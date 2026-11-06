@@ -23,7 +23,7 @@ use windows::{
             Shell::{
                 ICommDlgBrowser, ICommDlgBrowser2, ICommDlgBrowser2_Impl, ICommDlgBrowser_Impl,
                 IExplorerBrowser, IExplorerBrowserEvents, IExplorerBrowserEvents_Impl, IShellView,
-                EBO_ALWAYSNAVIGATE, EBO_NOBORDER, EBO_SHOWFRAMES, EBO_NAVIGATEONCE, EBF_NODROPTARGET,
+                EBO_ALWAYSNAVIGATE, EBO_NOBORDER, EBO_SHOWFRAMES, EBO_NAVIGATEONCE, EBO_NOPERSISTVIEWSTATE, EBF_NODROPTARGET,
                 IFolderView2, IResultsFolder, IColumnManager, FVM_DETAILS,
                 IExplorerPaneVisibility, IExplorerPaneVisibility_Impl, EP_NavPane, EP_StatusBar,
                 EP_Commands, EP_DetailsPane, EP_PreviewPane, EP_Ribbon,
@@ -91,6 +91,17 @@ pub struct ExplorerBrowserHost {
 }
 
 impl ExplorerBrowserHost {
+    /// Creates a host that does not persist Shell-managed folder view settings.
+    ///
+    /// # Safety
+    /// The same STA and parent-window lifetime requirements as `create` apply.
+    pub unsafe fn create_transient(parent: HWND, rect: RECT, modern: bool, panes: Panes) -> Result<Self> {
+        let host = unsafe { Self::create(parent, rect, modern, panes)? };
+        let options = unsafe { host.browser.GetOptions()? };
+        unsafe { host.browser.SetOptions(options | EBO_NOPERSISTVIEWSTATE)?; }
+        Ok(host)
+    }
+
     /// Creates and initializes the native Shell browser child window.
     ///
     /// # Safety

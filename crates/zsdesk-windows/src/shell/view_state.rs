@@ -1,9 +1,9 @@
 //! Bounded per-tab snapshots; inactive tabs retain no Shell view or HWND.
 use windows::Win32::{System::Com::CoTaskMemFree, UI::Shell::{
-    Common::ITEMIDLIST, IFolderView2, ILGetSize, FOLDERVIEWMODE,
+    Common::ITEMIDLIST, IEnumIDList, IFolderView2, ILGetSize, FOLDERVIEWMODE, SVGIO_SELECTION,
     SVSI_SELECT, SVSI_DESELECTOTHERS, SVSI_FOCUSED, SVSI_ENSUREVISIBLE,
 }};
-use windows::core::Interface;
+use windows::core::{HRESULT, Interface};
 use zsdesk_core::model::explorer::ShellViewState;
 use super::ExplorerBrowserHost;
 
@@ -47,43 +47,73 @@ impl ExplorerBrowserHost {
         let view: IFolderView2 = unsafe { self.current_view().ok()?.cast().ok()? };
         let mut mode=FOLDERVIEWMODE(0); let mut icon_size=0;
         unsafe { view.GetViewModeAndIconSize(&mut mode,&mut icon_size).ok()?; }
-        let mut selected=Vec::new(); let mut last=-1; let mut budget=0;
-        while selected.len()<256 {
-            let Ok(index) = (unsafe { view.GetSelectedItem(last) }) else {break};
-            if index <= last {break;} last=index;
-            if let Some(bytes)=unsafe { item_bytes(&view,index) } {
-                budget += bytes.len(); if budget > 128*1024 {break;}
-                selected.push(bytes);
+        let mut selected=Vec::new(); let mut budget=0;
+        // Some native DefView builds return the first selected index regardless
+        // of GetSelectedItem's start argument. Enumerate the selected child PIDLs
+        // directly, preserving their identity within virtual folders as well.
+        if let Ok(items)=unsafe {view.Items::<IEnumIDList>(SVGIO_SELECTION)} {
+            for _ in 0..256 {
+                let mut pointers=[std::ptr::null_mut()];let mut fetched=0;
+                let status=unsafe {items.Next(&mut pointers,Some(&mut fetched))};
+                // Failed enumerations do not transfer valid output entries.
+                if status.is_err() || fetched!=1 {break;}
+                if let Some(bytes)=unsafe {take_item_bytes(pointers[0])} {
+                    budget += bytes.len(); if budget > 128*1024 {break;}
+                    selected.push(bytes);
+                }
+                if status!=HRESULT(0) {break;}
             }
         }
-        let focused=unsafe { view.GetFocusedItem().ok().and_then(|i|item_bytes(&view,i)) };
-        let first_visible=unsafe { view.GetVisibleItem(-1,false).ok().and_then(|i|item_bytes(&view,i)) };
+        let mut focused_index=-1;
+        let focused_status=unsafe {(view.vtable().base__.GetFocusedItem)(view.as_raw(),&mut focused_index)};
+        let focused=if focused_status==HRESULT(0) && focused_index>=0 {unsafe {item_bytes(&view,focused_index)}}else{None};
+        let mut visible_index=-1;
+        let visible_status=unsafe {(view.vtable().GetVisibleItem)(view.as_raw(),-1,false.into(),&mut visible_index)};
+        let first_visible=if visible_status==HRESULT(0) && visible_index>=0 {unsafe {item_bytes(&view,visible_index)}}else{None};
         Some(ShellViewState {mode:mode.0,icon_size,selected,focused,first_visible})
     }
     pub unsafe fn restore_view(&self,state:&ShellViewState) {
         let Ok(shell_view)=(unsafe {self.current_view()}) else {return;};
         let Ok(view)=shell_view.cast::<IFolderView2>() else {return;};
         if (1..=8).contains(&state.mode) && (8..=512).contains(&state.icon_size) {
-            let _=unsafe {view.SetViewModeAndIconSize(FOLDERVIEWMODE(state.mode),state.icon_size)};
+            let mut mode=FOLDERVIEWMODE(0);let mut icon=0;
+            let unchanged=unsafe {view.GetViewModeAndIconSize(&mut mode,&mut icon)}.is_ok()
+                && (mode.0,icon)==(state.mode,state.icon_size);
+            if !unchanged {let _=unsafe {view.SetViewModeAndIconSize(FOLDERVIEWMODE(state.mode),state.icon_size)};}
         }
-        // SelectItem without SVSI_SELECT can deselect the item. Scroll before
-        // restoring the selection and preserve the focused item's own state.
+        // Clear once. Passing DESELECTOTHERS to SelectAndPositionItems applies
+        // it to every item and leaves only the last item selected on DefView.
+        let _=unsafe {shell_view.SelectItem(std::ptr::null(),SVSI_DESELECTOTHERS.0 as u32)};
+        // The SDK's SVSI_NOSTATECHANGE macro is outside the _SVSIF enum.
+        const NO_STATE_CHANGE:u32=0x8000_0000;
         if let Some(pidl)=state.first_visible.as_ref().filter(|p|valid_pidl(p)) {
-            let _=unsafe {shell_view.SelectItem(pidl.as_ptr().cast(),SVSI_ENSUREVISIBLE.0 as u32)};
+            let _=unsafe {shell_view.SelectItem(pidl.as_ptr().cast(),SVSI_ENSUREVISIBLE.0 as u32|NO_STATE_CHANGE)};
         }
-        let mut first=true;
-        for pidl in state.selected.iter().take(256).filter(|p|valid_pidl(p)) {
-            let flags=SVSI_SELECT.0 | if first {SVSI_DESELECTOTHERS.0} else {0};
-            let _=unsafe {shell_view.SelectItem(pidl.as_ptr().cast(),flags as u32)}; first=false;
-        }
+        let mut selected:Vec<_>=state.selected.iter().take(256).filter(|p|valid_pidl(p)).collect();
+        let mut flags=SVSI_SELECT.0 as u32;
         if let Some(pidl)=state.focused.as_ref().filter(|p|valid_pidl(p)) {
-            let selection=if state.selected.contains(pidl){SVSI_SELECT.0}else{0};
-            let _=unsafe {shell_view.SelectItem(pidl.as_ptr().cast(),(selection|SVSI_FOCUSED.0) as u32)};
+            if let Some(index)=selected.iter().position(|selected|*selected==pidl) {
+                // DefView focuses the final item in a batch. Keep this in the
+                // same submission so a later single-item request cannot replace
+                // the pending selection while a newly created view enumerates.
+                let focused=selected.remove(index);selected.push(focused);
+                flags|=SVSI_FOCUSED.0 as u32;
+            } else {
+                let _=unsafe {shell_view.SelectItem(pidl.as_ptr().cast(),SVSI_FOCUSED.0 as u32)};
+            }
+        }
+        if !selected.is_empty() {
+            let pidls:Vec<*const ITEMIDLIST>=selected.iter().map(|p|p.as_ptr().cast()).collect();
+            let _=unsafe {view.SelectAndPositionItems(pidls.len() as u32,pidls.as_ptr(),None,flags)};
         }
     }
 }
 unsafe fn item_bytes(view:&IFolderView2,index:i32)->Option<Vec<u8>> {
     let pointer: *mut ITEMIDLIST=unsafe {view.Item(index).ok()?};
+    unsafe {take_item_bytes(pointer)}
+}
+unsafe fn take_item_bytes(pointer:*mut ITEMIDLIST)->Option<Vec<u8>> {
+    if pointer.is_null() {return None;}
     let len=unsafe {ILGetSize(Some(pointer))} as usize;
     let result=if (2..=8192).contains(&len) && !pointer.is_null() {
         Some(unsafe {std::slice::from_raw_parts(pointer.cast::<u8>(),len)}.to_vec())

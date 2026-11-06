@@ -9,7 +9,7 @@
 use windows::{
     core::{w, PCSTR, PCWSTR},
     Win32::{
-        Foundation::{HWND, RECT},
+        Foundation::{HMODULE, HWND, RECT},
         Graphics::Dwm::{DwmExtendFrameIntoClientArea, DwmGetWindowAttribute, DwmSetWindowAttribute,
             DWMWA_CAPTION_BUTTON_BOUNDS, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMSBT_MAINWINDOW},
         System::{LibraryLoader::{GetProcAddress, LoadLibraryW}, Registry::{RegGetValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ}},
@@ -47,7 +47,10 @@ type FlushMenuThemes = unsafe extern "system" fn();
 
 fn uxtheme_ordinal(ordinal: usize) -> Option<unsafe extern "system" fn() -> isize> {
     if os_build() < 18362 { return None; }
-    let module = unsafe { LoadLibraryW(w!("uxtheme.dll")).ok()? };
+    // Keep one process-lifetime reference; navigation reapplies child themes.
+    static MODULE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let address = (*MODULE.get_or_init(|| unsafe { LoadLibraryW(w!("uxtheme.dll")).ok().map(|m| m.0 as usize) }))?;
+    let module = HMODULE(address as *mut _);
     unsafe { GetProcAddress(module, PCSTR(ordinal as *const u8)) }
 }
 

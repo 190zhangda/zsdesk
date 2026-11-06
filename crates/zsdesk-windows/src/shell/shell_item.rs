@@ -1,7 +1,7 @@
 use std::{borrow::Cow, path::PathBuf};
 
 use windows::{
-    core::{Interface, Result, PCWSTR, PWSTR},
+    core::{Error, HRESULT, Interface, Result, PCWSTR, PWSTR},
     Win32::{
         Foundation::HWND,
         System::{Com::CoTaskMemFree, SystemServices::SFGAO_FOLDER},
@@ -55,8 +55,9 @@ fn normalized_shell_parsing_name(value: &str) -> Cow<'_, str> {
 
 pub unsafe fn selected_shell_item(view: &IShellView) -> Result<IShellItem> {
     let folder_view: IFolderView2 = view.cast()?;
-    let index = unsafe { folder_view.GetSelectedItem(-1)? };
-    unsafe { folder_view.GetItem(index) }
+    let selected = unsafe { folder_view.GetSelection(false)? };
+    if unsafe { selected.GetCount()? } == 0 { return Err(Error::from_hresult(HRESULT(1))); }
+    unsafe { selected.GetItemAt(0) }
 }
 
 pub unsafe fn is_folder(item: &IShellItem) -> bool {

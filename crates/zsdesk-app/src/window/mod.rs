@@ -14,6 +14,8 @@ mod navigation;
 mod quick_preview;
 mod paint;
 mod global_search;
+#[cfg(test)]
+mod selection_regression;
 
 use std::{cell::{Cell, RefCell}, collections::HashMap, mem::size_of, path::PathBuf, rc::Rc};
 use anyhow::{Context, Result};
@@ -318,16 +320,23 @@ impl WindowState {
         self.measure_bookmarks();
         self.relayout();
         let panes = Panes { preview: self.session.ui.show_preview, details: self.session.ui.show_details };
-        self.browser = Some(unsafe { ExplorerBrowserHost::create(hwnd, win_rect(self.layout.browser), self.modern, panes)? });
+        #[cfg(not(test))]
+        let browser = unsafe { ExplorerBrowserHost::create(hwnd, win_rect(self.layout.browser), self.modern, panes)? };
+        #[cfg(test)]
+        let browser = unsafe { ExplorerBrowserHost::create_transient(hwnd, win_rect(self.layout.browser), self.modern, panes)? };
+        self.browser = Some(browser);
         if let Some(browser)=&self.browser{browser.set_context_menu_options(crate::context_preferences::native(&self.session.ui.context_menu));}
         self.tree = unsafe { NamespaceTreeHost::create(hwnd, win_rect(self.layout.tree)) }.ok();
         self.theme_children();
         self.position_children();
         unsafe { SetTimer(Some(hwnd), TIMER_STATUS, 1200, None); }
         unsafe { self.navigate_current(); }
-        self.check_integration();
-        if let Err(error) = crate::routing_control::refresh_owned_target(&self.config_path, hwnd) {
-            self.show_message(format!("文件位置绑定检查失败：{error}"));
+        #[cfg(not(test))]
+        {
+            self.check_integration();
+            if let Err(error) = crate::routing_control::refresh_owned_target(&self.config_path, hwnd) {
+                self.show_message(format!("文件位置绑定检查失败：{error}"));
+            }
         }
         Ok(())
     }
@@ -476,8 +485,9 @@ impl WindowState {
     }
 
     fn theme_children(&self) {
+        // DefView owns its ItemsView theme lifecycle. Retheming it during
+        // asynchronous navigation suppresses selection backgrounds in new views.
         if let Some(tree) = &self.tree { tree.apply_theme(self.dark, colorref(self.palette.content), colorref(self.palette.text)); }
-        if let Some(view) = self.browser.as_ref().and_then(|b| b.view_window()) { theme::theme_control(view, self.dark); }
     }
 
     fn invalidate(&self) { let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) }; }
