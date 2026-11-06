@@ -773,6 +773,8 @@ fn require_selected_applications(settings: &Settings) -> Result<()> {
 fn apply_settings(profile: &Path, mut settings: Settings) -> Result<String> {
     validate_settings(&settings)?;
     require_selected_applications(&settings)?;
+    let document_path = config_file(profile);
+    let original_document = if document_path.try_exists()? { Some(bounded_read(&document_path)?) } else { None };
     let bundle = bundled()?;
     let current = std::env::current_exe()?;
     let target_hash = digest(&current)?;
@@ -974,7 +976,8 @@ fn apply_settings(profile: &Path, mut settings: Settings) -> Result<String> {
     if import_legacy_choices && latest.applications.is_empty() && !latest.pending_changes {
         latest.applications = settings.applications.clone();
     }
-    merge_latest_choices(&mut settings, latest);
+    let latest_document = if document_path.try_exists()? { Some(bounded_read(&document_path)?) } else { None };
+    merge_after_apply(&mut settings, latest, original_document != latest_document);
     settings.control_path = Some(controller);
     settings.control_sha256 = Some(bundle.manifest.controller.sha256);
     settings.target_exe = Some(current);
@@ -983,6 +986,12 @@ fn apply_settings(profile: &Path, mut settings: Settings) -> Result<String> {
     settings.legacy = false;
     save(profile, &settings)?;
     Ok("所选应用的文件位置转发已启用；未运行的应用将在启动后接入".into())
+}
+fn merge_after_apply(settings: &mut Settings, latest: Settings, document_changed: bool) {
+    // Installing the new INI changes legacy runtime inference. That is not a
+    // user edit, and must not overwrite the choices captured before applying.
+    if !document_changed { settings.pending_changes = false; return; }
+    merge_latest_choices(settings, latest);
 }
 fn merge_latest_choices(settings: &mut Settings, latest: Settings) {
     let choices = |apps: &[Application]| {
@@ -1079,6 +1088,20 @@ fn startup_owned(controller: &Path, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unchanged_legacy_document_keeps_applied_startup_choice() {
+        let mut applied = Settings { legacy:true, start_with_windows:true, enabled:true, pending_changes:true, ..Default::default() };
+        applied.extra.insert("custom".into(), serde_json::json!({"keep":true}));
+        let inferred_after_install = Settings::default();
+        merge_after_apply(&mut applied, inferred_after_install, false);
+        assert!(applied.start_with_windows);
+        assert!(!applied.pending_changes);
+        assert_eq!(applied.extra["custom"]["keep"], true);
+        let changed = Settings { start_with_windows:false, pending_changes:true, ..Default::default() };
+        merge_after_apply(&mut applied, changed, true);
+        assert!(!applied.start_with_windows);
+        assert!(applied.pending_changes);
+    }
     #[test]
     fn refresh_resumes_only_an_enabled_owned_missing_watcher() {
         let current = Path::new("C:/Apps/ZSDesk.exe");

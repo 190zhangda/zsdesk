@@ -7,7 +7,6 @@ use windows::{
     core::{Interface, Result, BOOL},
     Win32::{
         Foundation::{HWND, POINT, PROPERTYKEY},
-        System::Ole::IOleWindow,
         UI::Shell::{
             IFolderView2, IShellItem, IShellItem2, IShellItemArray, SORTCOLUMN, SORT_ASCENDING, SORT_DESCENDING, SVGIO_ALLVIEW,
             SVGIO_SELECTION, SVSI_SELECT, SVSI_DESELECT, FWF_CHECKSELECT, FOLDERFLAGS, SHGetSetSettings, SHELLSTATEA,
@@ -62,8 +61,8 @@ impl ExplorerBrowserHost {
     /// Top-level window of the Shell view (for focus tests).
     pub fn view_window(&self) -> Option<HWND> {
         let view = unsafe { self.current_view().ok()? };
-        let window: IOleWindow = view.cast().ok()?;
-        unsafe { window.GetWindow().ok() }
+        // Use the IOleWindow method inherited by IShellView directly.
+        unsafe { view.GetWindow().ok() }
     }
 
     /// Runs a verb on the selection ("cut", "copy", "delete", "properties" …).
