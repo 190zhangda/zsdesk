@@ -20,6 +20,7 @@ enum Hidden : uint32_t {
 };
 inline constexpr uint32_t builtinMask=(1u<<10)-1;
 using PolicyProbe=bool(*)(IUnknown*,uint32_t*) noexcept;
+using ModelAugmenter=HRESULT(*)(IUnknown*,IUnknown**) noexcept;
 using CreateFunction=IUnknown**(__fastcall*)(IUnknown*,IUnknown**,HMENU);
 using ExtensionFunction=void(__fastcall*)(IUnknown*,HMENU,const GUID*,const HSTRING*);
 using UpdateFunction=bool(__fastcall*)(IUnknown*,const HSTRING*,const MENUITEMINFOW&,ULONG);
@@ -27,6 +28,8 @@ inline CreateFunction originalCreate=nullptr;
 inline ExtensionFunction originalExtension=nullptr;
 inline UpdateFunction originalUpdate=nullptr;
 inline PolicyProbe policyProbe=nullptr;
+inline ModelAugmenter modelAugmenter=nullptr;
+inline thread_local unsigned createDepth=0;
 inline SRWLOCK setupLock=SRWLOCK_INIT;
 inline HMODULE retainedModule=nullptr;
 inline HRESULT setupFailure=S_OK;
@@ -103,7 +106,10 @@ inline bool Policy(IUnknown* native,uint32_t& policy) noexcept {
     return enabled.load()&&policyProbe&&policyProbe(native,&policy);
 }
 inline IUnknown** __fastcall CreateModels(IUnknown* native,IUnknown** output,HMENU menu) {
+    ++createDepth;
+    struct DepthScope { ~DepthScope(){--createDepth;} } depthScope;
     auto result=originalCreate(native,output,menu);
+    if(createDepth==1&&output&&*output&&modelAugmenter&&FAILED(modelAugmenter(native,output)))++failures;
     uint32_t policy=0;
     if(output&&*output&&Policy(native,policy)&&(policy&builtinMask)){
         if(FAILED(FilterModels(*output,policy)))++failures;
@@ -129,12 +135,12 @@ inline bool __fastcall UpdateModel(IUnknown* native,const HSTRING* id,const MENU
     }
     return originalUpdate(native,id,item,flags);
 }
-inline HRESULT InstallVerified(HMODULE module,PolicyProbe probe) noexcept {
+inline HRESULT InstallVerified(HMODULE module,PolicyProbe probe,ModelAugmenter augmenter=nullptr) noexcept {
     if(!module||!probe)return E_INVALIDARG;
     AcquireSRWLockExclusive(&setupLock);
     HRESULT result=setupFailure;
     if(SUCCEEDED(result)&&enabled.load()){
-        result=retainedModule==module&&policyProbe==probe?S_OK:E_UNEXPECTED;
+        result=retainedModule==module&&policyProbe==probe&&modelAugmenter==augmenter?S_OK:E_UNEXPECTED;
         ReleaseSRWLockExclusive(&setupLock);return result;
     }
     struct Entry {ULONG_PTR rva;BYTE bytes[32];void* replacement;void** original;};
@@ -162,6 +168,7 @@ inline HRESULT InstallVerified(HMODULE module,PolicyProbe probe) noexcept {
         for(unsigned i=0;i<created;++i)MH_RemoveHook(base+entries[i].rva);
     }else{
         policyProbe=probe;
+        modelAugmenter=augmenter;
         for(const auto& entry:entries)if(MH_QueueEnableHook(base+entry.rva)!=MH_OK)result=E_FAIL;
         if(SUCCEEDED(result)&&MH_ApplyQueued()!=MH_OK)result=E_FAIL;
         if(SUCCEEDED(result))enabled.store(true);

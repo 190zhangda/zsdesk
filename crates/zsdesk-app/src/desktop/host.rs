@@ -88,6 +88,7 @@ struct DesktopAnchor { hwnd: HWND, process: u32, thread: u32 }
 impl DesktopAnchor {
     fn capture(hwnd: HWND) -> Option<Self> {
         if !unsafe { IsWindow(Some(hwnd)) }.as_bool()
+            || !unsafe { IsWindowVisible(hwnd) }.as_bool()
             || !matches!(super::class_name(hwnd).as_str(), "WorkerW" | "Progman") { return None; }
         let mut process = 0;
         let thread = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process)) };
@@ -96,6 +97,16 @@ impl DesktopAnchor {
     fn valid(self) -> bool {
         Self::capture(self.hwnd).is_some_and(|current| current.process == self.process && current.thread == self.thread)
     }
+}
+
+fn window_precedes(upper: HWND, lower: HWND) -> bool {
+    let mut window = unsafe { GetWindow(lower, GW_HWNDPREV) }.unwrap_or_default();
+    let mut visited = HashSet::new();
+    while !window.0.is_null() && visited.insert(window.0 as usize) {
+        if window == upper { return true; }
+        window = unsafe { GetWindow(window, GW_HWNDPREV) }.unwrap_or_default();
+    }
+    false
 }
 
 pub struct DesktopHost {
@@ -471,9 +482,15 @@ impl DesktopHost {
     /// Places every fence directly above `desktop` (the raised "显示桌面" WorkerW
     /// or Progman), skipping topmost windows so fences never cover applications.
     pub fn raise_above(&mut self, desktop: HWND) {
-        let Some(anchor) = DesktopAnchor::capture(desktop) else { return };
+        let Some(mut anchor) = DesktopAnchor::capture(desktop) else { return };
+        // Progman may receive activation while a previously raised WorkerW
+        // still covers it. Keep the higher verified desktop window as anchor.
+        if let Some(previous) = self.desktop_anchor.filter(|value| value.valid()) {
+            if window_precedes(previous.hwnd, anchor.hwnd) { anchor = previous; }
+        }
         self.desktop_anchor = Some(anchor);
         if self.config.settings.hidden { return; }
+        let desktop = anchor.hwnd;
         let mut after = unsafe { GetWindow(desktop, GW_HWNDPREV) }.unwrap_or_default();
         while !after.0.is_null() && (unsafe { GetWindowLongPtrW(after, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0 != 0 || self.fences.iter().any(|f| f.hwnd == after)) {
             after = unsafe { GetWindow(after, GW_HWNDPREV) }.unwrap_or_default();
@@ -491,18 +508,30 @@ impl DesktopHost {
         };
         // Preserve the desktop layer after an application gains foreground.
         // HWND_BOTTOM would put owned fences behind a still-raised WorkerW.
-        let mut above = unsafe { GetWindow(anchor.hwnd, GW_HWNDPREV) }.unwrap_or_default();
-        let mut visited = HashSet::new();
-        while !above.0.is_null() && visited.insert(above.0 as usize) {
-            if above == foreground { self.raise_above(anchor.hwnd); return; }
-            above = unsafe { GetWindow(above, GW_HWNDPREV) }.unwrap_or_default();
-        }
+        if window_precedes(foreground, anchor.hwnd) { self.raise_above(anchor.hwnd); return; }
         // During a desktop transition the anchor can still be above the app.
         // Keep application priority, and never join the topmost window band.
         let after = if unsafe { GetWindowLongPtrW(foreground, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0 != 0 {
             HWND_NOTOPMOST
         } else { foreground };
         for fence in &self.fences { super::set_z(fence.hwnd, after); }
+    }
+
+    /// Owner activation and popup menus can reorder Progman's owned windows
+    /// without a foreground event from another application.
+    pub fn repair_layer(&mut self) {
+        if self.config.settings.hidden { return; }
+        let anchor = self.desktop_anchor.filter(|value| value.valid())
+            .or_else(|| desktop::progman().and_then(DesktopAnchor::capture));
+        let Some(anchor) = anchor else { return };
+        let foreground = unsafe { GetForegroundWindow() };
+        let class = super::class_name(foreground);
+        if !foreground.0.is_null() && !class.starts_with("ZSDesk.")
+            && !matches!(class.as_str(), "WorkerW" | "Progman" | "#32768") {
+            self.lower_all(foreground);
+        } else {
+            self.raise_above(anchor.hwnd);
+        }
     }
 
     pub fn place_all(&mut self) {
@@ -531,11 +560,12 @@ impl DesktopHost {
         let Some(fence) = self.config.fence(id).cloned() else { return };
         let mut win = std::mem::replace(&mut self.fences[index], FenceWin::new(id));
         let palette = self.palette;
+        let show_counts = self.config.settings.show_counts;
         let generation = self.gfx.generation();
         self.icon_clock = self.icon_clock.wrapping_add(1);
         let tick = self.icon_clock;
         let (gfx, icons, loader, next_request) = (&self.gfx, &mut self.icons, &self.loader, &mut self.next_icon_request);
-        win.render(gfx, &fence, &palette, |entry, px| {
+        win.render(gfx, &fence, &palette, show_counts, |entry, px| {
             let key = (entry.key.clone(), px);
             let signature = (entry.size, entry.modified);
             let slot = icons.entry(key).or_insert_with(|| IconSlot::new(signature, tick));
@@ -1234,6 +1264,8 @@ impl DesktopHost {
             entry(if s.hidden { "显示全部格子" } else { "隐藏全部格子" }, "toggle-hidden", true, false),
             entry("双击桌面空白处隐藏/显示格子", "double-click", true, s.double_click_toggle),
             submenu("外观", vec![
+                entry("显示文件数量", "show-counts", true, s.show_counts),
+                MenuItemSpec::Separator,
                 entry("深色", "theme-dark", true, s.theme == FenceTheme::Dark),
                 entry("浅色", "theme-light", true, s.theme == FenceTheme::Light),
                 entry("跟随系统", "theme-system", true, s.theme == FenceTheme::System),
@@ -1288,6 +1320,7 @@ impl DesktopHost {
             "double-click" => { self.config.settings.double_click_toggle = !self.config.settings.double_click_toggle; self.schedule_save(); super::update_hook(self.config.settings.double_click_toggle); }
             "browse-inside" => { self.config.settings.browse_inside = !self.config.settings.browse_inside; self.schedule_save(); }
             "hover-expand" => { self.config.settings.hover_expand = !self.config.settings.hover_expand; self.schedule_save(); }
+            "show-counts" => { self.config.settings.show_counts = !self.config.settings.show_counts; self.schedule_save(); self.render_all(); }
             "hide-tray" => {
                 if self.config.settings.hide_tray { self.show_tray(); }
                 else {

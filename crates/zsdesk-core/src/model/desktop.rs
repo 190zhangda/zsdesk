@@ -142,6 +142,9 @@ pub struct DesktopSettings {
     /// 隐藏通知区域（托盘）图标。
     #[serde(default)]
     pub hide_tray: bool,
+    /// Show the item count in a fence header; hidden by default.
+    #[serde(default)]
+    pub show_counts: bool,
 }
 
 fn default_true() -> bool { true }
@@ -149,7 +152,7 @@ fn default_true() -> bool { true }
 impl Default for DesktopSettings {
     fn default() -> Self {
         Self { organize: false, icons_hidden_by_zsdesk: false, hidden: false, double_click_toggle: true,
-            theme: FenceTheme::Dark, opacity: 55, browse_inside: true, hover_expand: true, hide_tray: false }
+            theme: FenceTheme::Dark, opacity: 55, browse_inside: true, hover_expand: true, hide_tray: false, show_counts: false }
     }
 }
 
@@ -333,6 +336,16 @@ pub fn auto_layout(count: usize, area_w: i32, area_h: i32) -> Vec<Bounds> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn existing_profiles_hide_counts_until_enabled() {
+        let mut value = serde_json::to_value(DesktopConfig::default()).unwrap();
+        value["settings"].as_object_mut().unwrap().remove("show_counts");
+        let mut config: DesktopConfig = serde_json::from_value(value).unwrap();
+        assert!(!config.settings.show_counts);
+        config.settings.show_counts = true;
+        let restored: DesktopConfig = serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(restored.settings.show_counts);
+    }
 
     fn info(key: &str, folder: bool) -> ItemInfo {
         let name = key.rsplit('\\').next().unwrap().to_string();

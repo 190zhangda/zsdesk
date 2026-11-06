@@ -6,6 +6,8 @@ namespace routing {
 inline constexpr DWORD kMagic = 0x3152464E;
 inline constexpr DWORD kVersion = 1;
 inline constexpr ULONG_PTR kCopyDataTag = 0x3152464E;
+inline constexpr ULONG_PTR kActivateCopyDataTag = 0x5A534441;
+inline constexpr wchar_t kActivationProperty[] = L"ZSDesk.Activate.v1";
 inline constexpr wchar_t kBridgeClass[] = L"Native360.FileRevealBridge.1";
 inline constexpr DWORD kMaxItems = 128;
 inline constexpr DWORD kMaxPacketBytes = 1024 * 1024;

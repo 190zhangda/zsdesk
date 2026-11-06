@@ -169,8 +169,8 @@ pub struct WindowPlacement {
 pub enum CommandBarItem { New, Cut, Copy, Paste, Rename, Share, Delete, Sort, View, More, PreviewPane, DetailsPane }
 
 impl CommandBarItem {
-    pub const ALL: [Self; 12] = [Self::New, Self::Cut, Self::Copy, Self::Paste, Self::Rename, Self::Share,
-        Self::Delete, Self::Sort, Self::View, Self::More, Self::PreviewPane, Self::DetailsPane];
+    pub const ALL: [Self; 11] = [Self::New, Self::Cut, Self::Copy, Self::Paste, Self::Rename, Self::Share,
+        Self::Delete, Self::Sort, Self::View, Self::More, Self::PreviewPane];
 
     pub const fn key(self) -> &'static str {
         match self {
@@ -195,7 +195,7 @@ impl Default for CommandBarPreferences {
 }
 
 impl CommandBarPreferences {
-    pub fn item_visible(&self, item: CommandBarItem) -> bool { !self.hidden_items.contains(&item) }
+    pub fn item_visible(&self, item: CommandBarItem) -> bool { item != CommandBarItem::DetailsPane && !self.hidden_items.contains(&item) }
     pub fn set_item_visible(&mut self, item: CommandBarItem, visible: bool) {
         self.hidden_items.retain(|hidden| *hidden != item);
         if !visible { self.hidden_items.push(item); }

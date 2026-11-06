@@ -215,7 +215,7 @@ impl FenceWin {
     }
 
     /// Paints and presents the fence. `icon` resolves item bitmaps.
-    pub fn render(&mut self, gfx: &Gfx, fence: &Fence, palette: &FencePalette, mut icon: impl FnMut(&ShellEntry, i32) -> Option<ID2D1Bitmap>) {
+    pub fn render(&mut self, gfx: &Gfx, fence: &Fence, palette: &FencePalette, show_counts: bool, mut icon: impl FnMut(&ShellEntry, i32) -> Option<ID2D1Bitmap>) {
         if self.hwnd.0.is_null() { return; }
         let rect = self.window_rect();
         let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
@@ -232,7 +232,7 @@ impl FenceWin {
         let col = |c: zsdesk_ui::theme::Color| Color::rgba8(c.r, c.g, c.b, c.a);
         let _ = gfx.draw(surface, |cv: &Canvas| {
             let outer = RectF::new(0.5, 0.5, w as f32 - 1.0, h as f32 - 1.0);
-            let radius = sf(8.0);
+            let radius = sf(10.0);
             let drop_all = self.drop_hover == Some(usize::MAX);
             cv.round(outer, radius, col(palette.background));
             // Title bar.
@@ -241,8 +241,7 @@ impl FenceWin {
             cv.round(outer, radius, col(palette.title));
             cv.pop_clip();
             let hovered = !matches!(self.hover, FenceHit::None);
-            let title_style = TextStyle::ui(sf(12.5)).weight(600).align(Align::Center);
-            let count = format!("{}", self.entries.len());
+            let title_style = TextStyle::ui(sf(13.0)).weight(600).align(Align::Center);
             let side = sf(36.0);
             let mut text = fence.title.clone();
             if fence.locked { text = format!("{text} \u{1F512}"); }
@@ -254,7 +253,8 @@ impl FenceWin {
                 let more = rf(g.more);
                 if self.hover == FenceHit::More { cv.round(more, sf(4.0), col(palette.hover)); }
                 cv.glyph(glyph::MORE, more, sf(13.0), col(palette.text));
-            } else {
+            } else if show_counts {
+                let count = self.entries.len().to_string();
                 cv.text(&count, RectF::new(w as f32 - sf(40.0), 0.0, sf(30.0), title.h), &small, col(palette.text_secondary));
             }
             if !g.back.is_empty() {

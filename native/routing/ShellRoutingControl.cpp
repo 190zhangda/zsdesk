@@ -329,7 +329,7 @@ DWORD EnsureDestination(const Destination& destination,Target& target,HWND& wind
     return ERROR_NOT_READY;
 }
 int DestinationShowCommand(bool visible,bool iconic,INT_PTR preferred) {
-    if(visible&&iconic)return SW_RESTORE;
+    if(iconic)return SW_RESTORE;
     if(!visible&&(preferred==SW_SHOWNORMAL||preferred==SW_SHOWMAXIMIZED))return int(preferred);
     return SW_SHOW;
 }
@@ -339,18 +339,26 @@ DWORD Forward(const std::vector<BYTE>& packet,bool& uncertain,bool allowForegrou
     if(gStop&&WaitForSingleObject(gStop,0)==WAIT_OBJECT_0)return ERROR_CANCELLED;
     Target checked;DWORD owner=0;GetWindowThreadProcessId(window,&owner);
     if(owner!=target.pid||!DestinationProcess(owner,destination,checked)||checked.created!=target.created)return ERROR_INVALID_WINDOW_HANDLE;
-    if(allowForeground)AllowSetForegroundWindow(target.pid);
     COPYDATASTRUCT data{};data.dwData=routing::kCopyDataTag;data.cbData=DWORD(packet.size());data.lpData=const_cast<BYTE*>(packet.data());DWORD_PTR result=0;SetLastError(0);
     if(!SendMessageTimeoutW(window,WM_COPYDATA,0,reinterpret_cast<LPARAM>(&data),SMTO_ABORTIFHUNG|SMTO_BLOCK,1500,&result)){error=GetLastError();uncertain=error==ERROR_TIMEOUT||error==0;return error?error:ERROR_TIMEOUT;}
     if(result!=1)return ERROR_NOT_SUPPORTED;
-    // Only an acknowledged real request may reveal the target. Asynchronous
-    // showing avoids the launcher's SW_HIDE being reused as first-show policy.
+    // Permission belongs to a process, not the target HWND. Once delegated,
+    // the receiver must perform activation on its own UI thread. Asking this
+    // worker to activate after delegation loses the inherited permission.
     if(allowForeground){
         DWORD currentOwner=0;GetWindowThreadProcessId(window,&currentOwner);Target current;
         if(currentOwner==target.pid&&DestinationProcess(currentOwner,destination,current)&&current.created==target.created){
-            const INT_PTR preferred=reinterpret_cast<INT_PTR>(GetPropW(window,L"ZSDesk.PreferredShow"));
-            ShowWindowAsync(window,DestinationShowCommand(IsWindowVisible(window)!=FALSE,IsIconic(window)!=FALSE,preferred));
-            SetForegroundWindow(window);
+            if(reinterpret_cast<INT_PTR>(GetPropW(window,routing::kActivationProperty))==1){
+                AllowSetForegroundWindow(target.pid);
+                COPYDATASTRUCT activation{routing::kActivateCopyDataTag,0,nullptr};DWORD_PTR shown=0;
+                // A show failure never replays the already accepted navigation.
+                SendMessageTimeoutW(window,WM_COPYDATA,0,reinterpret_cast<LPARAM>(&activation),SMTO_ABORTIFHUNG|SMTO_BLOCK,1500,&shown);
+            }else{
+                // Retain the broker's inherited permission for older receivers.
+                const INT_PTR preferred=reinterpret_cast<INT_PTR>(GetPropW(window,L"ZSDesk.PreferredShow"));
+                ShowWindowAsync(window,DestinationShowCommand(IsWindowVisible(window)!=FALSE,IsIconic(window)!=FALSE,preferred));
+                SetForegroundWindow(window);
+            }
         }
     }
     return 0;
@@ -412,15 +420,15 @@ DWORD Watch() {
     for(;;){DWORD waited=MsgWaitForMultipleObjects(1,&gStop,FALSE,INFINITE,QS_ALLINPUT);if(waited==WAIT_OBJECT_0)break;if(waited!=WAIT_OBJECT_0+1){error=ErrorOr();break;}MSG message{};while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){if(message.message==WM_QUIT){SetEvent(gStop);break;}TranslateMessage(&message);DispatchMessageW(&message);}}
     gAccepting.store(false);SetEvent(gStop);SetEvent(gWake);worker.join();if(legacyWindow)DestroyWindow(legacyWindow);if(legacyAtom)UnregisterClassW(kLegacyClass,legacy.hInstance);DestroyWindow(window);UnregisterClassW(kRouterClass,klass.hInstance);gStop=nullptr;gWake=nullptr;CoUninitialize();ReleaseMutex(mutex.get());return error;
 }
-bool OwnWatcherWindow(){
+HWND OwnWatcherWindow(){
     const std::wstring property=gPrefix+L".Owner";
     for(const wchar_t* klass:{kRouterClass,kLegacyClass}){HWND window=nullptr;while((window=FindWindowExW(HWND_MESSAGE,window,klass,nullptr))!=nullptr){
         DWORD pid=0;GetWindowThreadProcessId(window,&pid);Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid));if(!process||!SameOwner(process.get(),pid))continue;
         wchar_t path[32768]{};DWORD size=DWORD(std::size(path));if(!QueryFullProcessImageNameW(process.get(),0,path,&size)||_wcsicmp(path,gExe.c_str()))continue;
         INT_PTR protocol=reinterpret_cast<INT_PTR>(GetPropW(window,L"ZSDesk.Routing.Protocol"));
-        if(protocol==2&&reinterpret_cast<INT_PTR>(GetPropW(window,property.c_str()))==1)return true;
-        if(!protocol&&gRunName==L"Native360FileRevealRouting"&&!wcscmp(klass,kLegacyClass))return true;
-    }}return false;
+        if(protocol==2&&reinterpret_cast<INT_PTR>(GetPropW(window,property.c_str()))==1)return window;
+        if(!protocol&&gRunName==L"Native360FileRevealRouting"&&!wcscmp(klass,kLegacyClass))return window;
+    }}return nullptr;
 }
 DWORD StopWatcher() {
     Handle mutex(OpenMutexW(SYNCHRONIZE|MUTEX_MODIFY_STATE,FALSE,(gPrefix+L".Watch").c_str()));if(!mutex)return GetLastError()==ERROR_FILE_NOT_FOUND?0:ErrorOr();
@@ -491,7 +499,8 @@ DWORD Reveal(const wchar_t* item) {
     std::wstring full=item;if(!AbsolutePath(full))return ERROR_BAD_PATHNAME;DWORD attributes=GetFileAttributesW(full.c_str());if(attributes==INVALID_FILE_ATTRIBUTES)return ErrorOr();
     std::wstring folder=full;DWORD count=0;if(!(attributes&FILE_ATTRIBUTE_DIRECTORY)){size_t slash=full.find_last_of(L'\\');if(slash==std::wstring::npos)return ERROR_BAD_PATHNAME;folder=full.substr(0,slash+(slash==2?1:0));count=1;}
     routing::PacketHeader header;header.itemCount=count;header.sourcePid=GetCurrentProcessId();header.sourceKind=4;header.requestId=Now()^GetCurrentProcessId();header.bytes=DWORD(sizeof(header)+(folder.size()+1+(count?full.size()+1:0))*2);std::vector<BYTE> packet(header.bytes);memcpy(packet.data(),&header,sizeof(header));wchar_t* strings=reinterpret_cast<wchar_t*>(packet.data()+sizeof(header));memcpy(strings,folder.c_str(),(folder.size()+1)*2);if(count)memcpy(strings+folder.size()+1,full.c_str(),(full.size()+1)*2);
-    HWND window=FindWindowExW(HWND_MESSAGE,nullptr,kRouterClass,nullptr);if(!window)return ERROR_NOT_FOUND;DWORD owner=0;GetWindowThreadProcessId(window,&owner);Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,owner));if(!process||!SameOwner(process.get(),owner))return ERROR_ACCESS_DENIED;
+    HWND window=OwnWatcherWindow();if(!window)return ERROR_NOT_FOUND;DWORD owner=0;GetWindowThreadProcessId(window,&owner);Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,owner));if(!process||!SameOwner(process.get(),owner))return ERROR_ACCESS_DENIED;
+    AllowSetForegroundWindow(owner);
     COPYDATASTRUCT data{};data.dwData=routing::kCopyDataTag;data.cbData=DWORD(packet.size());data.lpData=packet.data();DWORD_PTR reply=0;SetLastError(0);if(!SendMessageTimeoutW(window,WM_COPYDATA,0,reinterpret_cast<LPARAM>(&data),SMTO_ABORTIFHUNG|SMTO_BLOCK,1500,&reply))return ErrorOr(ERROR_TIMEOUT);return reply==1?0:ERROR_NOT_SUPPORTED;
 }
 void AddDiscovery(std::map<std::wstring,Compatibility>& found,const std::wstring& path,const std::wstring& caller=L""){

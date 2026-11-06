@@ -300,6 +300,7 @@ impl WindowState {
         unsafe { SetPropW(hwnd, PCWSTR(key.as_ptr()), Some(windows::Win32::Foundation::HANDLE(1usize as *mut _)))?; }
         let route_key = crate::routing_control::profile_property(&self.config_path);
         unsafe { SetPropW(hwnd, PCWSTR(route_key.as_ptr()), Some(windows::Win32::Foundation::HANDLE(1usize as *mut _)))?; }
+        unsafe { SetPropW(hwnd, windows::core::w!("ZSDesk.Activate.v1"), Some(windows::Win32::Foundation::HANDLE(1usize as *mut _)))?; }
         let preferred_show=if self.session.ui.window.is_some_and(|p|p.maximized){SW_SHOWMAXIMIZED.0}else{SW_SHOWNORMAL.0};
         unsafe{SetPropW(hwnd,windows::core::w!("ZSDesk.PreferredShow"),Some(windows::Win32::Foundation::HANDLE(preferred_show as usize as *mut _)))?;}
         let (family, _) = zsdesk_windows::gfx::system_ui_font(Some(hwnd));
@@ -594,6 +595,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         }
         WM_COPYDATA if lp.0 != 0 => {
             let data = unsafe { &*(lp.0 as *const COPYDATASTRUCT) };
+            if data.dwData == crate::instance::ACTIVATE_MAGIC && data.cbData == 0 {
+                return LRESULT(unsafe { crate::instance::activate(hwnd) } as isize);
+            }
             if data.dwData==crate::instance::DIAGNOSTICS_MAGIC{
                 if data.lpData.is_null() || data.cbData>65536{return LRESULT(0);}
                 let bytes=unsafe{std::slice::from_raw_parts(data.lpData as *const u8,data.cbData as usize)};

@@ -16,6 +16,7 @@
 #include <new>
 #include <atomic>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstdint>
 #include "MenuSelectionSnapshot.h"
 #include "MenuCommandBridge.h"
@@ -74,7 +75,7 @@ class Session;
 using NativePrepareFn=HRESULT(STDMETHODCALLTYPE*)(Presenter*,UINT,IUnknown*,POINT,IContextMenu*,UINT,UINT,BOOL,const void*,GUID,IShellItem*);
 static std::atomic<NativePrepareFn> gNativePrepare{nullptr};
 static HRESULT STDMETHODCALLTYPE PrepareAgile(Presenter*,UINT,IUnknown*,POINT,IContextMenu*,UINT,UINT,BOOL,const void*,GUID,IShellItem*);
-struct PresenterRecord { Session* session;DWORD thread;ULONGLONG generation;uint32_t hidden; };
+struct PresenterRecord { Session* session;DWORD thread;ULONGLONG generation;uint32_t hidden;HMENU extra=nullptr;bool extraPending=false; };
 static SRWLOCK gPresenterLock=SRWLOCK_INIT;
 static std::unordered_map<IUnknown*,PresenterRecord> gPresenters;
 static std::atomic<ULONGLONG> gRequests{0},gPresenterCreations{0},gSelectionSnapshots{0},gRuntimeInitializations{0};
@@ -95,6 +96,49 @@ static bool PresenterMenuPolicy(IUnknown* native,uint32_t* hidden) noexcept {
     AcquireSRWLockShared(&gPresenterLock);auto found=gPresenters.find(native);
     const bool valid=found!=gPresenters.end();if(valid)*hidden=found->second.hidden;
     ReleaseSRWLockShared(&gPresenterLock);return valid;
+}
+static HRESULT AppendStandaloneModels(IUnknown* native,IUnknown** output) noexcept {
+    HMENU extra=nullptr;
+    AcquireSRWLockExclusive(&gPresenterLock);auto found=gPresenters.find(native);
+    if(found!=gPresenters.end()&&found->second.thread==GetCurrentThreadId()&&found->second.extraPending){
+        extra=found->second.extra;found->second.extraPending=false;
+    }
+    ReleaseSRWLockExclusive(&gPresenterLock);
+    if(!extra||!output||!*output)return S_FALSE;
+    try{
+        Microsoft::WRL::ComPtr<IUnknown> items;
+        menu_model_filter::originalCreate(native,items.GetAddressOf(),extra);
+        Microsoft::WRL::ComPtr<menu_model_filter::ItemVector> source,destination;
+        HRESULT result=items?items->QueryInterface(menu_model_filter::itemVectorIid,reinterpret_cast<void**>(source.GetAddressOf())):E_UNEXPECTED;
+        if(SUCCEEDED(result))result=(*output)->QueryInterface(menu_model_filter::itemVectorIid,reinterpret_cast<void**>(destination.GetAddressOf()));
+        UINT count=0;if(SUCCEEDED(result))result=source->Size(&count);
+        std::unordered_set<std::wstring> ownIds;
+        for(UINT index=0;SUCCEEDED(result)&&index<count;++index){
+            Microsoft::WRL::ComPtr<IInspectable> item;result=source->GetAt(index,&item);
+            menu_model_filter::String id;if(SUCCEEDED(result))result=menu_model_filter::GetId(item.Get(),id);
+            if(SUCCEEDED(result)&&!menu_model_filter::Equal(id.View(),L"Separator"))ownIds.emplace(id.View());
+        }
+        UINT existing=0;if(SUCCEEDED(result))result=destination->Size(&existing);
+        for(UINT index=existing;SUCCEEDED(result)&&index>0;--index){
+            Microsoft::WRL::ComPtr<IInspectable> item;result=destination->GetAt(index-1,&item);
+            menu_model_filter::String id;if(SUCCEEDED(result))result=menu_model_filter::GetId(item.Get(),id);
+            if(SUCCEEDED(result)&&ownIds.count(std::wstring(id.View())))result=destination->RemoveAt(index-1);
+        }
+        // Background menus may already contain the application section.
+        // Replace it by identity, retaining one copy and one group separator.
+        while(SUCCEEDED(result)){
+            result=destination->Size(&existing);if(FAILED(result)||!existing)break;
+            Microsoft::WRL::ComPtr<IInspectable> item;result=destination->GetAt(0,&item);
+            menu_model_filter::String id;if(SUCCEEDED(result))result=menu_model_filter::GetId(item.Get(),id);
+            if(FAILED(result)||!menu_model_filter::Equal(id.View(),L"Separator"))break;
+            result=destination->RemoveAt(0);
+        }
+        for(UINT index=count;SUCCEEDED(result)&&index>0;--index){
+            Microsoft::WRL::ComPtr<IInspectable> item;result=source->GetAt(index-1,&item);
+            if(SUCCEEDED(result))result=destination->InsertAt(0,item.Get());
+        }
+        return result;
+    }catch(...){return E_UNEXPECTED;}
 }
 static HMODULE gMenuModule=nullptr;
 static void** gIdentitySlot=nullptr;
@@ -221,9 +265,13 @@ class Session final : public IServiceProvider, public IOleWindow, public NativeC
     bool retiring_=false;
     void** originalPresenterTable_=nullptr;
     void* presenterTable_[11]{};
+    bool standalone_=false,standaloneDone_=false;
+    UINT standaloneChoice_=0;
+    POINT standalonePoint_{};
+    HWND standaloneOwner_=nullptr;
 
 public:
-    Session(IExplorerBrowser* browser,IShellView* shell,HWND window):shell_(shell),browser_(browser),window_(window),thread_(GetCurrentThreadId()){
+    Session(IExplorerBrowser* browser,IShellView* shell,HWND window,HWND menuOwner=nullptr):shell_(shell),browser_(browser),window_(window),thread_(GetCurrentThreadId()),standalone_(menuOwner!=nullptr),standaloneOwner_(menuOwner){
         shell_->AddRef();browser_->AddRef();
         shell_->QueryInterface(IID_PPV_ARGS(&nativeServices_));
         if(FAILED(shell_->QueryInterface(IID_PPV_ARGS(&commandTarget_))))browser_->QueryInterface(IID_PPV_ARGS(&commandTarget_));
@@ -241,6 +289,15 @@ public:
     HWND Window()const{return window_;}
     DWORD Thread()const{return thread_;}
     bool OwnsPresenter(Presenter* presenter)const{return presenter==presenter_&&!retiring_;}
+    void ConfigureStandalone(HWND owner,HMENU extra,POINT point){
+        standalone_=true;standaloneDone_=false;standaloneChoice_=0;standalonePoint_=point;standaloneOwner_=owner;
+        AcquireSRWLockExclusive(&gPresenterLock);auto found=gPresenters.find(presenter_);
+        if(found!=gPresenters.end()){found->second.extra=extra;found->second.extraPending=extra!=nullptr;}
+        ReleaseSRWLockExclusive(&gPresenterLock);
+    }
+    bool StandaloneDone()const{return standaloneDone_||retiring_;}
+    UINT StandaloneChoice()const{return standaloneChoice_;}
+    POINT StandalonePoint()const{return standalonePoint_;}
     bool InstallSelectionBridge(Presenter* native,HMODULE module){
         void** original=*reinterpret_cast<void***>(native);
         constexpr ULONG_PTR known[11]={0x777f0,0xc3c80,0x6dbf0,0xf7300,0x105fc0,0xf4840,0xf4650,0x745a0,0xf8b00,0x7eff0,0xf46f0};
@@ -275,7 +332,7 @@ public:
             originalPresenterTable_=nullptr;
         }
     }
-    bool Matches(IShellView* shell)const{return shell==shell_ && !retiring_;}
+    bool Matches(IShellView* shell,HWND menuOwner)const{return shell==shell_ && standaloneOwner_==menuOwner && !retiring_;}
     HRESULT CreatePresenter(){
         HRESULT hr=shell_->QueryInterface(kCallbackIID,reinterpret_cast<void**>(&callback_));
         if(FAILED(hr))return hr;
@@ -298,8 +355,8 @@ public:
         if(SUCCEEDED(hr))verified.store(module);
         if(SUCCEEDED(hr))hr=EnsureThreadRuntime(candidate);
         if(SUCCEEDED(hr))hr=menu_command_bridge::InstallVerified(module,&CommandPresenterOwner);
-        if(SUCCEEDED(hr))hr=menu_model_filter::InstallVerified(module,&PresenterMenuPolicy);
-        if(SUCCEEDED(hr))hr=SafeInitialize(candidate,static_cast<NativeCallback*>(this),GetAncestor(window_,GA_ROOT));
+        if(SUCCEEDED(hr))hr=menu_model_filter::InstallVerified(module,&PresenterMenuPolicy,&AppendStandaloneModels);
+        if(SUCCEEDED(hr))hr=SafeInitialize(candidate,static_cast<NativeCallback*>(this),standaloneOwner_?standaloneOwner_:GetAncestor(window_,GA_ROOT));
         // The independently owned queue must prevent each presenter from owning
         // a dispatcher whose destructor would shut down the shared UI runtime.
         if(SUCCEEDED(hr)){
@@ -352,6 +409,7 @@ public:
     ULONG STDMETHODCALLTYPE Release()override{ULONG count=InterlockedDecrement(&refs_);if(!count)delete this;return count;}
     HRESULT STDMETHODCALLTYPE GetWindow(HWND* window)override{
         if(!window)return E_POINTER;*window=nullptr;
+        if(standalone_){*window=standaloneOwner_;return IsWindow(standaloneOwner_)?S_OK:E_FAIL;}
         return shell_?shell_->GetWindow(window):E_FAIL;
     }
     HRESULT STDMETHODCALLTYPE ContextSensitiveHelp(BOOL)override{return E_NOTIMPL;}
@@ -380,10 +438,15 @@ public:
         Release();
     }
     void STDMETHODCALLTYPE Invoke(IContextMenu* menu,IShellItemArray* items,HMENU popup,UINT command,POINT point)override{
+        if(standalone_){standaloneChoice_=command;standalonePoint_=point;standaloneDone_=true;return;}
         ForwardCallback([&](NativeCallback* callback){callback->Invoke(menu,items,popup,command,point);});
     }
-    void STDMETHODCALLTYPE OnContextMenuDismiss()override{ForwardCallback([](NativeCallback* callback){callback->OnContextMenuDismiss();},true);}
+    void STDMETHODCALLTYPE OnContextMenuDismiss()override{
+        if(standalone_){standaloneDone_=true;return;}
+        ForwardCallback([](NativeCallback* callback){callback->OnContextMenuDismiss();},true);
+    }
     void STDMETHODCALLTYPE DoExpandedContextMenu(POINT point,int flags,GUID* context,POINT* origin,int kind)override{
+        if(standalone_){standaloneChoice_=UINT_MAX;standalonePoint_=point;standaloneDone_=true;return;}
         AddRef();
         IShellView* view=!retiring_?shell_:nullptr;if(view)view->AddRef();
         const auto show=gOriginalMenuCallback.load();
@@ -402,7 +465,10 @@ public:
         }
         Release();
     }
-    void STDMETHODCALLTYPE SetFocus()override{ForwardCallback([](NativeCallback* callback){callback->SetFocus();});}
+    void STDMETHODCALLTYPE SetFocus()override{
+        if(standalone_){if(IsWindow(standaloneOwner_))::SetFocus(standaloneOwner_);return;}
+        ForwardCallback([](NativeCallback* callback){callback->SetFocus();});
+    }
 };
 
 
@@ -434,6 +500,7 @@ thread_local bool constructing=false;
 thread_local bool closing=false;
 thread_local HWND failedWindow=nullptr;
 thread_local IShellView* failedView=nullptr;
+thread_local HWND failedOwner=nullptr;
 thread_local HRESULT failedResult=S_OK;
 UINT invoke_message=0;
 constexpr UINT_PTR subclass_id=0x5a53444d;
@@ -456,7 +523,7 @@ LRESULT CALLBACK menu_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD
 struct Reset { ULONGLONG start=Micros(); ~Reset(){gLastQueryMicros=Micros()-start;constructing=false;} };
 }
 // Called directly by our own BrowserSite. No controller or cross-process hook.
-extern "C" HRESULT zs_menu_query(IExplorerBrowser* browser,REFGUID service,REFIID iid,void** out) noexcept {
+static HRESULT QueryMenuPresenter(IExplorerBrowser* browser,REFGUID service,REFIID iid,void** out,HWND menuOwner) noexcept {
     if(!out)return E_POINTER;
     *out=nullptr;
     if(!browser || service!=kPresenterSID || iid!=kPresenterIID || constructing || closing || gNativeCloseFault)return E_NOINTERFACE;
@@ -468,20 +535,23 @@ extern "C" HRESULT zs_menu_query(IExplorerBrowser* browser,REFGUID service,REFII
     if(FAILED(hr)||!v)return E_NOINTERFACE;
     HWND hwnd=nullptr;
     if(FAILED(v->GetWindow(&hwnd))||!hwnd||GetWindowThreadProcessId(hwnd,nullptr)!=GetCurrentThreadId()){v->Release();return E_NOINTERFACE;}
-    if(failedWindow==hwnd&&failedView==v){v->Release();return failedResult;}
-    if(active && (!active->Matches(v)||active->Window()!=hwnd))detach(active);
+    if(failedWindow==hwnd&&failedView==v&&failedOwner==menuOwner){v->Release();return failedResult;}
+    if(active && (!active->Matches(v,menuOwner)||active->Window()!=hwnd))detach(active);
     if(active){v->Release();return active->GetPresenter(iid,out);}
-    failedWindow=nullptr;failedView=nullptr;
+    failedWindow=nullptr;failedView=nullptr;failedOwner=nullptr;
     IShellView* identity=v;
-    auto s=new(std::nothrow) Session(browser,v,hwnd);
+    auto s=new(std::nothrow) Session(browser,v,hwnd,menuOwner);
     v->Release();if(!s)return E_OUTOFMEMORY;
     try{hr=s->CreatePresenter();}catch(...){hr=E_UNEXPECTED;}
     if(SUCCEEDED(hr) && !closing && IsWindow(hwnd) && SetWindowSubclass(hwnd,menu_proc,subclass_id,reinterpret_cast<DWORD_PTR>(s))){
         active=s;return s->GetPresenter(iid,out);
     }
-    failedResult=FAILED(hr)?hr:E_NOINTERFACE;failedWindow=hwnd;failedView=identity;
+    failedResult=FAILED(hr)?hr:E_NOINTERFACE;failedWindow=hwnd;failedView=identity;failedOwner=menuOwner;
     InterlockedExchange(&gLastFailure,failedResult);
     s->Retire();s->Release();return failedResult;
+}
+extern "C" HRESULT zs_menu_query(IExplorerBrowser* browser,REFGUID service,REFIID iid,void** out) noexcept {
+    return QueryMenuPresenter(browser,service,iid,out,nullptr);
 }
 extern "C" void zs_menu_shutdown() noexcept {
     closing=true;
@@ -491,7 +561,7 @@ extern "C" void zs_menu_shutdown() noexcept {
     }
     // This is a view lifecycle operation, not process shutdown. New previews,
     // tab hosts and menu mode changes must still be able to acquire a presenter.
-    failedWindow=nullptr;failedView=nullptr;failedResult=S_OK;closing=false;
+    failedWindow=nullptr;failedView=nullptr;failedOwner=nullptr;failedResult=S_OK;closing=false;
 }
 extern "C" void zs_menu_set_hidden_features(uint32_t hidden) noexcept {
     gHiddenMenuFeatures=hidden;
@@ -512,3 +582,4 @@ extern "C" void zs_menu_diagnostics(ZsMenuDiagnostics* out) noexcept {
         menu_model_filter::removed.load(),menu_model_filter::skippedExtensions.load(),
         menu_model_filter::skippedUpdates.load(),menu_model_filter::failures.load()};
 }
+#include "StandaloneMenuHost.h"

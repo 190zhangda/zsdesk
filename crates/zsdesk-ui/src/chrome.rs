@@ -73,7 +73,7 @@ const COMMAND_GROUPS: &[&[CommandId]] = &[
     &[CommandId::Cut, CommandId::Copy, CommandId::Paste, CommandId::Rename, CommandId::Share, CommandId::Delete],
     &[CommandId::Sort, CommandId::View],
     &[CommandId::More],
-    &[CommandId::PreviewPane, CommandId::DetailsPane],
+    &[CommandId::PreviewPane],
 ];
 
 /// Inputs the host measures or owns.
@@ -203,7 +203,7 @@ impl ChromeLayout {
             x += natural;
         }
         if x + s(4) + button <= utility_left {
-            layout.new_tab = Rect::clamped(x + s(4), button_y, button, button_h);
+            layout.new_tab = Rect::clamped(x + s(4), tab_y, button, tab_h);
         }
 
         // Bookmarks bar, directly under the tabs.
@@ -461,6 +461,8 @@ mod tests {
         for dpi in [96, 120, 144, 192] {
             let caption = Rect::new(1600 - scale(138, dpi), scale(3, dpi), scale(46, dpi), scale(30, dpi));
             let l = ChromeLayout::new(&ChromeInput { caption_button: Some(caption), ..input(1600, 2, 0, dpi) });
+            assert_eq!(l.new_tab.y, l.tabs[0].rect.y);
+            assert_eq!(l.new_tab.height, l.tabs[0].rect.height);
             for rect in [l.tab_list, l.app_menu] {
                 assert_eq!(rect.y, caption.y);
                 assert_eq!(rect.height, caption.height);
@@ -514,7 +516,7 @@ mod tests {
                     }
                 }
                 assert!(l.command_rect(CommandId::PreviewPane).is_some());
-                assert!(l.command_rect(CommandId::DetailsPane).is_some());
+                assert!(l.command_rect(CommandId::DetailsPane).is_none());
             }
         }
         let narrow = ChromeLayout::new(&input(360, 1, 0, 96));

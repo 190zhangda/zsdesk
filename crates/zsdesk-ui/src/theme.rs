@@ -129,10 +129,10 @@ impl FencePalette {
         let a = (opacity.clamp(10, 100) as u32 * 255 / 100) as u8;
         match mode {
             Mode::Dark => Self {
-                background: Color::rgba(0x1C, 0x1C, 0x1C, a),
-                title: Color::rgba(0x00, 0x00, 0x00, (a as u32 * 2 / 5) as u8),
-                border: Color::rgba(0xFF, 0xFF, 0xFF, 0x22),
-                text: Color::rgb(0xFF, 0xFF, 0xFF),
+                background: Color::rgba(0x20, 0x22, 0x27, a),
+                title: Color::rgba(0x14, 0x16, 0x1A, (a as u32 * 2 / 5) as u8),
+                border: Color::rgba(0xFF, 0xFF, 0xFF, 0x1C),
+                text: Color::rgb(0xF5, 0xF6, 0xF8),
                 text_secondary: Color::rgba(0xFF, 0xFF, 0xFF, 0xB0),
                 text_shadow: Color::rgba(0, 0, 0, 0xA0),
                 hover: Color::rgba(0xFF, 0xFF, 0xFF, 0x18),
@@ -141,8 +141,8 @@ impl FencePalette {
                 accent: Color::rgb(0x60, 0xCD, 0xFF),
             },
             Mode::Light => Self {
-                background: Color::rgba(0xF6, 0xF6, 0xF6, a),
-                title: Color::rgba(0xFF, 0xFF, 0xFF, (a as u32 * 3 / 5) as u8),
+                background: Color::rgba(0xF7, 0xF9, 0xFC, a),
+                title: Color::rgba(0xFF, 0xFF, 0xFF, (a as u32 / 5) as u8),
                 border: Color::rgba(0, 0, 0, 0x1A),
                 text: Color::rgba(0, 0, 0, 0xE4),
                 text_secondary: Color::rgba(0, 0, 0, 0x9B),

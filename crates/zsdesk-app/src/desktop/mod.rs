@@ -49,7 +49,12 @@ const DESKTOP_MAGIC: usize = 0x5A53_4443;
 const WM_COMMAND_REQUEST: u32 = WM_APP + 20;
 const WM_RENAME_REQUEST: u32 = WM_APP + 21;
 const WM_FOREGROUND: u32 = WM_APP + 22;
+const WM_REPAIR_LAYER: u32 = WM_APP + 23;
 const TIMER_RAISE: usize = 9;
+const TIMER_REPAIR_LAYER: usize = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DesktopClick { root: isize, time: u32, x: i32, y: i32 }
 
 /// Request handed to the desktop host (also forwarded between processes).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,7 +64,7 @@ thread_local! {
     static HOST: RefCell<Option<DesktopHost>> = const { RefCell::new(None) };
     static HOOK: Cell<isize> = const { Cell::new(0) };
     static HOST_HWND: Cell<isize> = const { Cell::new(0) };
-    static LAST_CLICK: Cell<(u32, i32, i32)> = const { Cell::new((0, 0, 0)) };
+    static LAST_CLICK: Cell<Option<DesktopClick>> = const { Cell::new(None) };
     /// Only explicit desktop-layer updates may change a fence's z-order.
     static ALLOW_Z: Cell<bool> = const { Cell::new(false) };
 }
@@ -70,6 +75,14 @@ pub(super) fn set_z(hwnd: HWND, after: HWND) {
     let _ = unsafe { SetWindowPos(hwnd, Some(after), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER) };
     ALLOW_Z.with(|z| z.set(previous));
 }
+
+fn request_layer_repair() {
+    let host = HOST_HWND.with(Cell::get);
+    if host != 0 { let _ = unsafe { PostMessageW(Some(HWND(host as *mut _)), WM_REPAIR_LAYER, WPARAM(0), LPARAM(0)) }; }
+}
+
+struct MenuLayerRepair;
+impl Drop for MenuLayerRepair { fn drop(&mut self) { request_layer_repair(); } }
 
 /// Foreground changes: "显示桌面" raises a WorkerW above every window, so fences
 /// follow the desktop window instead of staying pinned beneath it.
@@ -260,6 +273,11 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             if matches!(class_name(window).as_str(), "WorkerW" | "Progman") { with_host(|h| h.raise_above(window)); }
             return LRESULT(0);
         }
+        WM_REPAIR_LAYER | WM_TIMER if msg == WM_REPAIR_LAYER || wp.0 == TIMER_REPAIR_LAYER => {
+            let _ = unsafe { KillTimer(Some(hwnd), TIMER_REPAIR_LAYER) };
+            if with_host(|h| h.repair_layer()).is_none() { unsafe { SetTimer(Some(hwnd), TIMER_REPAIR_LAYER, 30, None); } }
+            return LRESULT(0);
+        }
         WM_TIMER => {
             let done = with_host(|h| {
                 if wp.0 == TIMER_SAVE { h.save_now(); }
@@ -275,7 +293,8 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             return LRESULT(0);
         }
         WM_DESKTOP_DBLCLICK => {
-            let point = POINT { x: wp.0 as i32, y: lp.0 as i32 };
+            let point = unpack_screen_point(lp.0);
+            if desktop_click_root(point) != Some(HWND(wp.0 as *mut _)) { return LRESULT(0); }
             let organize = with_host(|h| h.config.settings.organize).unwrap_or(false);
             let hit = desktop::classify_point(point);
             if hit == DesktopHit::Empty || (organize && hit == DesktopHit::Item) {
@@ -317,11 +336,18 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 fn point_of(lp: LPARAM) -> POINT { POINT { x: (lp.0 as i16) as i32, y: ((lp.0 >> 16) as i16) as i32 } }
 
 unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg != 0 && msg == zsdesk_windows::shell::menu::failure_message() {
+        let text = wide(&format!("右键菜单加载失败（0x{:08X}），隐藏设置仍保留。", wp.0 as u32));
+        unsafe { MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), w!("ZSDesk 桌面格子"), MB_OK | MB_ICONWARNING); }
+        request_layer_repair();
+        return LRESULT(0);
+    }
     if let Some(result) = forward_menu_message(msg, wp, lp) { return result; }
     let id = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as u64;
     if id == 0 { return unsafe { DefWindowProcW(hwnd, msg, wp, lp) }; }
     match msg {
         WM_MOUSEMOVE => { if let Some(a) = with_host(|h| h.mouse_move(id, point_of(lp))) { run_after(a); } return LRESULT(0); }
+        WM_ACTIVATE | WM_SETFOCUS | WM_ENTERMENULOOP | WM_EXITMENULOOP => { request_layer_repair(); }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             if let Some(a) = with_host(|h| h.mouse_down(id, point_of(lp), msg == WM_LBUTTONDBLCLK)) { run_after(a); }
             return LRESULT(0);
@@ -441,15 +467,20 @@ fn run_after(after: After) {
 }
 
 fn item_menu(fence: u64, point: POINT) {
+    let _layer = MenuLayerRepair;
     let Some((hwnd, pidls, extra)) = with_host(|h| h.win_index(fence).map(|i| (h.fences[i].hwnd, h.selected_pidls(fence), h.item_menu_items(fence)))).flatten() else { return };
     if pidls.is_empty() { return fence_menu(fence, point); }
     apply_context_preferences();
-    let Ok(menu) = ShellMenu::for_items(hwnd, &pidls) else { return };
+    let menu = match ShellMenu::for_items(hwnd, &pidls) {
+        Ok(menu) => menu,
+        Err(error) => { zsdesk_windows::shell::menu::report_failure(hwnd, error.code()); return; }
+    };
     let shift = key_down(VK_SHIFT);
-    if menu.populate(true, shift).is_err() { return; }
+    if let Err(error) = menu.populate(true, shift) { zsdesk_windows::shell::menu::report_failure(hwnd, error.code()); return; }
     let ids = insert_top(menu.hmenu(), &extra);
     let _ = unsafe { SetForegroundWindow(hwnd) };
-    let Some(chosen) = menu.track(hwnd, menu.hmenu(), point) else { return };
+    request_layer_repair();
+    let Some(chosen) = menu.track_selected(hwnd, point, &pidls) else { refresh_fence(fence); return };
     if chosen >= APP_FIRST {
         if let Some(id) = ids.get((chosen - APP_FIRST) as usize) {
             if let Some(a) = with_host(|h| h.menu_command(Some(fence), id, point)) { run_after(a); }
@@ -474,15 +505,18 @@ fn item_menu(fence: u64, point: POINT) {
 }
 
 fn fence_menu(fence: u64, point: POINT) {
+    let _layer = MenuLayerRepair;
     apply_context_preferences();
     let Some((hwnd, spec, folder)) = with_host(|h| h.win_index(fence).map(|i| (h.fences[i].hwnd, h.fence_menu(fence), h.target_folder(fence)))).flatten() else { return };
     let shell = folder.as_ref().and_then(|f| desktop::folder_for_path(f).ok()).and_then(|f| ShellMenu::for_folder_background(hwnd, &f).ok())
         .filter(|m| m.populate(false, key_down(VK_SHIFT)).is_ok());
     let _ = unsafe { SetForegroundWindow(hwnd) };
+    request_layer_repair();
     match shell {
         Some(menu) => {
             let ids = insert_top(menu.hmenu(), &spec.items);
-            let Some(chosen) = menu.track(hwnd, menu.hmenu(), point) else { return };
+            let chosen = folder.as_ref().and_then(|folder| menu.track_folder_background(hwnd, point, folder));
+            let Some(chosen) = chosen else { refresh_fence(fence); return };
             if chosen >= APP_FIRST {
                 if let Some(id) = ids.get((chosen - APP_FIRST) as usize) {
                     if let Some(a) = with_host(|h| h.menu_command(Some(fence), id, point)) { run_after(a); }
@@ -637,6 +671,7 @@ impl DropHandler for FenceDrop {
 // ---- desktop double-click hook ------------------------------------------------------
 
 pub fn update_hook(enabled: bool) {
+    LAST_CLICK.with(|click| click.set(None));
     let current = HOOK.with(Cell::get);
     if enabled && current == 0 {
         let instance = unsafe { GetModuleHandleW(None) }.ok().map(|m| HINSTANCE(m.0));
@@ -647,20 +682,43 @@ pub fn update_hook(enabled: bool) {
     }
 }
 
+// This fast path uses only window-manager metadata. Shell accessibility work
+// remains in the asynchronously posted host message.
+fn desktop_click_root(point: POINT) -> Option<HWND> {
+    let window = unsafe { WindowFromPoint(point) };
+    if window.0.is_null() { return None; }
+    let root = unsafe { GetAncestor(window, GA_ROOT) };
+    matches!(class_name(root).as_str(), "WorkerW" | "Progman").then_some(root)
+}
+
+fn next_desktop_click(previous: Option<DesktopClick>, current: Option<DesktopClick>, limit: u32, dx: i32, dy: i32) -> (Option<DesktopClick>, bool) {
+    let Some(current) = current.filter(|click| click.root != 0) else { return (None, false) };
+    let double = previous.is_some_and(|previous| previous.root == current.root
+        && current.time.wrapping_sub(previous.time) <= limit
+        && (i64::from(current.x) - i64::from(previous.x)).abs() <= i64::from(dx.max(0))
+        && (i64::from(current.y) - i64::from(previous.y)).abs() <= i64::from(dy.max(0)));
+    (if double { None } else { Some(current) }, double)
+}
+
+fn pack_screen_point(point: POINT) -> isize { ((u64::from(point.y as u32) << 32) | u64::from(point.x as u32)) as isize }
+fn unpack_screen_point(value: isize) -> POINT { POINT { x: value as u32 as i32, y: ((value as u64) >> 32) as u32 as i32 } }
+
 unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 && wp.0 as u32 == WM_LBUTTONDOWN && lp.0 != 0 {
         let info = unsafe { &*(lp.0 as *const MSLLHOOKSTRUCT) };
-        let (time, x, y) = LAST_CLICK.with(Cell::get);
         let limit = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
         let (dx, dy) = (unsafe { GetSystemMetrics(SM_CXDOUBLECLK) }, unsafe { GetSystemMetrics(SM_CYDOUBLECLK) });
-        let double = info.time.wrapping_sub(time) <= limit && (info.pt.x - x).abs() <= dx && (info.pt.y - y).abs() <= dy;
+        let current = desktop_click_root(info.pt).map(|root| DesktopClick { root: root.0 as isize, time: info.time, x: info.pt.x, y: info.pt.y });
+        let (next, double) = next_desktop_click(LAST_CLICK.with(Cell::get), current, limit, dx, dy);
+        LAST_CLICK.with(|click| click.set(next));
         if double {
-            LAST_CLICK.with(|c| c.set((0, 0, 0)));
             let host = HOST_HWND.with(Cell::get);
-            let _ = unsafe { PostMessageW(Some(HWND(host as *mut _)), WM_DESKTOP_DBLCLICK, WPARAM(info.pt.x as usize), LPARAM(info.pt.y as isize)) };
-        } else {
-            LAST_CLICK.with(|c| c.set((info.time, info.pt.x, info.pt.y)));
+            if let Some(current) = current {
+                let _ = unsafe { PostMessageW(Some(HWND(host as *mut _)), WM_DESKTOP_DBLCLICK, WPARAM(current.root as usize), LPARAM(pack_screen_point(info.pt))) };
+            }
         }
+    } else if code >= 0 && matches!(wp.0 as u32, WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_XBUTTONDOWN | WM_MOUSEWHEEL | WM_MOUSEHWHEEL) {
+        LAST_CLICK.with(|click| click.set(None));
     }
     unsafe { CallNextHookEx(None, code, wp, lp) }
 }
@@ -722,6 +780,29 @@ fn class_name(hwnd: HWND) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn desktop_double_click_requires_two_clicks_on_the_same_desktop_root() {
+        let first = DesktopClick { root: 1, time: 100, x: 500, y: 300 };
+        let second = DesktopClick { time: 200, ..first };
+        let (pending, double) = next_desktop_click(None, Some(first), 500, 4, 4);
+        assert!(!double);
+        assert_eq!(next_desktop_click(pending, Some(second), 500, 4, 4), (None, true));
+        let other = DesktopClick { root: 2, ..second };
+        assert!(!next_desktop_click(pending, Some(other), 500, 4, 4).1);
+        // A fence/application click or an intervening right button clears the
+        // candidate, even when the following desktop click is at the same point.
+        let cleared = next_desktop_click(pending, None, 500, 4, 4).0;
+        assert!(!next_desktop_click(cleared, Some(second), 500, 4, 4).1);
+    }
+    #[test]
+    fn desktop_double_click_time_wrap_and_screen_coordinates_are_bounded() {
+        let first = DesktopClick { root: 1, time: u32::MAX - 50, x: -40000, y: 50000 };
+        let next = DesktopClick { time: 25, ..first };
+        assert!(next_desktop_click(Some(first), Some(next), 500, 4, 4).1);
+        assert!(!next_desktop_click(Some(first), Some(DesktopClick { x: 40000, ..next }), 500, 4, 4).1);
+        let point = unpack_screen_point(pack_screen_point(POINT { x: -40000, y: 50000 }));
+        assert_eq!((point.x, point.y), (-40000, 50000));
+    }
     #[test]
     fn commands_round_trip_between_processes() {
         for command in [DesktopCommand::Show, DesktopCommand::Organize, DesktopCommand::Map(r"D:\资料 2026".into()), DesktopCommand::Quit] {

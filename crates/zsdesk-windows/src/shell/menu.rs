@@ -14,7 +14,7 @@ use windows::{
         System::{Com::CoTaskMemFree, Ole::IOleWindow},
         UI::{
             Shell::{
-                Common::ITEMIDLIST, IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, IShellView,
+                Common::ITEMIDLIST, IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, IShellView, IShellItem,
                 ILClone, ILFindLastID, ILRemoveLastID, SHBindToParent, SVGIO_BACKGROUND, SVGIO_SELECTION,
                 CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX, CMIC_MASK_PTINVOKE,
                 CMIC_MASK_SHIFT_DOWN, CMIC_MASK_CONTROL_DOWN, CMF_NORMAL, CMF_CANRENAME, CMF_EXTENDEDVERBS,
@@ -86,6 +86,17 @@ pub fn failure_message() -> u32 {
 extern "C" {
     fn zs_menu_set_hidden_features(hidden: u32);
     fn zs_menu_set_original_callback(callback: Option<unsafe extern "system" fn(*mut core::ffi::c_void, POINT) -> windows::core::HRESULT>);
+    fn zs_menu_track_standalone(owner: HWND, context: *mut core::ffi::c_void, menu: HMENU,
+        count: u32, pidls: *const *const ITEMIDLIST, folder: *mut core::ffi::c_void, background: i32,
+        point: *mut POINT, choice: *mut u32) -> windows::core::HRESULT;
+}
+
+pub fn report_failure(owner: HWND, error: windows::core::HRESULT) {
+    let message = failure_message();
+    if message != 0 {
+        let root = unsafe { windows::Win32::UI::WindowsAndMessaging::GetAncestor(owner, windows::Win32::UI::WindowsAndMessaging::GA_ROOT) };
+        let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(root), message, WPARAM(error.0 as u32 as usize), LPARAM(0)) };
+    }
 }
 
 // Shared bit contract with native/MenuModelFilter.h. Unknown canonical verbs
@@ -193,6 +204,40 @@ impl ShellMenu {
         self.track_with_policy(owner, menu, point, true)
     }
 
+    /// Uses a private native Shell view for the selected PIDL snapshot. The
+    /// returned command ID is handled by the existing fence open/rename logic.
+    pub fn track_selected(&self, owner: HWND, point: POINT, pidls: &[Vec<u8>]) -> Option<u32> {
+        self.track_standalone(owner, point, pidls, None, false)
+    }
+
+    pub fn track_folder_background(&self, owner: HWND, point: POINT, path: &std::path::Path) -> Option<u32> {
+        let folder = unsafe { super::shell_item(&zsdesk_core::model::explorer::ShellLocation::Path(path.to_path_buf())) }.ok();
+        self.track_standalone(owner, point, &[], folder.as_ref(), true)
+    }
+
+    fn track_standalone(&self, owner: HWND, mut point: POINT, pidls: &[Vec<u8>], folder: Option<&IShellItem>, background: bool) -> Option<u32> {
+        #[cfg(all(target_arch = "x86_64", target_env = "msvc"))]
+        if context_menu_options().modern && (!background || folder.is_some()) {
+            if let Ok(count) = u32::try_from(pidls.len()) {
+                self.filter(self.hmenu, &context_menu_options());
+                let identifiers: Vec<*const ITEMIDLIST> = pidls.iter().map(|pidl| pidl.as_ptr().cast()).collect();
+                let mut choice = 0;
+                let active = ActiveMenuScope::enter(&self.menu, true);
+                let result = unsafe { zs_menu_track_standalone(owner, self.menu.as_raw(), self.hmenu,
+                    count, identifiers.as_ptr(), folder.map_or(std::ptr::null_mut(), Interface::as_raw),
+                    i32::from(background), &mut point, &mut choice) };
+                drop(active);
+                if result.is_ok() {
+                    if choice == u32::MAX { return self.track(owner, self.hmenu, point); }
+                    return (choice != 0).then_some(choice);
+                }
+            }
+        }
+        // Version/handler failures retain all application entries and the same
+        // visibility policy in the native original presentation.
+        self.track(owner, self.hmenu, point)
+    }
+
     /// Explicit command-bar menus retain their available commands independently
     /// of which commands are shown by a file's context menu.
     pub fn track_unfiltered(&self, owner: HWND, menu: HMENU, point: POINT) -> Option<u32> {
@@ -201,8 +246,8 @@ impl ShellMenu {
 
     fn track_with_policy(&self, owner: HWND, menu: HMENU, point: POINT, context: bool) -> Option<u32> {
         let options = context_menu_options();
-        // This path always hosts an original Shell HMENU, including desktop
-        // fences while Explorer uses the Windows 11 presentation.
+        // This path hosts the original presentation, including an explicit
+        // expansion from a Windows 11 menu or its compatible fallback.
         let filter = context;
         if filter { self.filter(menu, &options); }
         let _active = ActiveMenuScope::enter(&self.menu, filter);

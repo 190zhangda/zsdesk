@@ -130,7 +130,7 @@ pub const COMMAND_BAR_CHOICES: &[(&str, CommandBarItem)] = &[
     ("新建", CommandBarItem::New), ("剪切", CommandBarItem::Cut), ("复制", CommandBarItem::Copy),
     ("粘贴", CommandBarItem::Paste), ("重命名", CommandBarItem::Rename), ("共享", CommandBarItem::Share),
     ("删除", CommandBarItem::Delete), ("排序", CommandBarItem::Sort), ("查看", CommandBarItem::View),
-    ("更多", CommandBarItem::More), ("预览", CommandBarItem::PreviewPane), ("详细信息", CommandBarItem::DetailsPane),
+    ("更多", CommandBarItem::More), ("预览", CommandBarItem::PreviewPane),
 ];
 
 pub fn interface_settings_menu(ui: &ExplorerUi) -> MenuSpec {

@@ -4,6 +4,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/CommandAgility.h");
     println!("cargo:rerun-if-changed=native/MenuCommandBridge.h");
     println!("cargo:rerun-if-changed=native/MenuModelFilter.h");
+    println!("cargo:rerun-if-changed=native/StandaloneMenuHost.h");
     println!("cargo:rerun-if-changed=native/minhook");
     if std::env::var("TARGET").as_deref() == Ok("x86_64-pc-windows-msvc") {
         cc::Build::new().files(["native/minhook/src/buffer.c", "native/minhook/src/hook.c",

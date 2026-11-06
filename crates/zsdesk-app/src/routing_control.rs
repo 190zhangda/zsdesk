@@ -407,6 +407,7 @@ fn add(settings: &mut Settings, value: Inspection, selected: bool) -> Result<()>
     {
         app.caller_module = value.caller_module;
         app.profile = value.profile;
+        app.enabled |= selected;
         return Ok(());
     }
     ensure!(settings.applications.len() < 128, "应用数量超过上限");
@@ -439,6 +440,12 @@ pub fn request_add(profile: &Path, path: PathBuf, window: HWND) -> Result<()> {
 }
 pub fn request_apply(profile: &Path, window: HWND) -> Result<()> {
     enqueue(profile, Action::Apply, window)
+}
+/// Synchronous counterpart for a background CLI. Returns only after the selected
+/// bindings are applied; it does not create a window or queue work that could be
+/// lost when the short-lived command process exits.
+pub fn apply_owned_settings(config_path: &Path) -> Result<String> {
+    apply_settings(config_path, load(config_path)?)
 }
 pub fn configure(profile: &Path, enabled: bool, window: HWND) -> Result<bool> {
     let s = load(profile)?;
@@ -654,6 +661,13 @@ fn write_ini(path: &Path, map: &BTreeMap<String, String>) -> Result<()> {
     }
     utf16_file(path, &text)
 }
+fn targets_current(settings: &Settings, ini: &BTreeMap<String, String>, current: &Path) -> bool {
+    settings.target_exe.as_ref().is_some_and(|path| key(path) == key(current))
+        && ini.get("TargetExe").is_some_and(|path| key(Path::new(path)) == key(current))
+}
+fn resume_owned_watcher(settings: &Settings, ini: &BTreeMap<String, String>, current: &Path, running: bool) -> bool {
+    settings.enabled && !running && targets_current(settings, ini, current)
+}
 fn refresh_target(settings: &Settings) -> Result<()> {
     let current = std::env::current_exe()?;
     if settings
@@ -666,14 +680,16 @@ fn refresh_target(settings: &Settings) -> Result<()> {
     if let Some(control) = installed(settings)? {
         let path = control.with_file_name("package.ini");
         let mut ini = read_ini(&path)?;
-        if ini
-            .get("TargetExe")
-            .is_some_and(|p| key(Path::new(p)) == key(&current))
-        {
+        if targets_current(settings, &ini, &current) {
             let hash = digest(&current)?;
             if ini.get("TargetSHA256") != Some(&hash) {
                 ini.insert("TargetSHA256".into(), hash);
                 write_ini(&path, &ini)?;
+            }
+            // Resume only the already installed binding file. A draft selection
+            // and the independent login-startup preference are never applied here.
+            if resume_owned_watcher(settings, &ini, &current, service_running(&control)) {
+                start_watch(&control)?;
             }
         }
     }
@@ -726,6 +742,9 @@ fn copy_component(root: &Path, item: &Component, target: &Path) -> Result<()> {
     atomic(target, &bytes)
 }
 fn start_watch(controller: &Path) -> Result<()> {
+    if service_running(controller) {
+        return Ok(());
+    }
     let mut child = Command::new(controller)
         .arg("--watch")
         .creation_flags(0x08000000)
@@ -743,13 +762,21 @@ fn start_watch(controller: &Path) -> Result<()> {
     }
     Ok(())
 }
+fn import_legacy_choices(settings: &Settings) -> bool {
+    settings.legacy && settings.applications.is_empty() && !settings.pending_changes
+}
+fn require_selected_applications(settings: &Settings) -> Result<()> {
+    ensure!(settings.applications.iter().any(|app| app.enabled) || import_legacy_choices(settings),
+            "请先勾选需要接管的应用");
+    Ok(())
+}
 fn apply_settings(profile: &Path, mut settings: Settings) -> Result<String> {
     validate_settings(&settings)?;
+    require_selected_applications(&settings)?;
     let bundle = bundled()?;
     let current = std::env::current_exe()?;
     let target_hash = digest(&current)?;
-    let import_legacy_choices =
-        settings.legacy && settings.applications.is_empty() && !settings.pending_changes;
+    let import_legacy_choices = import_legacy_choices(&settings);
     if import_legacy_choices {
         for found in discover(&bundle)? {
             if legacy_default_selection(&found) {
@@ -1052,6 +1079,54 @@ fn startup_owned(controller: &Path, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn refresh_resumes_only_an_enabled_owned_missing_watcher() {
+        let current = Path::new("C:/Apps/ZSDesk.exe");
+        let mut settings = Settings { enabled: true, target_exe: Some(current.into()), ..Default::default() };
+        let mut ini = BTreeMap::from([("TargetExe".into(), "c:\\apps\\zsdesk.exe".into())]);
+        assert!(resume_owned_watcher(&settings, &ini, current, false));
+        assert!(!resume_owned_watcher(&settings, &ini, current, true));
+        settings.start_with_windows = true;
+        assert!(resume_owned_watcher(&settings, &ini, current, false));
+        settings.enabled = false;
+        assert!(!resume_owned_watcher(&settings, &ini, current, false));
+        settings.enabled = true;
+        ini.insert("TargetExe".into(), "C:/Other/ZSDesk.exe".into());
+        assert!(!resume_owned_watcher(&settings, &ini, current, false));
+        ini.insert("TargetExe".into(), current.to_string_lossy().into_owned());
+        settings.target_exe = Some("C:/Other/ZSDesk.exe".into());
+        assert!(!resume_owned_watcher(&settings, &ini, current, false));
+    }
+    #[test]
+    fn fresh_or_explicitly_empty_choices_never_auto_select_sources() {
+        let mut settings = Settings::default();
+        assert!(require_selected_applications(&settings).is_err());
+        settings.legacy = true;
+        assert!(require_selected_applications(&settings).is_ok());
+        settings.pending_changes = true;
+        assert!(require_selected_applications(&settings).is_err());
+        settings.pending_changes = false;
+        settings.applications.push(Application { id:100, label:"reader".into(), executable:"C:/Apps/reader.exe".into(),
+            caller_module:"C:/Apps/reader.exe".into(), profile:1, enabled:false, executable_sha256:String::new(), caller_sha256:String::new() });
+        assert!(require_selected_applications(&settings).is_err());
+        settings.applications[0].enabled = true;
+        assert!(require_selected_applications(&settings).is_ok());
+    }
+    #[test]
+    fn explicitly_adding_a_discovered_application_selects_it() {
+        let found = || Inspection {
+            executable: "C:/apps/reader.exe".into(), caller_module: "C:/apps/reader.exe".into(),
+            label: "reader.exe".into(), supported: true, profile: 1, reason: String::new(),
+        };
+        let mut settings = Settings::default();
+        add(&mut settings, found(), false).unwrap();
+        assert!(!settings.applications[0].enabled);
+        add(&mut settings, found(), true).unwrap();
+        assert!(settings.applications[0].enabled);
+        add(&mut settings, found(), false).unwrap();
+        assert!(settings.applications[0].enabled);
+        assert_eq!(settings.applications.len(), 1);
+    }
     #[test]
     fn public_defaults_have_no_local_bindings() {
         let value = serde_json::to_value(Settings::default()).unwrap();

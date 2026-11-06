@@ -143,6 +143,7 @@ bool BuildExplorer(const wchar_t* executable,const wchar_t* operation,const wcha
     if(!CopyString(executable,file)||!CopyString(operation,verb)||!CopyString(parameters,args))return false;
     if(shell_route::ExplorerSelect(file,verb,args,show,gWindows,request))kind=extended?3:2;
     else if(shell_route::ExplorerDirectory(file,verb,args,show,gWindows,request))kind=4;
+    else if(shell_route::DirectDirectory(file,verb,args,show,request))kind=extended?9:8;
     else return false;
     return ExistingRequest(request);
 }
@@ -186,14 +187,26 @@ bool BuildPidls(PCIDLIST_ABSOLUTE folder,UINT count,PCUITEMID_CHILD_ARRAY childr
     return shell_route::Selection(parent,paths,flags,request)&&ExistingRequest(request);
 }
 bool BuildFolderIdList(const SHELLEXECUTEINFOW& info,RouteRequest& request) {
-    constexpr ULONG required=SEE_MASK_IDLIST|SEE_MASK_CLASSNAME;
-    constexpr ULONG allowed=required|SEE_MASK_FLAG_NO_UI|SEE_MASK_NOASYNC|SEE_MASK_UNICODE|SEE_MASK_NO_CONSOLE;
-    if((info.fMask&required)!=required||(info.fMask&~allowed)||!info.lpIDList||info.nShow!=SW_SHOWNORMAL)return false;
+    constexpr ULONG allowed=SEE_MASK_INVOKEIDLIST|SEE_MASK_CLASSNAME|SEE_MASK_FLAG_NO_UI|SEE_MASK_NOASYNC|
+        SEE_MASK_UNICODE|SEE_MASK_NO_CONSOLE|SEE_MASK_NOCLOSEPROCESS|SEE_MASK_ASYNCOK|SEE_MASK_FLAG_LOG_USAGE|SEE_MASK_WAITFORINPUTIDLE;
+    if((info.fMask&~allowed)||!shell_route::VisibleOpenCommand(info.nShow))return false;
+    if((info.fMask&(SEE_MASK_INVOKEIDLIST^SEE_MASK_IDLIST))&&
+       (info.fMask&SEE_MASK_INVOKEIDLIST)!=SEE_MASK_INVOKEIDLIST)return false;
     std::wstring file,parameters,verb,kind,path;
-    if(!CopyString(info.lpFile,file)||!file.empty()||!CopyString(info.lpParameters,parameters)||!parameters.empty()||
-       !CopyString(info.lpVerb,verb)||(!verb.empty()&&!shell_route::EqualPath(verb,L"open")&&!shell_route::EqualPath(verb,L"explore"))||
-       !CopyString(info.lpClass,kind)||!shell_route::EqualPath(kind,L"folder")||
-       !FileSystemPath(static_cast<PCIDLIST_ABSOLUTE>(info.lpIDList),path))return false;
+    if(!CopyString(info.lpFile,file)||!CopyString(info.lpParameters,parameters)||!shell_route::Trim(parameters).empty()||
+       !CopyString(info.lpVerb,verb)||!shell_route::FolderOpenVerb(verb))return false;
+    if(info.fMask&SEE_MASK_CLASSNAME){
+        if(!CopyString(info.lpClass,kind)||(!shell_route::EqualPath(kind,L"folder")&&!shell_route::EqualPath(kind,L"directory")))return false;
+    }
+    if((info.fMask&SEE_MASK_IDLIST)&&info.lpIDList){
+        if(!FileSystemPath(static_cast<PCIDLIST_ABSOLUTE>(info.lpIDList),path))return false;
+        if(!file.empty()){
+            std::wstring normalized;if(!shell_route::NormalizeAbsolute(file,normalized)||!shell_route::EqualPath(normalized,path))return false;
+        }
+    }else{
+        if((info.fMask&SEE_MASK_IDLIST)&&((info.fMask&SEE_MASK_INVOKEIDLIST)!=SEE_MASK_INVOKEIDLIST))return false;
+        path=std::move(file);
+    }
     RouteRequest folder;if(!shell_route::NormalizeAbsolute(path,folder.folder)||!ExistingRequest(folder))return false;
     request=std::move(folder);return true;
 }
@@ -217,7 +230,8 @@ BOOL WINAPI HookEx(SHELLEXECUTEINFOW* info) {
     ActiveScope active;
     try {
         SHELLEXECUTEINFOW copy{};
-        constexpr ULONG allowed=SEE_MASK_FLAG_NO_UI|SEE_MASK_NOASYNC|SEE_MASK_UNICODE|SEE_MASK_NO_CONSOLE;
+        constexpr ULONG allowed=SEE_MASK_FLAG_NO_UI|SEE_MASK_NOASYNC|SEE_MASK_UNICODE|SEE_MASK_NO_CONSOLE|
+            SEE_MASK_NOCLOSEPROCESS|SEE_MASK_ASYNCOK|SEE_MASK_FLAG_LOG_USAGE|SEE_MASK_WAITFORINPUTIDLE;
         if(info&&CopyMemorySafe(&copy,info,sizeof(copy))&&copy.cbSize==sizeof(copy)) {
             RouteRequest request;DWORD kind=0;
             bool supported=false;

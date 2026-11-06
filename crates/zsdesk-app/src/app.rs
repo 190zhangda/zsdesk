@@ -26,6 +26,7 @@ struct Options {
     apply_import: bool,
     diagnostics_main: Option<PathBuf>,
     uninstall_integration: bool,
+    routing_apply: bool,
 }
 
 fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
@@ -33,6 +34,7 @@ fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         if arg == "--uninstall-integration" { opts.uninstall_integration = true; continue; }
+        if arg == "--routing-apply" { opts.routing_apply = true; continue; }
         if arg=="--diagnostics-main"{opts.diagnostics_main=Some(iter.next().context("缺少诊断报告路径")?.into());continue;}
         if arg == "--import-tencent" {
             if opts.mode != Mode::Explorer || opts.import_source.is_some() { bail!("导入命令不能与其他启动模式混用"); }
@@ -75,6 +77,9 @@ fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
     if opts.uninstall_integration && (opts.mode != Mode::Explorer || opts.target.is_some() || opts.select || opts.classic || opts.diagnostics_main.is_some()) {
         bail!("卸载恢复不能与文件浏览或其他启动模式混用");
     }
+    if opts.routing_apply && (opts.uninstall_integration || opts.mode != Mode::Explorer || opts.target.is_some() || opts.select || opts.classic || opts.diagnostics_main.is_some()) {
+        bail!("后台文件位置设置不能与其他启动模式混用");
+    }
     if opts.diagnostics_main.is_some() && (opts.mode!=Mode::Explorer || opts.target.is_some() || opts.select){bail!("窗口诊断不能与其他启动模式混用");}
     if opts.mode == Mode::ImportTencent {
         if opts.import_report.is_none() { bail!("导入命令必须指定 --import-report 报告路径"); }
@@ -94,7 +99,7 @@ pub fn shell_open_target() -> Option<OsString> {
 
 /// Used before parsing succeeds so malformed background commands never show UI.
 pub fn is_import_cli() -> bool {
-    std::env::args_os().skip(1).any(|arg| arg == "--import-tencent" || arg == "--import-report" || arg == "--apply-import" || arg == "--diagnostics" || arg == "--diagnostics-main" || arg == "--build-info" || arg == "--uninstall-integration")
+    std::env::args_os().skip(1).any(|arg| arg == "--import-tencent" || arg == "--import-report" || arg == "--apply-import" || arg == "--diagnostics" || arg == "--diagnostics-main" || arg == "--build-info" || arg == "--uninstall-integration" || arg == "--routing-apply")
 }
 
 pub fn run() -> Result<()> {
@@ -108,6 +113,10 @@ pub fn run() -> Result<()> {
     let opts = parse(std::env::args_os().skip(1))?;
     let config = std::path::absolute(opts.profile.map(|p| p.join("explorer-session.json")).unwrap_or_else(storage::config_path))?;
     let desktop_config = config.with_file_name("desktop-fences.json");
+    if opts.routing_apply {
+        println!("{}", crate::routing_control::apply_owned_settings(&config)?);
+        return Ok(());
+    }
     if opts.uninstall_integration {
         let exe = std::env::current_exe()?;
         crate::routing_control::uninstall_owned(&config, &exe)?;

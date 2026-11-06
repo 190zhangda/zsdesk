@@ -119,12 +119,29 @@ inline bool IsExplorer(std::wstring_view executable, std::wstring_view windowsDi
     return NormalizeAbsolute(path, expected) && EqualPath(actual, expected);
 }
 
-// Accept only the known Weixin open/explorer.exe /select,<one absolute path>
-// form. Unsupported Explorer switches, non-default show modes and verbs fall back.
+inline bool VisibleOpenCommand(int showCommand) {
+    return showCommand==SW_SHOWNORMAL||showCommand==SW_SHOW||
+           showCommand==SW_RESTORE||showCommand==SW_SHOWDEFAULT;
+}
+
+inline bool FolderOpenVerb(std::wstring_view operation) {
+    return operation.empty()||EqualPath(operation,L"open")||EqualPath(operation,L"explore");
+}
+
+// The caller verifies the resulting path is an existing filesystem directory.
+// Parameters, ordinary documents, executables and custom verbs are not routed.
+inline bool DirectDirectory(std::wstring_view file,std::wstring_view operation,
+                            std::wstring_view parameters,int showCommand,RouteRequest& output) {
+    if(!FolderOpenVerb(operation)||!VisibleOpenCommand(showCommand)||!Trim(parameters).empty())return false;
+    RouteRequest request;if(!NormalizeAbsolute(file,request.folder))return false;
+    output=std::move(request);return true;
+}
+
+// Unsupported Explorer switches and nonactivating/minimized show modes fall back.
 inline bool ExplorerSelect(std::wstring_view executable, std::wstring_view operation,
                            std::wstring_view parameters, int showCommand,
                            std::wstring_view windowsDirectory, RouteRequest& output) {
-    if ((!operation.empty() && !EqualPath(operation, L"open")) || showCommand != SW_SHOWNORMAL ||
+    if ((!operation.empty() && !EqualPath(operation, L"open")) || !VisibleOpenCommand(showCommand) ||
         !IsExplorer(executable, windowsDirectory)) return false;
     parameters = Trim(parameters);
     constexpr std::wstring_view prefix = L"/select,";
@@ -146,7 +163,7 @@ inline bool ExplorerSelect(std::wstring_view executable, std::wstring_view opera
 inline bool ExplorerDirectory(std::wstring_view executable, std::wstring_view operation,
                               std::wstring_view parameters, int showCommand,
                               std::wstring_view windowsDirectory, RouteRequest& output) {
-    if ((!operation.empty() && !EqualPath(operation, L"open")) || showCommand != SW_SHOWNORMAL ||
+    if (!FolderOpenVerb(operation) || !VisibleOpenCommand(showCommand) ||
         !IsExplorer(executable, windowsDirectory)) return false;
     auto path = Trim(parameters);
     if (path.empty()) return false;

@@ -24,9 +24,9 @@ use windows::{
             Shell::{
                 IContextMenu, INameSpaceTreeControl, INameSpaceTreeControl2, INameSpaceTreeControlEvents,
                 INameSpaceTreeControlEvents_Impl, IShellItem, IShellItemArray, IShellItemFilter, IShellItemFilter_Impl,
-                NamespaceTreeControl, SHGetFileInfoW, SHGetIDListFromObject, SHGetKnownFolderItem, NSTCECT_DBLCLICK,
-                NSTCECT_LBUTTON, NSTCECT_MBUTTON, NSTCEHT_ONITEM, NSTCEHT_ONITEMBUTTON, NSTCEHT_ONITEMICON,
-                NSTCEHT_ONITEMLABEL, NSTCIS_EXPANDED, NSTCIS_SELECTED, NSTCIS_SELECTEDNOEXPAND, NSTCRS_EXPANDED, NSTCRS_VISIBLE,
+                NamespaceTreeControl, SHGetFileInfoW, SHGetIDListFromObject, SHGetKnownFolderItem, NSTCECT_BUTTON,
+                NSTCECT_LBUTTON, NSTCECT_MBUTTON, NSTCEHT_ONITEM, NSTCEHT_ONITEMBUTTON, NSTCEHT_ONITEMINDENT,
+                NSTCEHT_ONITEMRIGHT, NSTCIS_EXPANDED, NSTCIS_SELECTED, NSTCIS_SELECTEDNOEXPAND, NSTCRS_EXPANDED, NSTCRS_VISIBLE,
                 SICHINT_CANONICAL,
                 NSTCS_AUTOHSCROLL, NSTCS_FULLROWSELECT, NSTCS_HASEXPANDOS, NSTCS_NOEDITLABELS,
                 NSTCS_SHOWSELECTIONALWAYS, NSTCS_FADEINOUTEXPANDOS, NSTCS_TABSTOP, NSTCS_ROOTHASEXPANDO,
@@ -50,6 +50,16 @@ use super::{
 };
 
 const S_FALSE: HRESULT = HRESULT(1);
+
+#[cfg(test)]
+thread_local! {
+    static CLICK_TRACE: RefCell<Vec<(u32, u32, u32)>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub fn take_click_trace_for_test() -> Vec<(u32, u32, u32)> {
+    CLICK_TRACE.with(|trace| std::mem::take(&mut *trace.borrow_mut()))
+}
 
 pub struct NamespaceTreeHost {
     tree: INameSpaceTreeControl,
@@ -296,6 +306,21 @@ impl TreeEvents {
     }
 }
 
+/// Returns whether an item click opens a new tab. Structural tree regions stay
+/// under native TreeView control and must never navigate the folder view.
+fn navigation_click(hit_test: u32, click_type: u32) -> Option<bool> {
+    let structural = (NSTCEHT_ONITEMBUTTON.0 | NSTCEHT_ONITEMINDENT.0) as u32;
+    // FULLROWSELECT includes the blank area after the label. ONITEM alone only
+    // contains the icon, label and state icon, so it misses that part of a row.
+    let item_row = (NSTCEHT_ONITEM.0 | NSTCEHT_ONITEMRIGHT.0) as u32;
+    if hit_test & structural != 0 || hit_test & item_row == 0 { return None; }
+    match click_type & NSTCECT_BUTTON.0 as u32 {
+        button if button == NSTCECT_LBUTTON.0 as u32 => Some(false),
+        button if button == NSTCECT_MBUTTON.0 as u32 => Some(true),
+        _ => None,
+    }
+}
+
 unsafe fn system_icon_indices(item: &IShellItem) -> Option<(i32, i32)> {
     let pidl = unsafe { SHGetIDListFromObject(item).ok()? };
     let path = PCWSTR(pidl.cast());
@@ -312,18 +337,13 @@ unsafe fn system_icon_indices(item: &IShellItem) -> Option<(i32, i32)> {
 #[allow(non_snake_case)]
 impl INameSpaceTreeControlEvents_Impl for TreeEvents_Impl {
     fn OnItemClick(&self, shell_item: Ref<IShellItem>, hit_test: u32, click_type: u32) -> Result<()> {
-        let hit = hit_test as i32;
-        let is_item = hit & (NSTCEHT_ONITEM.0 | NSTCEHT_ONITEMLABEL.0 | NSTCEHT_ONITEMICON.0) != 0;
-        let is_expand_button = hit & NSTCEHT_ONITEMBUTTON.0 != 0;
-        // Low bits carry the button (1 left, 2 middle, 3 right); NSTCECT_DBLCLICK is a flag.
-        let button = click_type & 0x3;
-        let _ = NSTCECT_DBLCLICK;
-        let middle = button == NSTCECT_MBUTTON.0 as u32;
-        let left = button == NSTCECT_LBUTTON.0 as u32;
-        if (left || middle) && is_item && !is_expand_button {
-            if let Some(item) = shell_item.as_ref() { self.post_item(item, middle); }
+        #[cfg(test)]
+        CLICK_TRACE.with(|trace| trace.borrow_mut().push((hit_test, click_type,
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetMessagePos() })));
+        if let Some(new_tab) = navigation_click(hit_test, click_type) {
+            if let Some(item) = shell_item.as_ref() { self.post_item(item, new_tab); }
             // Middle click is fully handled here; do not change tree selection.
-            if middle { return Ok(()); }
+            if new_tab { return Ok(()); }
         }
         // S_OK consumes TreeView's default processing, including expand/collapse.
         Err(Error::from_hresult(S_FALSE))
@@ -356,5 +376,41 @@ impl INameSpaceTreeControlEvents_Impl for TreeEvents_Impl {
         if default_icon.is_null() || open_icon.is_null() { return Err(Error::from_hresult(S_FALSE)); }
         unsafe { *default_icon = default_index; *open_icon = open_index; }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::Shell::{NSTCECT_DBLCLICK, NSTCECT_RBUTTON,
+        NSTCEHT_NOWHERE, NSTCEHT_ONITEMICON, NSTCEHT_ONITEMLABEL, NSTCEHT_ONITEMSTATEICON};
+
+    #[test]
+    fn entire_selected_row_opens_the_folder() {
+        for hit in [NSTCEHT_ONITEMICON, NSTCEHT_ONITEMLABEL, NSTCEHT_ONITEMSTATEICON, NSTCEHT_ONITEMRIGHT] {
+            assert_eq!(navigation_click(hit.0 as u32, NSTCECT_LBUTTON.0 as u32), Some(false));
+            assert_eq!(navigation_click(hit.0 as u32, NSTCECT_MBUTTON.0 as u32), Some(true));
+        }
+    }
+
+    #[test]
+    fn expansion_and_indent_never_navigate() {
+        for hit in [NSTCEHT_ONITEMBUTTON.0, NSTCEHT_ONITEMINDENT.0, NSTCEHT_NOWHERE.0,
+            NSTCEHT_ONITEMBUTTON.0 | NSTCEHT_ONITEMLABEL.0,
+            NSTCEHT_ONITEMINDENT.0 | NSTCEHT_ONITEMRIGHT.0] {
+            for button in [NSTCECT_LBUTTON.0, NSTCECT_MBUTTON.0, NSTCECT_RBUTTON.0] {
+                assert_eq!(navigation_click(hit as u32, button as u32), None);
+            }
+        }
+    }
+
+    #[test]
+    fn double_click_flag_preserves_button_identity() {
+        let hit = NSTCEHT_ONITEMRIGHT.0 as u32;
+        assert_eq!(navigation_click(hit, (NSTCECT_LBUTTON.0 | NSTCECT_DBLCLICK.0) as u32), Some(false));
+        assert_eq!(navigation_click(hit, (NSTCECT_MBUTTON.0 | NSTCECT_DBLCLICK.0) as u32), Some(true));
+        assert_eq!(navigation_click(hit, (NSTCECT_RBUTTON.0 | NSTCECT_DBLCLICK.0) as u32), None);
+        assert_eq!(navigation_click(hit, NSTCECT_RBUTTON.0 as u32), None);
+        assert_eq!(navigation_click(hit, 0), None);
     }
 }
