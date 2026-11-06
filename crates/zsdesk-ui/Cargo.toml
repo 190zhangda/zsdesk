@@ -1,0 +1,11 @@
+[package]
+name = "zsdesk-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ZSDesk native window layout."
+
+[dependencies]
+zsui = { path = "../../../zsui", default-features = false }
+zsdesk-core = { path = "../zsdesk-core" }

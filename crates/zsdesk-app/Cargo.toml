@@ -1,0 +1,70 @@
+[package]
+name = "zsdesk-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ZSDesk application entry: MVU state, commands and window host."
+
+[dependencies]
+zsdesk-core = { path = "../zsdesk-core" }
+zsdesk-platform = { path = "../zsdesk-platform" }
+zsdesk-ui = { path = "../zsdesk-ui" }
+zsdesk-windows = { path = "../zsdesk-windows" }
+anyhow.workspace = true
+dirs.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+roxmltree = "0.21.1"
+sha2 = "0.10.9"
+rusqlite.workspace = true
+
+[features]
+# Editions: 标准版 = no features, 网络版 = network, 桌面版 = desktop, 全量版 = both.
+default = ["network", "desktop"]
+network = []
+desktop = []
+
+[[example]]
+name = "desktop_probe"
+path = "examples/desktop_probe.rs"
+
+[[example]]
+name = "enum_probe"
+path = "examples/enum_probe.rs"
+required-features = []
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-core = "0.62.2"
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_NetworkManagement_WNet",
+  "Win32_Graphics_Direct2D",
+  "Win32_Graphics_Direct2D_Common",
+  "Win32_Graphics_DirectWrite",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Imaging",
+  "Win32_System_Memory",
+  "Win32_System_Registry",
+  "Win32_UI_Accessibility",
+  "Win32_Security",
+  "Win32_System_Threading",
+  "Win32_System_DataExchange",
+  "Win32_Graphics_Gdi",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_Globalization",
+  "Win32_UI_Controls",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_PropertiesSystem",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Ole",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0"

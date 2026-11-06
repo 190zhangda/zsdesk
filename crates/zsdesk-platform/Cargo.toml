@@ -1,0 +1,10 @@
+[package]
+name = "zsdesk-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ZSDesk platform-agnostic traits implemented by zsdesk-windows."
+
+[dependencies]
+zsdesk-core = { path = "../zsdesk-core" }

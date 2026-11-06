@@ -1,0 +1,220 @@
+//! Windows 11 Fluent design tokens for the Explorer chrome and desktop fences.
+//!
+//! Values follow the WinUI 3 light/dark resource dictionaries. Semantic roles
+//! use ZSUI's [`ColorRole`] so chrome code never hard-codes per-control colors.
+
+pub use zsui::{Color, ColorRole, ZsIcon};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode { Light, Dark }
+
+/// Colors for one theme mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Palette {
+    pub mode: Mode,
+    /// Tab strip when no DWM backdrop is visible.
+    pub strip: Color,
+    /// Active tab, address row and command bar (the "layer" above Mica).
+    pub layer: Color,
+    /// Shell content, tree and status bar background.
+    pub content: Color,
+    pub text: Color,
+    pub text_secondary: Color,
+    pub text_disabled: Color,
+    pub accent: Color,
+    pub accent_text: Color,
+    /// Subtle button hover / pressed fills.
+    pub hover: Color,
+    pub pressed: Color,
+    /// Text box fill (solid so native EDIT controls can match it).
+    pub input: Color,
+    pub input_focused: Color,
+    pub input_border: Color,
+    pub input_underline: Color,
+    pub stroke: Color,
+    pub divider: Color,
+    pub danger: Color,
+    pub inactive_tab_separator: Color,
+}
+
+impl Palette {
+    pub const fn light() -> Self {
+        Self {
+            mode: Mode::Light,
+            strip: Color::rgb(0xEE, 0xF1, 0xF6),
+            layer: Color::rgb(0xF9, 0xF9, 0xF9),
+            content: Color::rgb(0xFF, 0xFF, 0xFF),
+            text: Color::rgba(0, 0, 0, 0xE4),
+            text_secondary: Color::rgba(0, 0, 0, 0x9B),
+            text_disabled: Color::rgba(0, 0, 0, 0x5C),
+            accent: Color::rgb(0x00, 0x5F, 0xB8),
+            accent_text: Color::rgb(0xFF, 0xFF, 0xFF),
+            hover: Color::rgba(0, 0, 0, 0x0F),
+            pressed: Color::rgba(0, 0, 0, 0x09),
+            input: Color::rgb(0xFF, 0xFF, 0xFF),
+            input_focused: Color::rgb(0xFF, 0xFF, 0xFF),
+            input_border: Color::rgba(0, 0, 0, 0x0F),
+            input_underline: Color::rgba(0, 0, 0, 0x72),
+            stroke: Color::rgba(0, 0, 0, 0x0F),
+            divider: Color::rgba(0, 0, 0, 0x14),
+            danger: Color::rgb(0xC4, 0x2B, 0x1C),
+            inactive_tab_separator: Color::rgba(0, 0, 0, 0x24),
+        }
+    }
+
+    pub const fn dark() -> Self {
+        Self {
+            mode: Mode::Dark,
+            strip: Color::rgb(0x20, 0x20, 0x20),
+            layer: Color::rgb(0x2C, 0x2C, 0x2C),
+            content: Color::rgb(0x19, 0x19, 0x19),
+            text: Color::rgb(0xFF, 0xFF, 0xFF),
+            text_secondary: Color::rgba(0xFF, 0xFF, 0xFF, 0xC8),
+            text_disabled: Color::rgba(0xFF, 0xFF, 0xFF, 0x5D),
+            accent: Color::rgb(0x60, 0xCD, 0xFF),
+            accent_text: Color::rgb(0, 0, 0),
+            hover: Color::rgba(0xFF, 0xFF, 0xFF, 0x0F),
+            pressed: Color::rgba(0xFF, 0xFF, 0xFF, 0x0A),
+            input: Color::rgb(0x37, 0x37, 0x37),
+            input_focused: Color::rgb(0x1F, 0x1F, 0x1F),
+            input_border: Color::rgba(0xFF, 0xFF, 0xFF, 0x12),
+            input_underline: Color::rgba(0xFF, 0xFF, 0xFF, 0x8B),
+            stroke: Color::rgba(0xFF, 0xFF, 0xFF, 0x12),
+            divider: Color::rgba(0xFF, 0xFF, 0xFF, 0x15),
+            danger: Color::rgb(0xC4, 0x2B, 0x1C),
+            inactive_tab_separator: Color::rgba(0xFF, 0xFF, 0xFF, 0x28),
+        }
+    }
+
+    pub const fn for_mode(mode: Mode) -> Self { match mode { Mode::Light => Self::light(), Mode::Dark => Self::dark() } }
+
+    /// Resolves a ZSUI semantic role.
+    pub const fn role(&self, role: ColorRole) -> Color {
+        match role {
+            ColorRole::PrimaryText => self.text,
+            ColorRole::SecondaryText => self.text_secondary,
+            ColorRole::DisabledText => self.text_disabled,
+            ColorRole::Accent => self.accent,
+            ColorRole::AccentText => self.accent_text,
+            ColorRole::Surface => self.content,
+            ColorRole::SurfaceRaised => self.layer,
+            ColorRole::Control => self.input,
+            ColorRole::Border => self.stroke,
+            ColorRole::StrongStroke => self.input_underline,
+            ColorRole::Success => Color::rgb(0x0F, 0x7B, 0x0F),
+            ColorRole::Warning => Color::rgb(0x9D, 0x5D, 0x00),
+            ColorRole::Danger => self.danger,
+        }
+    }
+}
+
+/// Desktop fence appearance (translucent layer over the wallpaper).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FencePalette {
+    pub background: Color,
+    pub title: Color,
+    pub border: Color,
+    pub text: Color,
+    pub text_secondary: Color,
+    pub text_shadow: Color,
+    pub hover: Color,
+    pub selected: Color,
+    pub selected_border: Color,
+    pub accent: Color,
+}
+
+impl FencePalette {
+    /// `opacity` is the background opacity in percent (10–100).
+    pub fn new(mode: Mode, opacity: u8) -> Self {
+        let a = (opacity.clamp(10, 100) as u32 * 255 / 100) as u8;
+        match mode {
+            Mode::Dark => Self {
+                background: Color::rgba(0x1C, 0x1C, 0x1C, a),
+                title: Color::rgba(0x00, 0x00, 0x00, (a as u32 * 2 / 5) as u8),
+                border: Color::rgba(0xFF, 0xFF, 0xFF, 0x22),
+                text: Color::rgb(0xFF, 0xFF, 0xFF),
+                text_secondary: Color::rgba(0xFF, 0xFF, 0xFF, 0xB0),
+                text_shadow: Color::rgba(0, 0, 0, 0xA0),
+                hover: Color::rgba(0xFF, 0xFF, 0xFF, 0x18),
+                selected: Color::rgba(0x60, 0xCD, 0xFF, 0x40),
+                selected_border: Color::rgba(0x60, 0xCD, 0xFF, 0x90),
+                accent: Color::rgb(0x60, 0xCD, 0xFF),
+            },
+            Mode::Light => Self {
+                background: Color::rgba(0xF6, 0xF6, 0xF6, a),
+                title: Color::rgba(0xFF, 0xFF, 0xFF, (a as u32 * 3 / 5) as u8),
+                border: Color::rgba(0, 0, 0, 0x1A),
+                text: Color::rgba(0, 0, 0, 0xE4),
+                text_secondary: Color::rgba(0, 0, 0, 0x9B),
+                text_shadow: Color::rgba(0xFF, 0xFF, 0xFF, 0x00),
+                hover: Color::rgba(0, 0, 0, 0x0D),
+                selected: Color::rgba(0x00, 0x5F, 0xB8, 0x30),
+                selected_border: Color::rgba(0x00, 0x5F, 0xB8, 0x80),
+                accent: Color::rgb(0x00, 0x5F, 0xB8),
+            },
+        }
+    }
+}
+
+/// Segoe Fluent Icons / Segoe MDL2 Assets code points. Semantic icons come
+/// from ZSUI's [`ZsIcon`]; Explorer-specific glyphs are listed here.
+pub mod glyph {
+    use super::ZsIcon;
+    pub const BACK: &str = "\u{E72B}";
+    pub const FORWARD: &str = "\u{E72A}";
+    pub const UP: &str = "\u{E74A}";
+    pub const REFRESH: &str = ZsIcon::Refresh.windows_fluent_glyph();
+    pub const ADD: &str = ZsIcon::Add.windows_fluent_glyph();
+    pub const CLOSE_SMALL: &str = "\u{E711}";
+    pub const SEARCH: &str = ZsIcon::Search.windows_fluent_glyph();
+    pub const CHEVRON_RIGHT: &str = "\u{E76C}";
+    pub const CHEVRON_DOWN: &str = "\u{E70D}";
+    pub const CHEVRON_DOWN_SMALL: &str = "\u{E96E}";
+    pub const CUT: &str = ZsIcon::Cut.windows_fluent_glyph();
+    pub const COPY: &str = ZsIcon::Copy.windows_fluent_glyph();
+    pub const PASTE: &str = ZsIcon::Paste.windows_fluent_glyph();
+    pub const RENAME: &str = "\u{E8AC}";
+    pub const DELETE: &str = ZsIcon::Delete.windows_fluent_glyph();
+    pub const SHARE: &str = "\u{E72D}";
+    pub const SORT: &str = "\u{E8CB}";
+    pub const VIEW: &str = "\u{E8A9}";
+    pub const MORE: &str = ZsIcon::More.windows_fluent_glyph();
+    pub const MENU: &str = "\u{E700}";
+    pub const STAR: &str = "\u{E734}";
+    pub const STAR_FILLED: &str = "\u{E735}";
+    pub const DETAILS_VIEW: &str = "\u{E8FD}";
+    pub const TILES_VIEW: &str = "\u{E8B9}";
+    pub const PROPERTIES: &str = "\u{E946}";
+    pub const PREVIEW: &str = "\u{E8FF}";
+    pub const OVERFLOW: &str = "\u{E76C}\u{E76C}";
+    pub const TABS: &str = "\u{E737}";
+    pub const LOCK: &str = "\u{E72E}";
+    pub const PIN: &str = ZsIcon::Pin.windows_fluent_glyph();
+    pub const FOLDER: &str = ZsIcon::Folder.windows_fluent_glyph();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn palettes_keep_readable_contrast() {
+        for p in [Palette::light(), Palette::dark()] {
+            assert_ne!(p.text, p.layer);
+            assert_eq!(p.role(ColorRole::SurfaceRaised), p.layer);
+            assert_eq!(p.input.a, 255, "native EDIT backgrounds must be opaque");
+            assert_eq!(p.input_focused.a, 255);
+        }
+    }
+    #[test]
+    fn fence_opacity_is_clamped() {
+        assert_eq!(FencePalette::new(Mode::Dark, 0).background.a, 25);
+        assert_eq!(FencePalette::new(Mode::Dark, 200).background.a, 255);
+    }
+    #[test]
+    fn zsui_glyphs_are_private_use_code_points() {
+        for g in [glyph::ADD, glyph::REFRESH, glyph::SEARCH, glyph::CUT, glyph::DELETE] {
+            let c = g.chars().next().unwrap() as u32;
+            assert!((0xE000..=0xF8FF).contains(&c));
+        }
+    }
+}

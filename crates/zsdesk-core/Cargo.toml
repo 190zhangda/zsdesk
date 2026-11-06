@@ -1,0 +1,11 @@
+[package]
+name = "zsdesk-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ZSDesk domain model: tabs, grids, rules, layout and common types."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

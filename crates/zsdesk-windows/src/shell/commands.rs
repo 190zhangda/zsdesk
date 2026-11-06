@@ -1,0 +1,262 @@
+//! Command bar operations on the hosted Shell view. Every action goes through
+//! the view's own `IContextMenu` / `IFolderView2`, so copy, paste, delete,
+//! rename and "新建" behave exactly like File Explorer (undo, conflicts,
+//! progress UI, recycle bin and third-party handlers included).
+
+use windows::{
+    core::{Interface, Result, BOOL},
+    Win32::{
+        Foundation::{HWND, POINT, PROPERTYKEY},
+        System::Ole::IOleWindow,
+        UI::Shell::{
+            IFolderView2, IShellItem, IShellItem2, IShellItemArray, SORTCOLUMN, SORT_ASCENDING, SORT_DESCENDING, SVGIO_ALLVIEW,
+            SVGIO_SELECTION, SVSI_SELECT, SVSI_DESELECT, FWF_CHECKSELECT, FOLDERFLAGS, SHGetSetSettings, SHELLSTATEA,
+            SSF_SHOWALLOBJECTS, SSF_SHOWEXTENSIONS, SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_FILESYSPATH,
+        },
+    },
+};
+
+use super::{menu::ShellMenu, ExplorerBrowserHost};
+
+pub const PKEY_NAME: PROPERTYKEY = PROPERTYKEY { fmtid: windows::core::GUID::from_u128(0xB725F130_47EF_101A_A5F1_02608C9EEBAC), pid: 10 };
+pub const PKEY_TYPE: PROPERTYKEY = PROPERTYKEY { fmtid: windows::core::GUID::from_u128(0xB725F130_47EF_101A_A5F1_02608C9EEBAC), pid: 4 };
+pub const PKEY_SIZE: PROPERTYKEY = PROPERTYKEY { fmtid: windows::core::GUID::from_u128(0xB725F130_47EF_101A_A5F1_02608C9EEBAC), pid: 12 };
+pub const PKEY_MODIFIED: PROPERTYKEY = PROPERTYKEY { fmtid: windows::core::GUID::from_u128(0xB725F130_47EF_101A_A5F1_02608C9EEBAC), pid: 14 };
+pub const PKEY_CREATED: PROPERTYKEY = PROPERTYKEY { fmtid: windows::core::GUID::from_u128(0xB725F130_47EF_101A_A5F1_02608C9EEBAC), pid: 15 };
+const PKEY_NULL: PROPERTYKEY = PROPERTYKEY { fmtid: windows::core::GUID::zeroed(), pid: 0 };
+
+/// Sort/group column identifiers shared with the UI layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Column { Name, Modified, Type, Size, Created }
+
+impl Column {
+    pub const fn key(self) -> PROPERTYKEY {
+        match self { Self::Name => PKEY_NAME, Self::Modified => PKEY_MODIFIED, Self::Type => PKEY_TYPE, Self::Size => PKEY_SIZE, Self::Created => PKEY_CREATED }
+    }
+    fn from_key(key: &PROPERTYKEY) -> Option<Self> {
+        [Self::Name, Self::Modified, Self::Type, Self::Size, Self::Created].into_iter().find(|c| {
+            let k = c.key(); k.fmtid == key.fmtid && k.pid == key.pid })
+    }
+}
+
+/// Item counts and the total size of selected files.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewStatus { pub items: usize, pub selected: usize, pub selected_bytes: Option<u64> }
+
+/// `None` is also cached: unsupported size metadata must not be retried by
+/// every status timer. Revision changes distinguish equal-sized selections.
+#[derive(Default)]
+pub(crate) struct SelectionSizeCache { entry: Option<(u64, usize, Option<u64>)> }
+impl SelectionSizeCache {
+    pub(crate) fn get(&self, revision: u64, selected: usize) -> Option<Option<u64>> {
+        self.entry.filter(|&(r, count, _)| r == revision && count == selected).map(|(_, _, bytes)| bytes)
+    }
+    pub(crate) fn store(&mut self, revision: u64, selected: usize, bytes: Option<u64>) {
+        self.entry = Some((revision, selected, bytes));
+    }
+}
+
+impl ExplorerBrowserHost {
+    fn folder_view(&self) -> Result<IFolderView2> { unsafe { self.current_view()?.cast() } }
+
+    /// Top-level window of the Shell view (for focus tests).
+    pub fn view_window(&self) -> Option<HWND> {
+        let view = unsafe { self.current_view().ok()? };
+        let window: IOleWindow = view.cast().ok()?;
+        unsafe { window.GetWindow().ok() }
+    }
+
+    /// Runs a verb on the selection ("cut", "copy", "delete", "properties" …).
+    pub fn invoke_selection(&self, owner: HWND, verb: &str, shift: bool) -> Result<()> {
+        let view = unsafe { self.current_view()? };
+        let menu = ShellMenu::for_view(&view, true)?;
+        menu.populate_for_invoke(shift)?;
+        menu.invoke_verb(owner, verb, shift)
+    }
+
+    /// Runs a verb on the folder background ("paste", "NewFolder", "properties").
+    pub fn invoke_background(&self, owner: HWND, verb: &str) -> Result<()> {
+        let view = unsafe { self.current_view()? };
+        let menu = ShellMenu::for_view(&view, false)?;
+        menu.populate_for_invoke(false)?;
+        menu.invoke_verb(owner, verb, false)
+    }
+
+    /// Shows the native "新建" submenu at `point` (screen) and runs the choice.
+    pub fn show_new_menu(&self, owner: HWND, point: POINT) -> Result<()> {
+        let view = unsafe { self.current_view()? };
+        let menu = ShellMenu::for_view(&view, false)?;
+        menu.populate(false, false)?;
+        // Without a recognizable "新建" submenu show the whole background menu instead.
+        let sub = menu.submenu_with_verb("NewFolder").unwrap_or(menu.hmenu());
+        if let Some(id) = menu.track_unfiltered(owner, sub, point) {
+            if ShellMenu::is_shell_id(id) { menu.invoke(owner, id, Some(point), false, false)?; }
+        }
+        Ok(())
+    }
+
+    /// Starts in-place rename of the selected item.
+    pub fn rename_selection(&self) -> Result<()> { unsafe { self.folder_view()?.DoRename() } }
+
+    pub fn select_all(&self, select: bool) {
+        let Ok(view) = self.folder_view() else { return };
+        let count = unsafe { view.ItemCount(SVGIO_ALLVIEW) }.unwrap_or(0);
+        let flag = if select { SVSI_SELECT.0 } else { SVSI_DESELECT.0 } as u32;
+        for i in 0..count.min(100_000) { let _ = unsafe { view.SelectItem(i, flag) }; }
+    }
+
+    pub fn invert_selection(&self) {
+        let Ok(view) = self.folder_view() else { return };
+        let count = unsafe { view.ItemCount(SVGIO_ALLVIEW) }.unwrap_or(0);
+        for i in 0..count.min(100_000) {
+            let Ok(pidl) = (unsafe { view.Item(i) }) else { continue };
+            let state = unsafe { view.GetSelectionState(pidl) }.unwrap_or(0) as i32;
+            unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(pidl.cast())) };
+            let flag = if state & SVSI_SELECT.0 != 0 { SVSI_DESELECT.0 } else { SVSI_SELECT.0 };
+            let _ = unsafe { view.SelectItem(i, flag as u32) };
+        }
+    }
+
+    pub fn sort(&self) -> Option<(Column, bool)> {
+        let view = self.folder_view().ok()?;
+        let mut columns = [SORTCOLUMN::default()];
+        unsafe { view.GetSortColumns(&mut columns).ok()? };
+        Some((Column::from_key(&columns[0].propkey)?, columns[0].direction == SORT_ASCENDING))
+    }
+
+    pub fn set_sort(&self, column: Column, ascending: bool) -> Result<()> {
+        let view = self.folder_view()?;
+        let columns = [SORTCOLUMN { propkey: column.key(), direction: if ascending { SORT_ASCENDING } else { SORT_DESCENDING } }];
+        unsafe { view.SetSortColumns(&columns) }
+    }
+
+    pub fn group(&self) -> Option<Column> {
+        let view = self.folder_view().ok()?;
+        let mut key = PROPERTYKEY::default();
+        let mut ascending = BOOL(1);
+        unsafe { view.GetGroupBy(&mut key, Some(&mut ascending)).ok()? };
+        Column::from_key(&key)
+    }
+
+    pub fn set_group(&self, column: Option<Column>) -> Result<()> {
+        let view = self.folder_view()?;
+        let key = column.map_or(PKEY_NULL, Column::key);
+        unsafe { view.SetGroupBy(&key, true) }
+    }
+
+    pub fn checkboxes(&self) -> bool {
+        self.folder_view().ok().and_then(|v| unsafe { v.GetCurrentFolderFlags() }.ok()).is_some_and(|f| f & FWF_CHECKSELECT.0 as u32 != 0)
+    }
+
+    pub fn set_checkboxes(&self, on: bool) -> Result<()> {
+        let view = self.folder_view()?;
+        unsafe { view.SetCurrentFolderFlags(FWF_CHECKSELECT.0 as u32, if on { FWF_CHECKSELECT.0 as u32 } else { 0 }) }
+    }
+
+    pub fn status(&self) -> ViewStatus {
+        let Ok(view) = self.folder_view() else { return ViewStatus::default() };
+        let items = unsafe { view.ItemCount(SVGIO_ALLVIEW) }.unwrap_or(0).max(0) as usize;
+        let selected = unsafe { view.ItemCount(SVGIO_SELECTION) }.unwrap_or(0).max(0) as usize;
+        let revision = self.selection_revision.get();
+        let cached = self.selection_size.borrow().get(revision, selected);
+        let bytes = if let Some(bytes) = cached { bytes } else {
+            // Never hold a RefCell borrow while calling third-party Shell
+            // properties: COM can reenter and notify a new selection.
+            let bytes = if selected > 0 {
+                unsafe { view.GetSelection(false) }.ok().and_then(|array|
+                    selection_size(&array, || self.selection_revision.get() == revision))
+            } else { None };
+            if self.selection_revision.get() == revision {
+                self.selection_size.borrow_mut().store(revision, selected, bytes);
+                bytes
+            } else { None }
+        };
+        ViewStatus { items, selected, selected_bytes: bytes }
+    }
+
+    /// File-system paths (or parsing names) of the selection, or the folder itself.
+    pub fn selection_paths(&self) -> Vec<String> {
+        self.selection_paths_limit(5000)
+    }
+    pub fn selection_paths_limit(&self,limit:u32)->Vec<String>{
+        let Ok(view) = self.folder_view() else { return Vec::new() };
+        let Ok(array) = (unsafe { view.GetSelection(false) }) else { return Vec::new() };
+        let count = unsafe { array.GetCount() }.unwrap_or(0);
+        (0..count.min(limit)).filter_map(|i| {
+            let item = unsafe { array.GetItemAt(i) }.ok()?;
+            let name = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }.or_else(|_| unsafe { item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) }).ok()?;
+            Some(unsafe { super::shell_item::take_pwstr(name) })
+        }).collect()
+    }
+    pub fn item_paths_limit(&self,limit:u32)->Vec<String>{
+        let Ok(view)=self.folder_view()else{return Vec::new();};
+        let count=unsafe{view.ItemCount(SVGIO_ALLVIEW)}.unwrap_or(0).max(0)as u32;
+        (0..count.min(limit)).filter_map(|i|{
+            let item:IShellItem=unsafe{view.GetItem(i as i32).ok()?};
+            let value=unsafe{item.GetDisplayName(SIGDN_FILESYSPATH).ok()?};
+            Some(unsafe{super::shell_item::take_pwstr(value)})
+        }).collect()
+    }
+    pub fn first_selected_path(&self)->Option<std::path::PathBuf>{
+        let view=self.folder_view().ok()?;
+        let array=unsafe{view.GetSelection(false).ok()?};
+        let item=unsafe{array.GetItemAt(0).ok()?};
+        let value=unsafe{item.GetDisplayName(SIGDN_FILESYSPATH).ok()?};
+        Some(std::path::PathBuf::from(unsafe{super::shell_item::take_pwstr(value)}))
+    }
+}
+
+fn selection_size(array: &IShellItemArray, still_current: impl Fn() -> bool) -> Option<u64> {
+    let count = unsafe { array.GetCount() }.ok()?;
+    let mut total = 0u64;
+    let mut any = false;
+    for i in 0..count {
+        if !still_current() { return None; }
+        let Ok(item) = (unsafe { array.GetItemAt(i) }) else { continue };
+        let Ok(item2) = item.cast::<IShellItem2>() else { continue };
+        if let Ok(size) = unsafe { item2.GetUInt64(&PKEY_SIZE) } { total = total.checked_add(size)?; any = true; }
+    }
+    any.then_some(total)
+}
+
+/// Global "show hidden items" / "show file extensions" (same switches as Explorer's View menu).
+pub fn folder_settings() -> (bool, bool) {
+    let mut state = SHELLSTATEA::default();
+    unsafe { SHGetSetSettings(Some(&mut state), SSF_SHOWALLOBJECTS | SSF_SHOWEXTENSIONS, false) };
+    let bits = state._bitfield1 as u32;
+    (bits & 1 != 0, bits & 2 != 0)
+}
+
+pub fn set_folder_settings(show_hidden: Option<bool>, show_extensions: Option<bool>) {
+    let mut state = SHELLSTATEA::default();
+    unsafe { SHGetSetSettings(Some(&mut state), SSF_SHOWALLOBJECTS | SSF_SHOWEXTENSIONS, false) };
+    let mut bits = state._bitfield1 as u32;
+    let mut mask = Default::default();
+    if let Some(on) = show_hidden { bits = if on { bits | 1 } else { bits & !1 }; mask = SSF_SHOWALLOBJECTS; }
+    if let Some(on) = show_extensions { bits = if on { bits | 2 } else { bits & !2 }; mask |= SSF_SHOWEXTENSIONS; }
+    state._bitfield1 = bits as i32;
+    unsafe { SHGetSetSettings(Some(&mut state), mask, true) };
+    let _: FOLDERFLAGS = FOLDERFLAGS(0);
+}
+
+#[cfg(test)]
+mod selection_cache_tests {
+    use super::SelectionSizeCache;
+    #[test]
+    fn same_count_with_a_new_selection_revision_recomputes_size() {
+        let mut cache = SelectionSizeCache::default();
+        cache.store(10, 2, Some(300));
+        assert_eq!(cache.get(10, 2), Some(Some(300)));
+        assert_eq!(cache.get(11, 2), None, "two different selected files cannot reuse the old sum");
+        assert_eq!(cache.get(10, 3), None);
+        cache.store(11, 2, Some(900));
+        assert_eq!(cache.get(11, 2), Some(Some(900)));
+    }
+    #[test]
+    fn unknown_property_result_is_cached_until_state_changes() {
+        let mut cache = SelectionSizeCache::default();
+        cache.store(4, 1, None);
+        assert_eq!(cache.get(4, 1), Some(None));
+        assert_eq!(cache.get(5, 1), None);
+    }
+}

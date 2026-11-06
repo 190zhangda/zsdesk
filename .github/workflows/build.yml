@@ -1,0 +1,45 @@
+name: Windows build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: zsdesk
+      - name: Read the ZSUI revision
+        id: dependency
+        shell: pwsh
+        run: '"revision=$((Get-Content -LiteralPath zsdesk/packaging/zsui-revision.txt -Raw).Trim())" >> $env:GITHUB_OUTPUT'
+      - uses: actions/checkout@v7
+        with:
+          repository: qiu7824/zsui
+          ref: ${{ steps.dependency.outputs.revision }}
+          path: zsui
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - name: Test
+        working-directory: zsdesk
+        run: cargo test --workspace --release --locked
+      - name: Check all editions
+        working-directory: zsdesk
+        shell: pwsh
+        run: |
+          cargo check --locked --release -p zsdesk-app --no-default-features
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo check --locked --release -p zsdesk-app --no-default-features --features network
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo check --locked --release -p zsdesk-app --no-default-features --features desktop
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo build --locked --release -p zsdesk-app
+          exit $LASTEXITCODE
