@@ -2,6 +2,9 @@
 
 Windows 原生多标签文件管理器与桌面格子，使用 Rust、Win32/COM、Direct2D 和 DirectWrite。
 
+界面的语义配色、图标和菜单模型来自作者的 Rust 原生桌面 UI 框架 [ZSUI](https://github.com/qiu7824/zsui)；
+窗口外壳、绘制、输入和 Shell 集成由 ZSDesk 直接调用 Win32 与 Direct2D 实现。
+
 [下载](https://github.com/qiu7824/zsdesk/releases) · [问题反馈](https://github.com/qiu7824/zsdesk/issues)
 
 ## 版本
@@ -118,7 +121,7 @@ ZSDesk.exe --import-tencent - --import-report "C:\Reports\layout.json" --apply-i
 验证工具链为 Rust 1.99.0。打包使用 PowerShell 7，安装器需要 Inno Setup 6.3 或更新版本。
 VC Runtime 从 Visual Studio x64 Redist 目录获取。
 
-ZSUI 关闭默认特性，仅提供主题、图标和布局模型。其固定源码版本记录于
+ZSUI 关闭默认特性，仅提供主题、图标和菜单模型。其固定源码版本记录于
 `packaging/zsui-revision.txt`，位于本仓库的同级 `zsui/` 目录。
 
 ```powershell
