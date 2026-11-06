@@ -353,7 +353,14 @@ impl WindowState {
         let anchor = self.layout.command_rect(CommandId::View);
         let choice = popup(self.hwnd, &menus::view_menu(mode, icon, show), anchor);
         match choice.as_deref() {
-            Some("show-nav") => { self.session.ui.show_tree = !show.navigation; self.save(); unsafe { self.resize(); } }
+            Some("show-nav") => {
+                self.session.ui.show_tree = !show.navigation; self.save(); unsafe { self.resize(); }
+                // A hidden tree is not synced while navigating; catch up when shown again.
+                if let Some(tree) = self.tree.as_ref().filter(|_| self.session.ui.show_tree) {
+                    let current = self.current_location().clone();
+                    if !matches!(current, ShellLocation::Search { .. }) { unsafe { tree.select_location(&current); } }
+                }
+            }
             Some("show-preview") => self.set_panes(!show.preview, false),
             Some("show-details") => self.set_panes(false, !show.details),
             Some("show-bookmarks") => { self.session.ui.show_bookmarks = !show.bookmarks; self.save(); unsafe { self.resize(); } }

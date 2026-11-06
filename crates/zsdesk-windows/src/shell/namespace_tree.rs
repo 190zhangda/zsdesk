@@ -15,10 +15,11 @@ use windows::{
         System::{
             Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER},
             Ole::IOleWindow,
+            Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
             SystemServices::{SFGAO_FOLDER, SFGAO_STREAM},
         },
         UI::{
-            Controls::{TVM_SETBKCOLOR, TVM_SETTEXTCOLOR, TVM_SETEXTENDEDSTYLE, TVM_SETINDENT,
+            Controls::{TVGN_CARET, TVM_SELECTITEM, TVM_SETBKCOLOR, TVM_SETTEXTCOLOR, TVM_SETEXTENDEDSTYLE, TVM_SETINDENT,
                 TVM_SETITEMHEIGHT, TVS_EX_DOUBLEBUFFER},
             HiDpi::GetDpiForWindow,
             Shell::{
@@ -29,6 +30,7 @@ use windows::{
                 NSTCEHT_ONITEMRIGHT, NSTCIS_EXPANDED, NSTCIS_SELECTED, NSTCIS_SELECTEDNOEXPAND, NSTCRS_EXPANDED, NSTCRS_VISIBLE,
                 SICHINT_CANONICAL,
                 NSTCS_AUTOHSCROLL, NSTCS_FULLROWSELECT, NSTCS_HASEXPANDOS, NSTCS_NOEDITLABELS,
+                NSTCGNI_NEXTVISIBLE, SICHINT_TEST_FILESYSPATH_IF_NOT_EQUAL,
                 NSTCS_SHOWSELECTIONALWAYS, NSTCS_FADEINOUTEXPANDOS, NSTCS_TABSTOP, NSTCS_ROOTHASEXPANDO,
                 NSTCS_ALLOWJUNCTIONS, NSTCS2_DISPLAYPADDING, NSTCS2_INTERRUPTNOTIFICATIONS,
                 NTSCS2_NOSINGLETONAUTOEXPAND,
@@ -188,24 +190,37 @@ impl NamespaceTreeHost {
         if !self.hwnd.0.is_null() { let _ = unsafe { ShowWindow(self.hwnd, if visible { SW_SHOW } else { SW_HIDE }) }; }
     }
 
-    /// Expands the tree down to `location` and selects it.
+    /// Follows a navigation made outside the tree (file view, address bar,
+    /// history, tabs), the way Explorer's navigation pane does.
+    ///
+    /// A folder that is already on screen (a Quick access entry, a root, or a
+    /// child of a branch the user opened) is selected without opening
+    /// anything. Otherwise the tree is only expanded down to the folder when
+    /// Explorer's "展开到打开的文件夹" option is on; with it off (the Windows
+    /// default) the tree keeps its shape and simply drops the selection.
     ///
     /// # Safety
     ///
     /// Must be called on the STA/UI thread that created this host while its COM
     /// apartment remains initialized.
     pub unsafe fn select_location(&self, location: &ShellLocation) {
-        let Ok(item) = (unsafe { shell_item(location) }) else { return };
+        let Ok(item) = (unsafe { shell_item(location) }) else { self.clear_selection(); return };
         let previous = self.last_location.borrow().clone();
         if previous.as_ref().is_some_and(|previous| unsafe { previous.Compare(&item, SICHINT_CANONICAL.0 as u32) }.is_ok_and(|order| order == 0)) {
             return;
         }
-        // Prefer an existing Quick access entry instead of expanding the same
-        // folder again beneath its drive and pushing quick links off-screen.
-        if unsafe { self.tree.SetItemState(&item, NSTCIS_SELECTEDNOEXPAND.0 as u32, NSTCIS_SELECTEDNOEXPAND.0 as u32) }.is_ok()
-            && unsafe { self.tree.GetItemState(&item, NSTCIS_SELECTED.0 as u32) }.is_ok_and(|state| state & NSTCIS_SELECTED.0 as u32 != 0) {
-            unsafe { self.reveal_selection(&item); }
-            *self.last_location.borrow_mut() = Some(item);
+        // Only rows the tree is showing qualify: selecting one hidden under a
+        // collapsed branch would open that branch. Quick access rows are
+        // different shell items for the same folder, so match by path too.
+        if let Some(row) = unsafe { self.shown_row(&item) } {
+            if unsafe { self.select(&row) } {
+                unsafe { self.reveal_selection(&row); }
+                *self.last_location.borrow_mut() = Some(item);
+                return;
+            }
+        }
+        if !expand_to_open_folder() {
+            self.clear_selection();
             return;
         }
         let mut chain = Vec::new();
@@ -219,11 +234,51 @@ impl NamespaceTreeHost {
             for ancestor in chain.iter().rev() {
                 let _ = self.tree.SetItemState(ancestor, NSTCIS_EXPANDED.0 as u32, NSTCIS_EXPANDED.0 as u32);
             }
-            if self.tree.SetItemState(&item, NSTCIS_SELECTEDNOEXPAND.0 as u32, NSTCIS_SELECTEDNOEXPAND.0 as u32).is_ok()
-                && self.tree.GetItemState(&item, NSTCIS_SELECTED.0 as u32).is_ok_and(|state| state & NSTCIS_SELECTED.0 as u32 != 0) {
+            if self.select(&item) {
                 self.reveal_selection(&item);
                 *self.last_location.borrow_mut() = Some(item);
+            } else {
+                // Archives and other filtered folders have no row.
+                self.clear_selection();
             }
+        }
+    }
+
+    /// Records a navigation started by clicking the tree. The clicked row is
+    /// already selected by the tree itself and must stay as the user left it:
+    /// no re-selection (which could jump to a duplicate row) and no expanding.
+    ///
+    /// # Safety
+    ///
+    /// Must be called on the STA/UI thread that created this host while its COM
+    /// apartment remains initialized.
+    pub unsafe fn adopt_location(&self, location: &ShellLocation) {
+        *self.last_location.borrow_mut() = unsafe { shell_item(location) }.ok();
+    }
+
+    /// First displayed row (every ancestor expanded) for the same folder as `item`.
+    unsafe fn shown_row(&self, item: &IShellItem) -> Option<IShellItem> {
+        let hint = (SICHINT_CANONICAL.0 | SICHINT_TEST_FILESYSPATH_IF_NOT_EQUAL.0) as u32;
+        let mut row = unsafe { self.tree.GetRootItems().and_then(|roots| roots.GetItemAt(0)) }.ok();
+        // Bounded walk; a tree that size is far beyond any real expansion.
+        for _ in 0..4096 {
+            let current = row?;
+            if unsafe { current.Compare(item, hint) }.is_ok_and(|order| order == 0) { return Some(current); }
+            row = unsafe { self.tree.GetNextItem(&current, NSTCGNI_NEXTVISIBLE) }.ok();
+        }
+        None
+    }
+
+    unsafe fn select(&self, item: &IShellItem) -> bool {
+        let selected = NSTCIS_SELECTED.0 as u32;
+        unsafe { self.tree.SetItemState(item, NSTCIS_SELECTEDNOEXPAND.0 as u32, NSTCIS_SELECTEDNOEXPAND.0 as u32) }.is_ok()
+            && unsafe { self.tree.GetItemState(item, selected) }.is_ok_and(|state| state & selected != 0)
+    }
+
+    fn clear_selection(&self) {
+        *self.last_location.borrow_mut() = None;
+        if let Some(view) = self.tree_view() {
+            unsafe { SendMessageW(view, TVM_SELECTITEM, Some(WPARAM(TVGN_CARET as usize)), Some(LPARAM(0))); }
         }
     }
 
@@ -245,6 +300,15 @@ impl NamespaceTreeHost {
         let _keep_events_alive = &self.events;
         let _ = unsafe { self.tree.TreeUnadvise(self.advise_cookie) };
     }
+}
+
+/// Explorer's 文件夹选项 › 导航窗格 › "展开到打开的文件夹" (off unless set).
+fn expand_to_open_folder() -> bool {
+    let mut value = 0u32;
+    let mut size = 4u32;
+    let ok = unsafe { RegGetValueW(HKEY_CURRENT_USER, windows::core::w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"),
+        windows::core::w!("NavPaneExpandToCurrentFolder"), RRF_RT_REG_DWORD, None, Some((&mut value as *mut u32).cast()), Some(&mut size)) }.is_ok();
+    ok && value != 0
 }
 
 fn scale(value: i32, dpi: u32) -> i32 {

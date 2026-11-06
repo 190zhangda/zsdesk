@@ -876,7 +876,7 @@ impl WindowState {
             WM_SHELL_SELECTION_CHANGED => { unsafe { acknowledge_selection_changed(lp.0); } self.refresh_status(); }
             WM_TREE_NAVIGATE => if lp.0 != 0 {
                 let location = unsafe { *Box::from_raw(lp.0 as *mut ShellLocation) };
-                if wp.0 != 0 { unsafe { self.new_tab(location); } } else { unsafe { self.navigate_to(location); } }
+                if wp.0 != 0 { unsafe { self.new_tab(location); } } else { unsafe { self.navigate_from_tree(location); } }
             },
             WM_BOOKMARK_PATH_DROPPED => if lp.0 != 0 { self.add_bookmark_path(unsafe { *Box::from_raw(lp.0 as *mut PathBuf) }); },
             WM_OPEN_TAB_PATH => if lp.0 != 0 {

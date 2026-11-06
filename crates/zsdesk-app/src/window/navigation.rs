@@ -1,7 +1,13 @@
 use super::*;
 
 #[derive(Clone)]
-pub(super) struct NavigationRequest { pub tab:ExplorerTab }
+pub(super) struct NavigationRequest {
+    pub tab:ExplorerTab,
+    /// Started by clicking the navigation tree: the tree already shows the
+    /// user's choice and is left alone when the folder opens.
+    pub from_tree:bool,
+}
+impl NavigationRequest { fn new(tab:ExplorerTab)->Self {Self{tab,from_tree:false}} }
 
 impl WindowState {
     pub(super) unsafe fn open_requested(&mut self,request:crate::instance::OpenRequest){
@@ -43,13 +49,20 @@ impl WindowState {
         unsafe {self.update_address();}
     }
     pub(super) unsafe fn navigate_current(&mut self) {
-        let request=NavigationRequest{tab:self.session.active_tab().clone()};
+        let request=NavigationRequest::new(self.session.active_tab().clone());
         unsafe {self.request_navigation(request);}
     }
     pub(super) unsafe fn navigate_to(&mut self,location:ShellLocation) {
+        unsafe {self.navigate_active(location,false);}
+    }
+    /// Opens a folder clicked in the navigation tree in the active tab.
+    pub(super) unsafe fn navigate_from_tree(&mut self,location:ShellLocation) {
+        unsafe {self.navigate_active(location,true);}
+    }
+    unsafe fn navigate_active(&mut self,location:ShellLocation,from_tree:bool) {
         unsafe {self.capture_active();}
         let mut tab=self.session.active_tab().clone();
-        if tab.navigate(location) {unsafe {self.request_navigation(NavigationRequest{tab});}}
+        if tab.navigate(location) {unsafe {self.request_navigation(NavigationRequest{tab,from_tree});}}
     }
     pub(super) unsafe fn navigation_completed(&mut self,location:ShellLocation) {
         let completed_request=self.pending.is_some();
@@ -65,7 +78,9 @@ impl WindowState {
             self.search_scope=None; self.search_result=None;
             if unsafe {GetFocus()}!=self.search_edit { let _=unsafe {SetWindowTextW(self.search_edit,PCWSTR::null())}; }
         }
+        let mut from_tree=false;
         if let Some(mut request)=self.pending.take() {
+            from_tree=request.from_tree;
             request.tab.replace_current(location);
             if let Some(index)=self.session.tabs.iter().position(|t|t.id==request.tab.id) {
                 self.shown_tab=Some(request.tab.id);
@@ -84,13 +99,18 @@ impl WindowState {
             if let Some(tab)=self.session.tabs.iter_mut().find(|t|t.id==id) {tab.navigate(location);}
         }
         if self.queued.is_none() && self.shown_tab!=Some(self.session.active_tab().id) {
-            self.queued=Some(NavigationRequest{tab:self.session.active_tab().clone()});
+            self.queued=Some(NavigationRequest::new(self.session.active_tab().clone()));
         }
         self.save();
         unsafe {self.rebuild_tabs();}
         if self.queued.is_none() {
             let current=self.current_location().clone();
-            if !matches!(&current,ShellLocation::Search{..}){if let Some(tree)=self.tree.as_ref().filter(|_|self.session.ui.show_tree) {unsafe {tree.select_location(&current);}}}
+            // Like Explorer, the tree and the file view sync differently: a tree
+            // click keeps the clicked row; any other navigation never opens
+            // tree branches unless "展开到打开的文件夹" is on.
+            if !matches!(&current,ShellLocation::Search{..}){if let Some(tree)=self.tree.as_ref().filter(|_|self.session.ui.show_tree) {
+                if from_tree {unsafe {tree.adopt_location(&current);}} else {unsafe {tree.select_location(&current);}}
+            }}
             self.theme_children();
             self.refresh_status();
             if completed_request{if let ShellLocation::Search{query,scope:None}=&current{self.start_fast_search(query);}}
@@ -153,7 +173,7 @@ impl WindowState {
         unsafe {self.capture_active();}
         let mut tab=self.session.active_tab().clone();
         if (if back {tab.go_back()} else {tab.go_forward()}).is_some() {
-            tab.view=None;unsafe {self.request_navigation(NavigationRequest{tab});}
+            tab.view=None;unsafe {self.request_navigation(NavigationRequest::new(tab));}
         }
     }
     pub(super) unsafe fn go_up(&mut self) {
