@@ -134,7 +134,7 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
                 let view = slot.try_borrow().ok().and_then(|s| s.as_ref().and_then(|s| s.keyboard_view(&msg, true)));
                 if let Some(view) = view {
                     // Shell verbs can enter COM/modal loops: release the state borrow first.
-                    let outcome = keyboard::execute(&view, hwnd, action);
+                    let outcome = keyboard::execute_message(&view, hwnd, action, &msg);
                     if let Ok(mut state) = slot.try_borrow_mut() { if let Some(state) = state.as_mut() { state.shell_result(Some(outcome)); } }
                     continue;
                 }

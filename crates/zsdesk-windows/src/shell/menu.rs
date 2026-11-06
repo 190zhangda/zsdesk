@@ -11,7 +11,7 @@ use windows::{
     core::{Interface, PCSTR, PCWSTR, PSTR, Result},
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
-        System::{Com::CoTaskMemFree, Ole::IOleWindow},
+        System::Com::CoTaskMemFree,
         UI::{
             Shell::{
                 Common::ITEMIDLIST, IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, IShellView, IShellItem,
@@ -24,7 +24,7 @@ use windows::{
                 CreatePopupMenu, DestroyMenu, GetMenuItemCount, GetMenuItemID, GetSubMenu, TrackPopupMenuEx,
                 HMENU, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_DRAWITEM, WM_INITMENUPOPUP,
                 WM_MEASUREITEM, WM_MENUCHAR, TPM_LEFTALIGN, TPM_TOPALIGN, TRACK_POPUP_MENU_FLAGS,
-                GetMenuStringW, GetMenuState, DeleteMenu, MF_BYPOSITION, MF_SEPARATOR,
+                GetMenuStringW, GetMenuState, DeleteMenu, MF_BYPOSITION, MF_BYCOMMAND, MF_DISABLED, MF_GRAYED, MF_SEPARATOR,
                 WM_CONTEXTMENU, WM_NCDESTROY, GetCursorPos, GetWindowRect,
             },
             Input::KeyboardAndMouse::{GetKeyState, VK_SHIFT, VK_CONTROL},
@@ -40,6 +40,41 @@ pub const APP_FIRST: u32 = 0x7000;
 
 /// `SEE_MASK_UNICODE`, shared by CMINVOKECOMMANDINFOEX.
 const CMIC_MASK_UNICODE: u32 = 0x4000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryAction { Undo, Redo }
+
+impl HistoryAction {
+    fn verb(self) -> &'static str { match self { Self::Undo => "undo", Self::Redo => "redo" } }
+    fn unavailable(self) -> &'static str {
+        match self { Self::Undo => "当前没有可撤销的文件操作", Self::Redo => "当前没有可重做的文件操作" }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HistoryCommand { id: u32, enabled: bool }
+
+fn listed_history_command(menu: &ShellMenu, handle: HMENU, verb: &str, depth: usize) -> Option<HistoryCommand> {
+    if depth > 8 { return None; }
+    for index in 0..unsafe { GetMenuItemCount(Some(handle)) }.max(0) {
+        let id = unsafe { GetMenuItemID(handle, index) };
+        if ShellMenu::is_shell_id(id) && menu.verb(id).is_some_and(|name| name.eq_ignore_ascii_case(verb)) {
+            let state = unsafe { GetMenuState(handle, id, MF_BYCOMMAND) };
+            return Some(HistoryCommand { id, enabled: state != u32::MAX && state & (MF_DISABLED.0 | MF_GRAYED.0) == 0 });
+        }
+        let child = unsafe { GetSubMenu(handle, index) };
+        if !child.is_invalid() {
+            if let Some(command) = listed_history_command(menu, child, verb, depth + 1) { return Some(command); }
+        }
+    }
+    None
+}
+
+fn invoke_history_command(action: HistoryAction, command: Option<HistoryCommand>, invoke: impl FnOnce(u32) -> Result<()>) -> Result<()> {
+    let command = command.filter(|command| command.enabled).ok_or_else(|| windows::core::Error::new(
+        windows::core::HRESULT(0x80040101u32 as i32), action.unavailable()))?;
+    invoke(command.id)
+}
 
 #[derive(Clone)]
 struct ActiveContext { menu: IContextMenu, filter: bool }
@@ -197,6 +232,14 @@ impl ShellMenu {
         let flags = CMF_NORMAL | CMF_EXPLORE | CMF_OPTIMIZEFORINVOKE
             | if extended { CMF_EXTENDEDVERBS } else { CMF_NORMAL };
         unsafe { self.menu.QueryContextMenu(self.hmenu, 0, SHELL_FIRST, SHELL_LAST, flags) }.ok()
+    }
+
+    /// Resolves history against a complete, synchronously populated menu.
+    /// The caller must provide a new menu and hold no application-state borrow.
+    pub fn invoke_history(&self, owner: HWND, action: HistoryAction) -> Result<()> {
+        unsafe { self.menu.QueryContextMenu(self.hmenu, 0, SHELL_FIRST, SHELL_LAST, CMF_NORMAL | CMF_EXPLORE) }.ok()?;
+        let command = listed_history_command(self, self.hmenu, action.verb(), 0);
+        invoke_history_command(action, command, |id| self.invoke(owner, id, None, false, false))
     }
 
     /// Shows `menu` (this menu or one of its submenus) and returns the chosen id.
@@ -383,7 +426,7 @@ struct ViewMenuState { view: IShellView, modern: Rc<Cell<bool>> }
 /// Hosts the original menu only in original mode, using the view's own native
 /// IContextMenu. This lets filters keep a precise canonical-verb/command map.
 pub(crate) unsafe fn attach_view_menu(view: &IShellView, modern: Rc<Cell<bool>>) {
-    let Ok(window) = view.cast::<IOleWindow>().and_then(|w| unsafe { w.GetWindow() }) else { return };
+    let Ok(window) = (unsafe { view.GetWindow() }) else { return };
     let mut existing = 0usize;
     if unsafe { GetWindowSubclass(window, Some(view_menu_proc), VIEW_MENU_SUBCLASS, Some(&mut existing)) }.as_bool() {
         if existing != 0 { unsafe { (*(existing as *mut ViewMenuState)).modern = modern; } }
@@ -420,7 +463,7 @@ unsafe extern "system" fn show_expanded_view_menu(raw_view: *mut core::ffi::c_vo
     let Some(view) = (unsafe { IShellView::from_raw_borrowed(&raw_view) }) else {
         return windows::core::HRESULT(0x8000_4003u32 as i32);
     };
-    let result = view.cast::<IOleWindow>().and_then(|window| unsafe { window.GetWindow() })
+    let result = unsafe { view.GetWindow() }
         .and_then(|owner| show_original_view_menu_at(owner, view, point));
     match result { Ok(()) => windows::core::HRESULT(0), Err(error) => error.code() }
 }
@@ -448,6 +491,23 @@ fn show_original_view_menu_at(owner: HWND, view: &IShellView, mut point: POINT) 
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+    #[test]
+    fn missing_or_disabled_history_commands_are_not_invoked() {
+        for command in [None, Some(HistoryCommand { id: 17, enabled: false })] {
+            for action in [HistoryAction::Undo, HistoryAction::Redo] {
+                let error = invoke_history_command(action, command, |_| panic!("unavailable command invoked")).unwrap_err();
+                assert_eq!(error.code(), windows::core::HRESULT(0x80040101u32 as i32));
+            }
+        }
+    }
+    #[test]
+    fn enabled_history_uses_the_views_exact_id_once() {
+        let calls = Cell::new(0);
+        invoke_history_command(HistoryAction::Undo, Some(HistoryCommand { id: 43, enabled: true }), |id| {
+            assert_eq!(id, 43); calls.set(calls.get() + 1); Ok(())
+        }).unwrap();
+        assert_eq!(calls.get(), 1);
+    }
     #[test]
     fn modern_policy_covers_visible_functions_and_keeps_extensions_independent() {
         let mut options = ContextMenuOptions::default();

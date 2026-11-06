@@ -21,7 +21,7 @@ use windows::{
 use zsdesk_core::model::desktop::{auto_layout, categorize, distribute, sort_items, snap, drag_rect, Bounds, Category, DesktopConfig,
     Edges as CoreEdges, Fence, FenceSort, FenceSource, FenceTheme, FenceView, IconSize, ItemInfo, Placement, MIN_FENCE_H, MIN_FENCE_W, TITLE_H};
 use zsdesk_ui::{chrome::scale, menus::{entry, menu, submenu, MenuItemSpec, MenuSpec}, theme::{FencePalette, Mode}};
-use zsdesk_windows::{desktop::{self, ShellEntry}, gfx::Gfx, shell::{icons::{IconLoader, IconRequest}, notify::ChangeNotify, pidl}};
+use zsdesk_windows::{desktop::{self, ShellEntry}, gfx::Gfx, shell::{icons::{IconLoader, IconRequest}, menu::HistoryAction, notify::ChangeNotify, pidl}};
 
 use super::fence::{FenceHit, FenceWin, Interaction, RenameTarget};
 
@@ -47,9 +47,18 @@ pub enum After {
     Drag { fence: u64 },
     Open { fence: u64, index: usize, explorer: bool },
     Verb { fence: u64, verb: &'static str, background: bool },
+    History { fence: u64, action: HistoryAction },
     Rename { fence: u64, key: String, name: String },
     PickFolder { replace: Option<u64> },
     DeleteFence(u64),
+}
+
+fn history_shortcut(key: u16, control: bool, shift: bool, alt: bool) -> Option<HistoryAction> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_Y, VK_Z};
+    if !control || shift || alt { return None; }
+    if key == VK_Z.0 { Some(HistoryAction::Undo) }
+    else if key == VK_Y.0 { Some(HistoryAction::Redo) }
+    else { None }
 }
 
 const MAX_COLD_ICONS: usize = 128;
@@ -1052,6 +1061,9 @@ impl DesktopHost {
         let Some(fence) = self.config.fence(id).cloned() else { return After::Nothing };
         let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+        if let Some(action) = history_shortcut(key, ctrl, shift, unsafe { GetKeyState(VK_MENU.0 as i32) } < 0) {
+            return After::History { fence: id, action };
+        }
         let win = &mut self.fences[index];
         let count = win.entries.len();
         let k = VIRTUAL_KEY(key);
@@ -1650,6 +1662,23 @@ pub fn save_config(path: &Path, config: &DesktopConfig) -> std::io::Result<()> {
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, serde_json::to_vec_pretty(config).map_err(std::io::Error::other)?)?;
     std::fs::rename(&temporary, path)
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_C, VK_Y, VK_Z};
+    #[test]
+    fn fence_history_shortcuts_require_exact_modifiers() {
+        assert_eq!(history_shortcut(VK_Z.0, true, false, false), Some(HistoryAction::Undo));
+        assert_eq!(history_shortcut(VK_Y.0, true, false, false), Some(HistoryAction::Redo));
+        for key in [VK_Z, VK_Y] {
+            assert_eq!(history_shortcut(key.0, false, false, false), None);
+            assert_eq!(history_shortcut(key.0, true, true, false), None);
+            assert_eq!(history_shortcut(key.0, true, false, true), None);
+        }
+        assert_eq!(history_shortcut(VK_C.0, true, false, false), None);
+    }
 }
 
 #[cfg(test)]

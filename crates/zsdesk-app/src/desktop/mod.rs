@@ -33,13 +33,13 @@ use windows::{
             Controls::WM_MOUSELEAVE,
             HiDpi::SystemParametersInfoForDpi,
             Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_ESCAPE, VK_RETURN, VK_SHIFT},
-            Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass, SHDoDragDrop},
+            Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass, SHDoDragDrop, SHGetDesktopFolder, IShellView},
             WindowsAndMessaging::*,
         },
     },
 };
 use zsdesk_ui::menus::{MenuItemSpec, MenuSpec, UiCommand};
-use zsdesk_windows::{desktop::{self, DesktopHit}, gfx::Gfx, ole::DropHandler, shell::{menu::{forward_menu_message, ShellMenu, APP_FIRST}, notify::read_change}};
+use zsdesk_windows::{desktop::{self, DesktopHit}, gfx::Gfx, ole::DropHandler, shell::{menu::{forward_menu_message, HistoryAction, ShellMenu, APP_FIRST}, notify::read_change}};
 
 use host::{After, DesktopHost, TIMER_DESKTOP, TIMER_FOLDER, TIMER_PEEK, TIMER_SAVE, TIMER_ICONS, WM_DESKTOP_CHANGED, WM_DESKTOP_DBLCLICK, WM_FOLDER_CHANGED,
     WM_ICON_READY, WM_RENAME_DONE, WM_TRAY};
@@ -448,6 +448,7 @@ fn run_after(after: After) {
         After::Drag { fence } => drag(fence),
         After::Open { fence, index, explorer } => open(fence, index, explorer),
         After::Verb { fence, verb, background } => run_verb(fence, verb, background),
+        After::History { fence, action } => run_history(fence, action),
         After::Rename { fence, key, name } => {
             let target = with_host(|h| h.win_index(fence).and_then(|i| h.fences[i].entries.iter().find(|e| e.key == key).map(|e| (h.fences[i].hwnd, e.pidl.clone())))).flatten();
             if let Some((hwnd, pidl)) = target { let _ = desktop::rename(hwnd, &pidl, &name); }
@@ -578,6 +579,24 @@ fn open(fence: u64, index: usize, explorer: bool) {
         if hostable { with_host(|h| h.open_entry_in_explorer(&entry)); return; }
     }
     let _ = desktop::open(hwnd, &entry.pidl, None);
+}
+
+fn run_history(fence: u64, action: HistoryAction) {
+    let Some(hwnd) = fence_hwnd(fence) else { return };
+    // A private, unwindowed Shell view supplies background history commands.
+    // Do not borrow the user's desktop selection or create another GUI host.
+    let result = (|| -> windows::core::Result<()> {
+        let folder = unsafe { SHGetDesktopFolder()? };
+        let view: IShellView = unsafe { folder.CreateViewObject(hwnd)? };
+        let menu = ShellMenu::for_view(&view, false)?;
+        menu.invoke_history(hwnd, action)
+    })();
+    if let Err(error) = result {
+        let verb = if action == HistoryAction::Undo { "撤销" } else { "重做" };
+        let text = wide(&format!("无法{verb}文件操作：{error}"));
+        unsafe { MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), w!("ZSDesk 桌面格子"), MB_OK | MB_ICONINFORMATION); }
+    }
+    refresh_fence(fence);
 }
 
 fn run_verb(fence: u64, verb: &'static str, background: bool) {
