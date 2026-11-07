@@ -92,6 +92,28 @@ pub fn round_corners(hwnd: HWND, small: bool) {
     let _ = unsafe { DwmSetWindowAttribute(hwnd, windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE, (&value as *const i32).cast(), 4) };
 }
 
+/// Blurs whatever is behind `hwnd` (the Windows 10+ accent policy used for
+/// frosted glass); the window's own alpha still decides how much shows through.
+/// Returns whether the system accepted the change.
+pub fn set_blur_behind(hwnd: HWND, enabled: bool) -> bool {
+    #[repr(C)]
+    struct AccentPolicy { state: u32, flags: u32, gradient: u32, animation: u32 }
+    #[repr(C)]
+    struct CompositionData { attribute: u32, data: *mut core::ffi::c_void, size: usize }
+    type SetAttribute = unsafe extern "system" fn(HWND, *mut CompositionData) -> i32;
+    const ACCENT_DISABLED: u32 = 0;
+    const ACCENT_ENABLE_BLURBEHIND: u32 = 3;
+    const WCA_ACCENT_POLICY: u32 = 19;
+    if hwnd.0.is_null() { return false; }
+    let Ok(user32) = (unsafe { LoadLibraryW(w!("user32.dll")) }) else { return false };
+    let Some(function) = (unsafe { GetProcAddress(user32, PCSTR(c"SetWindowCompositionAttribute".as_ptr().cast())) }) else { return false };
+    // SAFETY: the exported function has had this signature since Windows 7.
+    let set: SetAttribute = unsafe { std::mem::transmute(function) };
+    let mut accent = AccentPolicy { state: if enabled { ACCENT_ENABLE_BLURBEHIND } else { ACCENT_DISABLED }, flags: 0, gradient: 0, animation: 0 };
+    let mut data = CompositionData { attribute: WCA_ACCENT_POLICY, data: (&mut accent as *mut AccentPolicy).cast(), size: std::mem::size_of::<AccentPolicy>() };
+    unsafe { set(hwnd, &mut data) != 0 }
+}
+
 /// Enables the Mica backdrop on Windows 11 22H2+. Returns whether it applies.
 pub fn enable_mica(hwnd: HWND) -> bool {
     if os_build() < 22621 { return false; }

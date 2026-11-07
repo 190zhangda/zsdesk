@@ -6,7 +6,7 @@ use std::collections::HashSet;
 
 use windows::Win32::{
     Foundation::{HWND, POINT, SIZE, RECT},
-    Graphics::{Direct2D::ID2D1Bitmap, Gdi::{GetDC, ReleaseDC, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION}},
+    Graphics::{Direct2D::ID2D1Bitmap, Gdi::{CreateRoundRectRgn, GetDC, ReleaseDC, SetWindowRgn, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION}},
     UI::WindowsAndMessaging::{GetWindowRect, UpdateLayeredWindow, ULW_ALPHA},
 };
 use zsdesk_core::model::desktop::{Fence, FenceView, TITLE_H};
@@ -15,9 +15,44 @@ use zsdesk_windows::{desktop::ShellEntry, gfx::{Align, Canvas, Color, Gfx, RectF
 
 pub const EDGE: i32 = 6;
 
+thread_local! {
+    /// Frosted glass is on: fence windows are clipped to their rounded shape so
+    /// the blur behind them does not show in the transparent corners.
+    static BLUR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn set_blur(on: bool) { BLUR.with(|b| b.set(on)); }
+
+/// Applies or removes the frosted-glass blur and the matching rounded window region.
+pub fn apply_glass(hwnd: HWND) {
+    let on = BLUR.with(std::cell::Cell::get);
+    zsdesk_windows::theme::set_blur_behind(hwnd, on);
+    shape_window(hwnd);
+}
+
+/// Keeps the window region in step with the painted 10-DIP corners (after every resize).
+pub fn shape_window(hwnd: HWND) {
+    if hwnd.0.is_null() { return; }
+    if !BLUR.with(std::cell::Cell::get) {
+        let _ = unsafe { SetWindowRgn(hwnd, None, true) };
+        return;
+    }
+    let mut r = RECT::default();
+    let _ = unsafe { GetWindowRect(hwnd, &mut r) };
+    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+    let diameter = scale(20, dpi);
+    // The system owns the region after SetWindowRgn succeeds.
+    let region = unsafe { CreateRoundRectRgn(0, 0, r.right - r.left + 1, r.bottom - r.top + 1, diameter, diameter) };
+    let _ = unsafe { SetWindowRgn(hwnd, Some(region), true) };
+}
+
 /// What the pointer is over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FenceHit { None, Title, More, Back, Edge(Edges), Item(usize), Empty, Scrollbar }
+pub enum FenceHit { None, Title, More, Back, Edge(Edges), Item(usize), Empty, Scrollbar, Tab(usize), AddTab, TabList }
+
+/// One tab of the fence's group as measured at the last render.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabMeta { pub id: u64, pub label: String, pub width: i32 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Edges { pub left: bool, pub top: bool, pub right: bool, pub bottom: bool }
@@ -30,6 +65,9 @@ pub enum Interaction {
     Press { index: usize, cursor: POINT },
     Rubber { start: POINT, current: POINT, base: HashSet<String> },
     Thumb { cursor_y: i32, scroll: i32 },
+    /// Pressed on a tab: a click switches to it, a drag reorders or tears it off.
+    TabPress { tab: u64, cursor: POINT },
+    TabDrag { tab: u64, torn: bool },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -48,6 +86,11 @@ pub struct Geometry {
     pub max_scroll: i32,
     pub thumb: Rect,
     pub icon_px: i32,
+    /// Visible tab chips: (index into the fence's tabs, rectangle).
+    pub tabs: Vec<(usize, Rect)>,
+    pub add: Rect,
+    pub tab_list: Rect,
+    pub hidden_tabs: usize,
 }
 
 impl Geometry {
@@ -106,6 +149,52 @@ impl Geometry {
         g
     }
 
+    /// Lays out the pill tab strip. A single tab keeps the centred title and
+    /// only offers "+" next to the menu button; tabs that do not fit collapse
+    /// into a list button while the active tab stays visible.
+    pub fn layout_tabs(&mut self, tabs: &[TabMeta], active: usize, dpi: u32) {
+        let s = |v: i32| scale(v, dpi);
+        let chip_h = s(28).min(self.title.height);
+        let y = (self.title.height - chip_h) / 2;
+        let button = s(28);
+        if self.more.right() <= 0 { return; }
+        if tabs.len() < 2 {
+            self.add = Rect::new((self.more.x - s(2) - button).max(0), y, button, chip_h);
+            return;
+        }
+        let gap = s(2);
+        let left = if self.back.is_empty() { s(6) } else { self.back.right() + s(4) };
+        let right = self.more.x - s(4);
+        let total: i32 = tabs.iter().map(|t| t.width + gap).sum();
+        let mut visible: Vec<usize> = (0..tabs.len()).collect();
+        if left + total + button > right {
+            let list_w = s(40);
+            let room = right - left - button - list_w - gap * 2;
+            visible.clear();
+            let mut used = 0;
+            for (i, tab) in tabs.iter().enumerate() {
+                if used + tab.width + gap > room { break; }
+                visible.push(i);
+                used += tab.width + gap;
+            }
+            let active = active.min(tabs.len() - 1);
+            if !visible.contains(&active) {
+                match visible.last_mut() { Some(last) => *last = active, None => visible.push(active) }
+                visible.sort_unstable();
+            }
+            self.hidden_tabs = tabs.len() - visible.len();
+        }
+        let reserve = button + if self.hidden_tabs > 0 { s(40) + gap } else { 0 };
+        let mut x = left;
+        for i in visible {
+            let width = tabs[i].width.min((right - x - reserve).max(s(40)));
+            self.tabs.push((i, Rect::new(x, y, width, chip_h)));
+            x += width + gap;
+        }
+        if self.hidden_tabs > 0 { self.tab_list = Rect::new(x, y, s(40), chip_h); x += s(40) + gap; }
+        self.add = Rect::new(x.min(right - button).max(left), y, button, chip_h);
+    }
+
     pub fn hit(&self, x: i32, y: i32, dpi: u32, locked: bool, collapsed: bool) -> FenceHit {
         let edge = scale(EDGE, dpi);
         if !locked {
@@ -120,6 +209,9 @@ impl Geometry {
         if self.title.contains(x, y) {
             if self.more.contains(x, y) { return FenceHit::More; }
             if !self.back.is_empty() && self.back.contains(x, y) { return FenceHit::Back; }
+            if let Some((i, _)) = self.tabs.iter().find(|(_, r)| r.contains(x, y)) { return FenceHit::Tab(*i); }
+            if !self.tab_list.is_empty() && self.tab_list.contains(x, y) { return FenceHit::TabList; }
+            if !self.add.is_empty() && self.add.contains(x, y) { return FenceHit::AddTab; }
             return FenceHit::Title;
         }
         if !self.thumb.is_empty() && x >= self.thumb.x - scale(4, dpi) && self.content.contains(x, y) { return FenceHit::Scrollbar; }
@@ -174,6 +266,14 @@ pub struct FenceWin {
     pub peek: bool,
     /// Explicitly collapsed under the pointer: no peek until it leaves.
     pub peek_blocked: bool,
+    /// The fence's tab group (empty or one entry for a plain fence).
+    pub tabs: Vec<TabMeta>,
+    /// Translucent while dragged onto another fence to merge.
+    pub ghost: bool,
+    /// Title of a fence being dragged onto this one's title bar.
+    pub merge_hover: Option<String>,
+    /// Tab under a file drag.
+    pub drop_tab: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -183,8 +283,13 @@ impl FenceWin {
     pub fn new(id: u64) -> Self {
         Self { id, hwnd: HWND::default(), dpi: 96, entries: Vec::new(), selection: HashSet::new(), anchor: None, focus: None,
             hover: FenceHit::None, scroll: 0, interaction: None, surface: None, notify: None, notify_path: None, drop: None,
-            drop_hover: None, rename: None, message: None, tracking: false, peek: false, peek_blocked: false }
+            drop_hover: None, rename: None, message: None, tracking: false, peek: false, peek_blocked: false,
+            tabs: Vec::new(), ghost: false, merge_hover: None, drop_tab: None }
     }
+
+    /// More than one tab: the title bar shows the tab strip.
+    pub fn tabbed(&self) -> bool { self.tabs.len() > 1 }
+    pub fn active_index(&self) -> usize { self.tabs.iter().position(|t| t.id == self.id).unwrap_or(0) }
 
     pub fn window_rect(&self) -> RECT {
         let mut r = RECT::default();
@@ -194,12 +299,15 @@ impl FenceWin {
 
     pub fn geometry(&self, fence: &Fence) -> Geometry {
         let r = self.window_rect();
-        if self.peek {
+        let mut g = if self.peek {
             let mut open = fence.clone();
             open.collapsed = false;
-            return Geometry::new(r.right - r.left, r.bottom - r.top, self.dpi, &open, self.entries.len(), self.scroll, fence.browse.is_some());
-        }
-        Geometry::new(r.right - r.left, r.bottom - r.top, self.dpi, fence, self.entries.len(), self.scroll, fence.browse.is_some())
+            Geometry::new(r.right - r.left, r.bottom - r.top, self.dpi, &open, self.entries.len(), self.scroll, fence.browse.is_some())
+        } else {
+            Geometry::new(r.right - r.left, r.bottom - r.top, self.dpi, fence, self.entries.len(), self.scroll, fence.browse.is_some())
+        };
+        g.layout_tabs(&self.tabs, self.active_index(), self.dpi);
+        g
     }
 
     /// Collapsed as displayed right now (a peeking fence behaves as expanded).
@@ -241,12 +349,61 @@ impl FenceWin {
             cv.round(outer, radius, col(palette.title));
             cv.pop_clip();
             let hovered = !matches!(self.hover, FenceHit::None);
-            let title_style = TextStyle::ui(sf(13.0)).weight(600).align(Align::Center);
-            let side = sf(36.0);
-            let mut text = fence.title.clone();
-            if fence.locked { text = format!("{text} \u{1F512}"); }
-            if !matches!(self.rename, Some((_, RenameTarget::Title))) {
+            let renaming_title = matches!(self.rename, Some((_, RenameTarget::Title)));
+            if self.merge_hover.is_some() {
+                cv.push_clip(title);
+                cv.round(outer, radius, col(palette.selected).with_alpha(0.6));
+                cv.pop_clip();
+            }
+            if self.tabbed() {
+                let dragged = match &self.interaction { Some(Interaction::TabDrag { tab, .. }) => Some(*tab), _ => None };
+                for &(i, r) in &g.tabs {
+                    let tab = &self.tabs[i];
+                    let chip = rf(r);
+                    let active = tab.id == self.id;
+                    let dropping = self.drop_tab == Some(i);
+                    if dropping {
+                        cv.round(chip, sf(6.0), col(palette.selected));
+                        cv.stroke_round(chip, sf(6.0), col(palette.accent), sf(1.5));
+                    } else if active {
+                        cv.round(chip, sf(6.0), col(palette.chip));
+                    } else if self.hover == FenceHit::Tab(i) {
+                        cv.round(chip, sf(6.0), col(palette.hover));
+                    }
+                    let mut color = if active || dropping { col(palette.text) } else { col(palette.text_secondary) };
+                    if dragged == Some(tab.id) { color = color.with_alpha(0.45); }
+                    let x = chip.x + sf(10.0);
+                    if !(active && renaming_title) {
+                        let style = TextStyle::ui(sf(13.0)).weight(if active { 600 } else { 400 });
+                        cv.text(&tab.label, RectF::new(x, chip.y, (chip.right() - sf(10.0) - x).max(0.0), chip.h), &style, color);
+                    }
+                }
+                if !g.tab_list.is_empty() {
+                    let list = rf(g.tab_list);
+                    if self.hover == FenceHit::TabList { cv.round(list, sf(6.0), col(palette.hover)); }
+                    cv.glyph(glyph::CHEVRON_DOWN_SMALL, RectF::new(list.x + sf(6.0), list.y, sf(12.0), list.h), sf(10.0), col(palette.text_secondary));
+                    cv.text(&g.hidden_tabs.to_string(), RectF::new(list.x + sf(20.0), list.y, list.w - sf(22.0), list.h),
+                        &TextStyle::ui(sf(12.0)), col(palette.text_secondary));
+                }
+            } else if !renaming_title {
+                let title_style = TextStyle::ui(sf(13.0)).weight(600).align(Align::Center);
+                let side = if hovered { sf(66.0) } else { sf(36.0) };
+                let mut text = fence.title.clone();
+                if fence.locked { text = format!("{text} \u{1F512}"); }
                 cv.text(&text, RectF::new(side, 0.0, (w as f32 - side * 2.0).max(0.0), title.h), &title_style, col(palette.text));
+            }
+            if (hovered || self.tabbed()) && !g.add.is_empty() && self.merge_hover.is_none() {
+                let add = rf(g.add);
+                if self.hover == FenceHit::AddTab { cv.round(add, sf(6.0), col(palette.hover)); }
+                cv.glyph(glyph::ADD, add, sf(11.0), col(palette.text_secondary));
+            }
+            if let Some(incoming) = &self.merge_hover {
+                // Where the dragged fence will land as a tab.
+                let width = sf(96.0).min((w as f32 - sf(80.0)).max(sf(40.0)));
+                let x = if self.tabbed() { g.add.x as f32 } else { g.more.x as f32 - sf(4.0) - width };
+                let chip = RectF::new(x.min(w as f32 - sf(36.0) - width).max(sf(6.0)), (title.h - sf(28.0)) / 2.0, width, sf(28.0));
+                cv.stroke_round(chip, sf(6.0), col(palette.accent), sf(1.5));
+                cv.text(incoming, chip.inset(sf(10.0), 0.0), &TextStyle::ui(sf(13.0)).weight(600), col(palette.accent));
             }
             let small = TextStyle::ui(sf(11.0)).align(Align::End);
             if hovered && !g.more.is_empty() {
@@ -319,11 +476,13 @@ impl FenceWin {
                     cv.round(rf(g.thumb), sf(2.0), col(palette.text_secondary).with_alpha(0.6));
                 }
             }
-            let border = if drop_all { col(palette.accent) } else { col(palette.border) };
-            cv.stroke_round(outer, radius, border, if drop_all { sf(2.0) } else { 1.0 });
+            let highlight = drop_all || self.merge_hover.is_some();
+            let border = if highlight { col(palette.accent) } else { col(palette.border) };
+            cv.stroke_round(outer, radius, border, if highlight { sf(2.0) } else { 1.0 });
         });
         let screen = unsafe { GetDC(None) };
-        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+        let alpha = if self.ghost { 150 } else { 255 };
+        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: alpha, AlphaFormat: AC_SRC_ALPHA as u8 };
         let position = POINT { x: rect.left, y: rect.top };
         let size = SIZE { cx: w, cy: h };
         let origin = POINT::default();
@@ -384,6 +543,56 @@ mod tests {
         let g = Geometry::new(300, TITLE_H, 96, &f, 10, 0, false);
         assert!(g.cells.is_empty());
         assert_eq!(g.hit(150, TITLE_H - 1, 96, false, true), FenceHit::Title);
+    }
+
+    fn tabs(widths: &[i32]) -> Vec<TabMeta> {
+        widths.iter().enumerate().map(|(i, w)| TabMeta { id: i as u64 + 1, label: format!("t{i}"), width: *w }).collect()
+    }
+
+    #[test]
+    fn single_tab_keeps_the_title_and_offers_add_beside_the_menu() {
+        let mut g = Geometry::new(300, 200, 96, &fence(), 0, 0, false);
+        g.layout_tabs(&tabs(&[60]), 0, 96);
+        assert!(g.tabs.is_empty() && g.tab_list.is_empty());
+        assert!(g.add.right() <= g.more.x);
+        assert_eq!(g.hit(g.add.x + 2, g.add.y + 2, 96, false, false), FenceHit::AddTab);
+        assert_eq!(g.hit(100, 20, 96, false, false), FenceHit::Title, "the centred title still moves the fence");
+    }
+
+    #[test]
+    fn tabs_fit_in_order_with_add_after_them() {
+        let mut g = Geometry::new(400, 200, 96, &fence(), 0, 0, false);
+        g.layout_tabs(&tabs(&[60, 70, 80]), 1, 96);
+        assert_eq!(g.tabs.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert!(g.tabs.windows(2).all(|p| p[0].1.right() < p[1].1.x));
+        assert!(g.tabs.last().unwrap().1.right() < g.add.x && g.add.right() <= g.more.x);
+        let (_, second) = g.tabs[1];
+        assert_eq!(g.hit(second.x + 3, second.y + 3, 96, false, false), FenceHit::Tab(1));
+        assert_eq!(g.hit(g.add.right() + 4, 20, 96, false, false), FenceHit::Title, "space after the tabs moves the fence");
+    }
+
+    #[test]
+    fn overflowing_tabs_keep_the_active_tab_and_a_list_button() {
+        for dpi in [96, 144] {
+            let width = scale(260, dpi);
+            let mut g = Geometry::new(width, scale(200, dpi), dpi, &fence(), 0, 0, false);
+            let metas = tabs(&[scale(70, dpi); 8]);
+            g.layout_tabs(&metas, 6, dpi);
+            assert!(g.hidden_tabs > 0 && !g.tab_list.is_empty());
+            assert_eq!(g.tabs.len() + g.hidden_tabs, 8);
+            assert!(g.tabs.iter().any(|(i, _)| *i == 6));
+            let mut rects: Vec<Rect> = g.tabs.iter().map(|(_, r)| *r).collect();
+            rects.extend([g.tab_list, g.add]);
+            for (n, a) in rects.iter().enumerate() {
+                assert!(a.x >= 0 && a.right() <= g.more.x, "{a:?} at {dpi} DPI");
+                for b in &rects[n + 1..] { assert!(a.right() <= b.x || b.right() <= a.x, "{a:?} overlaps {b:?}"); }
+            }
+            assert_eq!(g.hit(g.tab_list.x + 2, g.tab_list.y + 2, dpi, false, false), FenceHit::TabList);
+        }
+        // Even the narrowest fence shows the active tab.
+        let mut g = Geometry::new(160, 200, 96, &fence(), 0, 0, false);
+        g.layout_tabs(&tabs(&[90, 90, 90]), 2, 96);
+        assert_eq!(g.tabs.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![2]);
     }
 
     #[test]

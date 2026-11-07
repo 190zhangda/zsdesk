@@ -21,9 +21,12 @@ use windows::{
 use zsdesk_core::model::desktop::{auto_layout, categorize, distribute, sort_items, snap, drag_rect, Bounds, Category, DesktopConfig,
     Edges as CoreEdges, Fence, FenceSort, FenceSource, FenceTheme, FenceView, IconSize, ItemInfo, Placement, MIN_FENCE_H, MIN_FENCE_W, TITLE_H};
 use zsdesk_ui::{chrome::scale, menus::{entry, menu, submenu, MenuItemSpec, MenuSpec}, theme::{FencePalette, Mode}};
-use zsdesk_windows::{desktop::{self, ShellEntry}, gfx::Gfx, shell::{icons::{IconLoader, IconRequest}, menu::HistoryAction, notify::ChangeNotify, pidl}};
+use zsdesk_windows::{desktop::{self, ShellEntry}, gfx::{Gfx, TextStyle}, shell::{icons::{IconLoader, IconRequest}, menu::HistoryAction, notify::ChangeNotify, pidl}};
 
-use super::fence::{FenceHit, FenceWin, Interaction, RenameTarget};
+use super::fence::{FenceHit, FenceWin, Interaction, RenameTarget, TabMeta};
+
+/// Hovering a dragged file over another tab switches to it after this delay.
+const TAB_HOVER_SWITCH: Duration = Duration::from_millis(600);
 
 pub const WM_TRAY: u32 = WM_APP + 10;
 pub const WM_DESKTOP_CHANGED: u32 = WM_APP + 11;
@@ -50,8 +53,17 @@ pub enum After {
     History { fence: u64, action: HistoryAction },
     Rename { fence: u64, key: String, name: String },
     PickFolder { replace: Option<u64> },
+    /// Adds a folder-mapped tab to this fence's group.
+    PickFolderTab { to: u64 },
+    /// "+" in the title bar: choose the kind of new tab.
+    AddTab { fence: u64, point: POINT },
+    /// "⌄ N": tabs that do not fit.
+    TabList { fence: u64, point: POINT },
     DeleteFence(u64),
 }
+
+/// Where a drag over a fence would drop.
+struct DropSpot { hover: usize, tab: Option<usize>, into: u64, target: Option<IDropTarget>, own: bool }
 
 fn history_shortcut(key: u16, control: bool, shift: bool, alt: bool) -> Option<HistoryAction> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_Y, VK_Z};
@@ -145,6 +157,10 @@ pub struct DesktopHost {
     drop_data: Option<IDataObject>,
     pub internal_drag: Option<(u64, Vec<String>)>,
     tray: bool,
+    /// Fence whose title bar receives the fence being moved (merge as a tab).
+    merge_target: Option<u64>,
+    /// Tab under a file drag and when the pointer arrived there.
+    tab_hover: Option<(u64, Instant)>,
 }
 
 impl DesktopHost {
@@ -154,8 +170,10 @@ impl DesktopHost {
         let mut host = Self { hwnd, config_path, explorer_config, config, fences: Vec::new(), desktop_entries: Vec::new(), gfx,
             icons: HashMap::new(), icon_clock: 0, next_icon_request: 1, icon_content_active: false, shutting_down: false, desktop_anchor: None,
             loader, desktop_notify: None, guard: None, pending: Vec::new(), known: HashSet::new(),
-            taskbar_created, palette: FencePalette::new(Mode::Dark, 55), drop_delegate: None, drop_data: None, internal_drag: None, tray: false };
+            taskbar_created, palette: FencePalette::new(Mode::Dark, 55), drop_delegate: None, drop_data: None, internal_drag: None, tray: false,
+            merge_target: None, tab_hover: None };
         host.update_palette();
+        super::fence::set_blur(host.config.settings.blur);
         host
     }
 
@@ -380,6 +398,10 @@ impl DesktopHost {
             self.flash(existing);
             return;
         }
+        self.create_folder_fence(path);
+    }
+
+    fn create_folder_fence(&mut self, path: PathBuf) {
         let monitor = primary_monitor();
         let others: Vec<Bounds> = self.config.fences.iter().filter(|f| f.placement.monitor == monitor.name)
             .map(|f| Bounds::new(f.placement.x, f.placement.y, f.placement.width, f.placement.height)).collect();
@@ -398,6 +420,7 @@ impl DesktopHost {
     }
 
     pub fn delete_fence(&mut self, id: u64) {
+        self.config.release_tab(id);
         self.config.fences.retain(|f| f.id != id);
         if self.config.settings.organize && !self.config.fences.iter().any(|f| f.is_desktop() && f.catch_all) {
             if let Some(f) = self.config.fences.iter_mut().find(|f| f.is_desktop()) { f.catch_all = true; }
@@ -422,6 +445,7 @@ impl DesktopHost {
         if self.config.fences.is_empty() && self.config.settings.hide_tray { self.show_tray(); }
         self.config.settings.hidden = false;
         for f in &self.fences {
+            if self.config.fence(f.id).is_some_and(Fence::is_hidden_tab) { continue; }
             let _ = unsafe { ShowWindow(f.hwnd, SW_SHOWNOACTIVATE) };
             if f.peek { unsafe { SetTimer(Some(f.hwnd), TIMER_PEEK, 250, None); } }
         }
@@ -433,6 +457,7 @@ impl DesktopHost {
         self.config.settings.hidden = !self.config.settings.hidden;
         let show = if self.config.settings.hidden { SW_HIDE } else { SW_SHOWNOACTIVATE };
         for f in &self.fences {
+            if !self.config.settings.hidden && self.config.fence(f.id).is_some_and(Fence::is_hidden_tab) { continue; }
             let _ = unsafe { ShowWindow(f.hwnd, show) };
             if !self.config.settings.hidden && f.peek { unsafe { SetTimer(Some(f.hwnd), TIMER_PEEK, 250, None); } }
         }
@@ -441,6 +466,7 @@ impl DesktopHost {
     }
 
     fn flash(&mut self, id: u64) {
+        if self.config.fence(id).is_some_and(Fence::is_hidden_tab) { self.switch_tab(id); }
         if let Some(f) = self.fences.iter().find(|f| f.id == id) {
             let _ = unsafe { ShowWindow(f.hwnd, SW_SHOWNOACTIVATE) };
             let _ = unsafe { SetForegroundWindow(f.hwnd) };
@@ -464,6 +490,215 @@ impl DesktopHost {
             if self.config.fences[i].is_desktop() { continue; }
             if self.fences.iter().find(|w| w.id == id).is_some_and(|w| w.entries.is_empty() && w.notify.is_none()) { self.refresh_folder(id); }
         }
+        self.apply_visibility();
+    }
+
+    /// Shows each group's active tab at the group position and hides the others.
+    fn apply_visibility(&mut self) {
+        if self.config.settings.hidden { return; }
+        for i in 0..self.fences.len() {
+            let id = self.fences[i].id;
+            let Some(fence) = self.config.fence(id).cloned() else { continue };
+            let hwnd = self.fences[i].hwnd;
+            let shown = unsafe { IsWindowVisible(hwnd) }.as_bool();
+            if !fence.is_hidden_tab() && !shown {
+                self.fences[i].peek = false;
+                let r = to_screen(&fence.placement, fence.collapsed);
+                let _ = unsafe { SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE) };
+                self.fences[i].dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+                self.render(id);
+                let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+            } else if fence.is_hidden_tab() && shown {
+                let win = &mut self.fences[i];
+                let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+                let _ = unsafe { KillTimer(Some(hwnd), TIMER_PEEK) };
+                win.peek = false;
+                win.surface = None;
+                win.hover = FenceHit::None;
+            }
+        }
+    }
+
+    // ---- tabs ----------------------------------------------------------------
+
+    /// Tab chips for `id`'s group, measured for the pill strip (empty for a plain fence).
+    fn tab_metas(&self, id: u64, dpi: u32) -> Vec<TabMeta> {
+        let ids = self.config.tab_ids(id);
+        if ids.len() < 2 { return Vec::new(); }
+        let sf = |v: f32| v * dpi as f32 / 96.0;
+        let style = TextStyle::ui(sf(13.0)).weight(600);
+        ids.iter().filter_map(|t| self.config.fence(*t)).map(|f| {
+            let label = if f.locked && f.tab_active { format!("{} \u{1F512}", f.title) } else { f.title.clone() };
+            let (text, _) = self.gfx.measure(&label, &style, sf(400.0));
+            let width = (text.ceil() + sf(20.0)) as i32;
+            TabMeta { id: f.id, label, width: width.clamp(scale(44, dpi), scale(140, dpi)) }
+        }).collect()
+    }
+
+    /// Shows tab `to` in place of its group's current tab.
+    pub fn switch_tab(&mut self, to: u64) {
+        let Some(from) = self.config.active_tab(to) else { return };
+        if from == to || self.config.fence(to).is_none_or(|f| f.group == 0) { return; }
+        self.commit_rename_if_any(from);
+        self.config.activate_tab(to);
+        self.schedule_save();
+        let (Some(fi), Some(ti)) = (self.win_index(from), self.win_index(to)) else { self.sync_windows(); return };
+        let rect = self.fences[fi].window_rect();
+        let (old, new) = (self.fences[fi].hwnd, self.fences[ti].hwnd);
+        let peek = std::mem::replace(&mut self.fences[fi].peek, false);
+        let blocked = self.fences[fi].peek_blocked;
+        let focused = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() } == old;
+        self.fences[fi].hover = FenceHit::None;
+        self.fences[fi].drop_tab = None;
+        let _ = unsafe { SetWindowPos(new, None, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, SWP_NOZORDER | SWP_NOACTIVATE) };
+        super::set_z(new, old);
+        let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(new) }.max(96);
+        let tabs = self.tab_metas(to, dpi);
+        {
+            let win = &mut self.fences[ti];
+            win.dpi = dpi;
+            win.peek = peek;
+            win.peek_blocked = blocked;
+            win.tracking = false;
+            win.interaction = None;
+            win.drop_tab = None;
+            win.tabs = tabs;
+        }
+        if let Some(fence) = self.config.fence(to).cloned() {
+            let win = &mut self.fences[ti];
+            win.clamp_scroll(&fence);
+            let mut cursor = POINT::default();
+            let _ = unsafe { GetCursorPos(&mut cursor) };
+            let _ = unsafe { windows::Win32::Graphics::Gdi::ScreenToClient(new, &mut cursor) };
+            win.hover = win.geometry(&fence).hit(cursor.x, cursor.y, win.dpi, fence.locked, win.collapsed(&fence));
+        }
+        if !self.config.settings.hidden {
+            // Paint before showing so the swap does not flash.
+            self.render(to);
+            let _ = unsafe { ShowWindow(new, SW_SHOWNOACTIVATE) };
+        }
+        let _ = unsafe { ShowWindow(old, SW_HIDE) };
+        let _ = unsafe { KillTimer(Some(old), TIMER_PEEK) };
+        if peek { unsafe { SetTimer(Some(new), TIMER_PEEK, 250, None); } }
+        self.fences[fi].surface = None;
+        if focused { let _ = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(new)) }; }
+        self.prune_icon_cache();
+    }
+
+    /// Next (`step` 1) or previous (-1) tab of `id`'s group.
+    fn cycle_tab(&mut self, id: u64, step: isize) {
+        let ids = self.config.tab_ids(id);
+        let Some(at) = ids.iter().position(|t| *t == id) else { return };
+        if ids.len() < 2 { return; }
+        let next = (at as isize + step).rem_euclid(ids.len() as isize) as usize;
+        self.switch_tab(ids[next]);
+    }
+
+    pub fn add_desktop_tab(&mut self, to: u64) {
+        if !self.config.settings.organize || self.config.fence(to).is_none() { return; }
+        let previous = self.config.active_tab(to).unwrap_or(to);
+        let id = self.config.take_id();
+        self.config.add_tab(to, Fence::new(id, "新建标签", FenceSource::Desktop, Placement::default()));
+        self.after_new_tab(previous, id);
+        self.refresh_desktop();
+        self.begin_rename(id, RenameTarget::Title);
+    }
+
+    pub fn add_folder_tab(&mut self, to: u64, path: PathBuf) {
+        if self.config.fence(to).is_none() { return; }
+        let previous = self.config.active_tab(to).unwrap_or(to);
+        let id = self.config.take_id();
+        self.config.add_tab(to, Fence::new(id, zsdesk_core::model::explorer::path_title(&path), FenceSource::Folder { root: path }, Placement::default()));
+        self.after_new_tab(previous, id);
+        self.refresh_folder(id);
+        self.render(id);
+    }
+
+    fn after_new_tab(&mut self, previous: u64, id: u64) {
+        self.save_now();
+        self.sync_windows();
+        if let (Some(p), Some(n)) = (self.win_index(previous), self.win_index(id)) { super::set_z(self.fences[n].hwnd, self.fences[p].hwnd); }
+        self.render_all();
+    }
+
+    /// Takes `tab` out of its group as its own fence at `placement`.
+    fn detach_tab(&mut self, tab: u64, placement: Placement) {
+        if self.config.tab_ids(tab).len() < 2 { return; }
+        self.commit_rename_if_any(tab);
+        self.config.split_tab(tab, placement);
+        self.save_now();
+        if let (Some(i), Some(fence)) = (self.win_index(tab), self.config.fence(tab).cloned()) {
+            let r = to_screen(&fence.placement, fence.collapsed);
+            let win = &mut self.fences[i];
+            win.peek = false;
+            win.interaction = None;
+            let _ = unsafe { SetWindowPos(win.hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE) };
+        }
+        self.apply_visibility();
+        self.render_all();
+    }
+
+    fn detach_tab_at(&mut self, tab: u64, screen: POINT) {
+        let Some(fence) = self.config.fence(tab).cloned() else { return };
+        let monitor = monitor_from_point(screen);
+        let x = unscale(screen.x - monitor.work.left, monitor.dpi) - 40;
+        let y = unscale(screen.y - monitor.work.top, monitor.dpi) - TITLE_H / 2;
+        self.detach_tab(tab, Placement { monitor: monitor.name, x: x.max(0), y: y.max(0), ..fence.placement });
+    }
+
+    /// Drops the moved fence `source` (with its tabs) into `target`'s tab group.
+    fn merge_fences(&mut self, source: u64, target: u64) {
+        let target_hwnd = self.win_index(target).map(|i| self.fences[i].hwnd);
+        if !self.config.merge_into(source, target) { return; }
+        self.save_now();
+        if let (Some(i), Some(fence)) = (self.win_index(source), self.config.fence(source).cloned()) {
+            let r = to_screen(&fence.placement, fence.collapsed);
+            let hwnd = self.fences[i].hwnd;
+            self.fences[i].peek = false;
+            let _ = unsafe { SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE) };
+            if let Some(target) = target_hwnd { super::set_z(hwnd, target); }
+        }
+        self.apply_visibility();
+        self.render_all();
+    }
+
+    /// Visible fence (outside `id`'s group) whose title bar is under `screen`.
+    fn merge_target_at(&self, id: u64, screen: POINT) -> Option<u64> {
+        let own = self.config.tab_ids(id);
+        self.fences.iter().filter(|w| !own.contains(&w.id) && unsafe { IsWindowVisible(w.hwnd) }.as_bool()).find(|w| {
+            let r = w.window_rect();
+            screen.x >= r.left && screen.x < r.right && screen.y >= r.top && screen.y < r.top + scale(TITLE_H, w.dpi)
+        }).map(|w| w.id)
+    }
+
+    fn set_merge_target(&mut self, id: u64, target: Option<u64>) {
+        if self.merge_target == target { return; }
+        if let Some(old) = self.merge_target.take() {
+            if let Some(i) = self.win_index(old) { self.fences[i].merge_hover = None; self.render(old); }
+        }
+        let title = self.config.fence(id).map(|f| f.title.clone()).unwrap_or_default();
+        if let Some(new) = target {
+            if let Some(i) = self.win_index(new) { self.fences[i].merge_hover = Some(title); self.render(new); }
+        }
+        self.merge_target = target;
+        if let Some(i) = self.win_index(id) { self.fences[i].ghost = target.is_some(); }
+        self.render(id);
+    }
+
+    /// Menu for the "+" button.
+    pub fn add_tab_menu(&self) -> MenuSpec {
+        let organize = self.config.settings.organize;
+        menu(vec![
+            entry(if organize { "桌面分组标签" } else { "桌面分组标签（需先一键整理桌面）" }, "new-tab-desktop", organize, false),
+            entry("映射文件夹标签…", "new-tab-folder", true, false),
+        ])
+    }
+
+    /// Every tab of `id`'s group, for the "⌄ N" button.
+    pub fn tab_list_menu(&self, id: u64) -> MenuSpec {
+        let active = self.config.active_tab(id);
+        menu(self.config.tab_ids(id).into_iter().filter_map(|t| self.config.fence(t))
+            .map(|f| entry(&f.title.replace('&', "&&"), &format!("switch-tab-{}", f.id), true, Some(f.id) == active)).collect())
     }
 
     fn create_window(&mut self, id: u64) {
@@ -478,13 +713,14 @@ impl DesktopHost {
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, id as isize); }
         let mut win = FenceWin::new(id);
         win.hwnd = hwnd;
+        super::fence::apply_glass(hwnd);
         win.dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
         // The suggested rectangle used the monitor DPI; recompute if the window got another one.
         let handler = std::rc::Rc::new(super::FenceDrop { fence: id });
         win.drop = unsafe { zsdesk_windows::ole::DropRegistration::register(hwnd, handler) }.ok();
         self.fences.push(win);
         super::set_z(hwnd, HWND_BOTTOM);
-        if !self.config.settings.hidden { let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) }; }
+        if !self.config.settings.hidden && !fence_hidden_tab(&self.config, id) { let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) }; }
         self.render(id);
     }
 
@@ -567,7 +803,10 @@ impl DesktopHost {
         if self.config.settings.hidden { self.release_hidden_graphics(); return; }
         let Some(index) = self.win_index(id) else { return };
         let Some(fence) = self.config.fence(id).cloned() else { return };
+        if fence.is_hidden_tab() { self.fences[index].surface = None; return; }
+        let tabs = self.tab_metas(id, self.fences[index].dpi);
         let mut win = std::mem::replace(&mut self.fences[index], FenceWin::new(id));
+        win.tabs = tabs;
         let palette = self.palette;
         let show_counts = self.config.settings.show_counts;
         let generation = self.gfx.generation();
@@ -628,7 +867,7 @@ impl DesktopHost {
         if self.config.settings.hidden { return keys; }
         for win in &self.fences {
             let Some(fence) = self.config.fence(win.id) else { continue };
-            if win.collapsed(fence) { continue; }
+            if win.collapsed(fence) || fence.is_hidden_tab() { continue; }
             let geometry = win.geometry(fence);
             let px = if fence.view == FenceView::List { scale(20, win.dpi) } else { geometry.icon_px };
             for (index, cell) in geometry.cells.iter().enumerate() {
@@ -641,7 +880,7 @@ impl DesktopHost {
     }
 
     fn prune_icon_cache(&mut self) {
-        let active = !self.config.settings.hidden && self.fences.iter().any(|w| self.config.fence(w.id).is_some_and(|f| !w.collapsed(f)));
+        let active = !self.config.settings.hidden && self.fences.iter().any(|w| self.config.fence(w.id).is_some_and(|f| !w.collapsed(f) && !f.is_hidden_tab()));
         if !active {
             self.icons.clear();
             self.loader.retain_requests(&HashSet::new());
@@ -676,6 +915,7 @@ impl DesktopHost {
             let rect = win.window_rect();
             let fence = self.config.fence(win.id);
             serde_json::json!({"id":win.id,"title":fence.map(|f|f.title.as_str()),"entry_count":win.entries.len(),
+                "group":fence.map(|f|f.group),"hidden_tab":fence.map(Fence::is_hidden_tab),
                 "collapsed":fence.map(|f|win.collapsed(f)),"peek":win.peek,"dpi":win.dpi,
                 "rect":{"left":rect.left,"top":rect.top,"right":rect.right,"bottom":rect.bottom},
                 "surface":win.surface.as_ref().map(|s|serde_json::json!({"width":s.width,"height":s.height,"pixel_bytes":s.pixel_bytes()}))})
@@ -813,6 +1053,7 @@ impl DesktopHost {
         let peeking = self.fences.iter().any(|w| w.id == id && w.peek);
         let keep_height = (fence.collapsed && !peeking).then_some(fence.placement.height);
         fence.placement = from_screen(rect, keep_height);
+        self.config.sync_group(id);
         self.schedule_save();
     }
 
@@ -849,10 +1090,35 @@ impl DesktopHost {
                 let area = Bounds::new(monitor.work.left, monitor.work.top, monitor.work.right - monitor.work.left, monitor.work.bottom - monitor.work.top);
                 let hwnd = win.hwnd;
                 let others = self.other_bounds(id);
-                let snapped = snap(moved, edges, &others, area, s(10), s(12));
-                let _ = unsafe { SetWindowPos(hwnd, None, snapped.x, snapped.y, snapped.w, snapped.h, SWP_NOZORDER | SWP_NOACTIVATE) };
-                if !edges.is_move() { if let Some(f) = self.config.fence(id).cloned() { self.fences[index].clamp_scroll(&f); } self.render(id); }
-                else { self.render(id); }
+                let target = if edges.is_move() { self.merge_target_at(id, screen) } else { None };
+                // Over another fence's title bar the fence follows the pointer freely.
+                let placed = if target.is_some() { moved } else { snap(moved, edges, &others, area, s(10), s(12)) };
+                let _ = unsafe { SetWindowPos(hwnd, None, placed.x, placed.y, placed.w, placed.h, SWP_NOZORDER | SWP_NOACTIVATE) };
+                if !edges.is_move() { if let Some(f) = self.config.fence(id).cloned() { self.fences[index].clamp_scroll(&f); } }
+                if edges.is_move() { self.set_merge_target(id, target); }
+                self.render(id);
+                return After::Nothing;
+            }
+            Some(Interaction::TabPress { tab, cursor }) => {
+                let threshold = unsafe { GetSystemMetrics(SM_CXDRAG) };
+                if !fence.locked && ((point.x - cursor.x).abs() > threshold || (point.y - cursor.y).abs() > threshold) {
+                    win.interaction = Some(Interaction::TabDrag { tab, torn: false });
+                    self.render(id);
+                }
+                return After::Nothing;
+            }
+            Some(Interaction::TabDrag { tab, .. }) => {
+                let g = win.geometry(&fence);
+                let margin = scale(24, win.dpi);
+                let torn = point.x < -margin || point.x > g.width + margin || point.y < -margin || point.y > g.title.height + margin;
+                if !torn {
+                    let before = g.tabs.iter().find(|(_, r)| point.x < r.x + r.width / 2).map(|(i, _)| win.tabs[*i].id);
+                    let order = self.config.tab_ids(id);
+                    let current = order.iter().position(|t| *t == tab).and_then(|at| order.get(at + 1).copied());
+                    if before != Some(tab) && before != current { self.config.move_tab(tab, before); self.schedule_save(); }
+                }
+                if let Some(i) = self.win_index(id) { self.fences[i].interaction = Some(Interaction::TabDrag { tab, torn }); }
+                self.render(id);
                 return After::Nothing;
             }
             Some(Interaction::Press { index: item, cursor }) => {
@@ -966,6 +1232,14 @@ impl DesktopHost {
                 unsafe { windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(win.hwnd); }
             }
             FenceHit::More => return After::FenceMenu { fence: id, point: screen_below(win.hwnd, g.more) },
+            FenceHit::Tab(i) => {
+                let tab = win.tabs[i].id;
+                if double && tab == id { self.toggle_collapse(id); return After::Nothing; }
+                win.interaction = Some(Interaction::TabPress { tab, cursor: point });
+                unsafe { windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(win.hwnd); }
+            }
+            FenceHit::AddTab => return After::AddTab { fence: id, point: screen_below(win.hwnd, g.add) },
+            FenceHit::TabList => return After::TabList { fence: id, point: screen_below(win.hwnd, g.tab_list) },
             FenceHit::Back => { self.browse_up(id); return After::Nothing; }
             FenceHit::Scrollbar => {
                 win.interaction = Some(Interaction::Thumb { cursor_y: point.y, scroll: win.scroll });
@@ -1010,9 +1284,28 @@ impl DesktopHost {
             let _ = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture() };
         }
         match interaction {
+            Some(Interaction::Move { .. }) if self.merge_target.is_some() => {
+                let target = self.merge_target.take();
+                for w in &mut self.fences { w.ghost = false; w.merge_hover = None; }
+                if let Some(target) = target { self.merge_fences(id, target); }
+                return After::Nothing;
+            }
             Some(Interaction::Move { .. }) | Some(Interaction::Resize { .. }) => {
                 let rect = win.window_rect();
                 self.store_rect(id, rect);
+            }
+            Some(Interaction::TabPress { tab, .. }) => {
+                if tab != id { self.switch_tab(tab); }
+                return After::Nothing;
+            }
+            Some(Interaction::TabDrag { tab, torn }) => {
+                if torn {
+                    let mut screen = point;
+                    let _ = unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(win.hwnd, &mut screen) };
+                    self.detach_tab_at(tab, screen);
+                    return After::Nothing;
+                }
+                self.schedule_save();
             }
             Some(Interaction::Press { index: item, .. }) => {
                 let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
@@ -1024,6 +1317,15 @@ impl DesktopHost {
         let _ = point;
         self.render(id);
         After::Nothing
+    }
+
+    /// Capture taken away mid-gesture (menus, Alt+Tab): drop the gesture and
+    /// any merge preview it was showing.
+    pub fn capture_lost(&mut self, id: u64) {
+        let Some(index) = self.win_index(id) else { return };
+        if self.fences[index].interaction.take().is_none() { return; }
+        if self.merge_target.is_some() { self.set_merge_target(id, None); }
+        self.render(id);
     }
 
     pub fn right_click(&mut self, id: u64, point: POINT) -> After {
@@ -1041,15 +1343,26 @@ impl DesktopHost {
                 self.render(id);
                 After::ItemMenu { fence: id, point: screen }
             }
+            FenceHit::Tab(i) => {
+                let tab = win.tabs[i].id;
+                if tab != id { self.switch_tab(tab); }
+                After::FenceMenu { fence: tab, point: screen }
+            }
             _ => After::FenceMenu { fence: id, point: screen },
         }
     }
 
-    pub fn wheel(&mut self, id: u64, delta: i32) {
+    pub fn wheel(&mut self, id: u64, delta: i32, screen: POINT) {
         let Some(index) = self.win_index(id) else { return };
         let Some(fence) = self.config.fence(id).cloned() else { return };
         let win = &mut self.fences[index];
         let g = win.geometry(&fence);
+        let mut client = screen;
+        let _ = unsafe { windows::Win32::Graphics::Gdi::ScreenToClient(win.hwnd, &mut client) };
+        if win.tabbed() && client.y >= 0 && client.y < g.title.height {
+            if delta != 0 { self.cycle_tab(id, if delta < 0 { 1 } else { -1 }); }
+            return;
+        }
         let step = if fence.view == FenceView::List { scale(26 * 3, win.dpi) } else { g.cells.first().map_or(80, |c| c.cell.height + scale(2, win.dpi)) };
         win.scroll = (win.scroll - delta * step / 120).clamp(0, g.max_scroll);
         self.render(id);
@@ -1064,6 +1377,7 @@ impl DesktopHost {
         if let Some(action) = history_shortcut(key, ctrl, shift, unsafe { GetKeyState(VK_MENU.0 as i32) } < 0) {
             return After::History { fence: id, action };
         }
+        if ctrl && key == VK_TAB.0 { self.cycle_tab(id, if shift { -1 } else { 1 }); return After::Nothing; }
         let win = &mut self.fences[index];
         let count = win.entries.len();
         let k = VIRTUAL_KEY(key);
@@ -1117,6 +1431,7 @@ impl DesktopHost {
         // Double-clicking a peeking fence pins it open.
         fence.collapsed = if peeking { false } else { !fence.collapsed };
         if fence.collapsed { if let Some(i) = self.fences.iter().position(|w| w.id == id) { self.fences[i].peek_blocked = true; } }
+        self.config.sync_group(id);
         let fence = self.config.fence_mut(id).unwrap();
         let placement = fence.placement.clone();
         let collapsed = fence.collapsed;
@@ -1159,6 +1474,12 @@ impl DesktopHost {
         let win = &self.fences[index];
         let g = win.geometry(&fence);
         let (rect, text, multiline) = match &target {
+            RenameTarget::Title if win.tabbed() => {
+                let active = win.active_index();
+                let chip = g.tabs.iter().find(|(i, _)| *i == active).map_or(g.title, |(_, r)| *r);
+                let width = chip.width.max(scale(120, win.dpi)).min((g.width - chip.x - scale(4, win.dpi)).max(scale(60, win.dpi)));
+                (zsdesk_ui::chrome::Rect::new(chip.x, chip.y, width, chip.height), fence.title.clone(), false)
+            }
             RenameTarget::Title => (zsdesk_ui::chrome::Rect::new(scale(36, win.dpi), scale(4, win.dpi), (g.width - scale(72, win.dpi)).max(scale(60, win.dpi)), g.title.height - scale(8, win.dpi)), fence.title.clone(), false),
             RenameTarget::Item(key) => {
                 let Some(i) = win.entries.iter().position(|e| &e.key == key) else { return };
@@ -1223,10 +1544,16 @@ impl DesktopHost {
     pub fn fence_menu(&self, id: u64) -> MenuSpec {
         let Some(fence) = self.config.fence(id) else { return menu(Vec::new()) };
         let s = &self.config.settings;
+        let tabbed = self.config.tab_ids(id).len() > 1;
         let mut items = Vec::new();
         if fence.is_desktop() { items.push(entry("新建格子", "new-fence", true, false)); }
         items.push(entry("新建文件夹映射格子…", "new-folder-fence", true, false));
-        items.push(entry("重命名格子", "rename", true, false));
+        items.push(submenu("新建标签", vec![
+            entry("桌面分组", "new-tab-desktop", s.organize, false),
+            entry("映射文件夹…", "new-tab-folder", true, false),
+        ]));
+        items.push(entry(if tabbed { "重命名标签" } else { "重命名格子" }, "rename", true, false));
+        if tabbed { items.push(entry("移到新格子", "split-tab", true, false)); }
         items.push(MenuItemSpec::Separator);
         items.push(submenu("查看", vec![
             entry("大图标", "icons-large", true, fence.view == FenceView::Icons && fence.icon_size == IconSize::Large),
@@ -1260,7 +1587,7 @@ impl DesktopHost {
         items.push(MenuItemSpec::Separator);
         items.push(entry("锁定格子", "lock", true, fence.locked));
         items.push(entry(if fence.collapsed { "展开格子" } else { "折叠格子" }, "collapse", true, false));
-        items.push(entry("删除格子", "delete", true, false));
+        items.push(entry(if tabbed { "关闭标签" } else { "删除格子" }, "delete", true, false));
         items.push(MenuItemSpec::Separator);
         items.push(submenu("桌面格子", self.global_items(s)));
         menu(items)
@@ -1268,6 +1595,10 @@ impl DesktopHost {
 
     fn global_items(&self, s: &zsdesk_core::model::desktop::DesktopSettings) -> Vec<MenuItemSpec> {
         let autostart = desktop::autostart_command().is_some();
+        let transparency = |opacity: u8| {
+            let label = if opacity >= 100 { "不透明".to_string() } else { format!("透明度 {}%", 100 - u32::from(opacity)) };
+            entry(&label, &format!("opacity-{opacity}"), true, s.opacity == opacity)
+        };
         vec![
             entry(if s.organize { "重新整理桌面" } else { "一键整理桌面" }, "organize", true, false),
             entry("还原系统桌面图标", "restore", s.organize, false),
@@ -1282,9 +1613,11 @@ impl DesktopHost {
                 entry("浅色", "theme-light", true, s.theme == FenceTheme::Light),
                 entry("跟随系统", "theme-system", true, s.theme == FenceTheme::System),
                 MenuItemSpec::Separator,
-                entry("透明度 30%", "opacity-30", true, s.opacity == 30), entry("透明度 45%", "opacity-45", true, s.opacity == 45),
-                entry("透明度 55%", "opacity-55", true, s.opacity == 55), entry("透明度 70%", "opacity-70", true, s.opacity == 70),
-                entry("透明度 85%", "opacity-85", true, s.opacity == 85),
+                entry("毛玻璃效果", "blur", true, s.blur),
+                MenuItemSpec::Separator,
+                // The setting stores the background opacity; the menu shows transparency.
+                transparency(100), transparency(85), transparency(70), transparency(55),
+                transparency(45), transparency(30), transparency(15),
             ]),
             entry("文件夹格子内打开子文件夹", "browse-inside", true, s.browse_inside),
             entry("鼠标悬停展开折叠的格子", "hover-expand", true, s.hover_expand),
@@ -1315,7 +1648,14 @@ impl DesktopHost {
             "change-folder" => return After::PickFolder { replace: Some(fid) },
             "rename" => self.begin_rename(fid, RenameTarget::Title),
             "delete" => return After::DeleteFence(fid),
-            "lock" => { if let Some(f) = self.config.fence_mut(fid) { f.locked = !f.locked; } self.schedule_save(); self.render(fid); }
+            "lock" => { if let Some(f) = self.config.fence_mut(fid) { f.locked = !f.locked; } self.config.sync_group(fid); self.schedule_save(); self.render(fid); }
+            "new-tab-desktop" => self.add_desktop_tab(fid),
+            "new-tab-folder" => return After::PickFolderTab { to: fid },
+            "split-tab" => if let Some(fence) = self.config.fence(fid).cloned() {
+                let placement = Placement { x: fence.placement.x + 24, y: fence.placement.y + 24, ..fence.placement };
+                self.detach_tab(fid, placement);
+            },
+            id if id.starts_with("switch-tab-") => if let Ok(tab) = id["switch-tab-".len()..].parse::<u64>() { self.switch_tab(tab); },
             "collapse" => self.toggle_collapse(fid),
             "open-explorer" => if let Some(path) = self.config.fence(fid).and_then(|f| f.folder().cloned()) { self.open_in_explorer(&path); },
             "browse-up" => self.browse_up(fid),
@@ -1333,6 +1673,13 @@ impl DesktopHost {
             "browse-inside" => { self.config.settings.browse_inside = !self.config.settings.browse_inside; self.schedule_save(); }
             "hover-expand" => { self.config.settings.hover_expand = !self.config.settings.hover_expand; self.schedule_save(); }
             "show-counts" => { self.config.settings.show_counts = !self.config.settings.show_counts; self.schedule_save(); self.render_all(); }
+            "blur" => {
+                self.config.settings.blur = !self.config.settings.blur;
+                super::fence::set_blur(self.config.settings.blur);
+                for win in &self.fences { super::fence::apply_glass(win.hwnd); }
+                self.schedule_save();
+                self.render_all();
+            }
             "hide-tray" => {
                 if self.config.settings.hide_tray { self.show_tray(); }
                 else {
@@ -1474,7 +1821,8 @@ impl DesktopHost {
     // ---- drag and drop -------------------------------------------------------
 
     /// Chooses the Shell drop target under `point` (screen) for fence `id`.
-    fn drop_target_at(&self, id: u64, point: POINT) -> Option<(usize, Option<IDropTarget>, bool)> {
+    /// Over another tab's chip the drop goes into that tab.
+    fn drop_target_at(&self, id: u64, point: POINT) -> Option<DropSpot> {
         let index = self.win_index(id)?;
         let fence = self.config.fence(id)?;
         let win = &self.fences[index];
@@ -1482,18 +1830,23 @@ impl DesktopHost {
         let _ = unsafe { windows::Win32::Graphics::Gdi::ScreenToClient(win.hwnd, &mut client) };
         let g = win.geometry(fence);
         let internal = self.internal_drag.as_ref();
-        if let FenceHit::Item(i) = g.hit(client.x, client.y, win.dpi, true, win.collapsed(fence)) {
+        let hit = g.hit(client.x, client.y, win.dpi, true, win.collapsed(fence));
+        if let FenceHit::Item(i) = hit {
             let entry = &win.entries[i];
             let dragging_self = internal.is_some_and(|(_, keys)| keys.contains(&entry.key));
             if entry.can_drop && !dragging_self && (entry.is_container() || entry.path.as_ref().is_some_and(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")))) {
-                return Some((i, desktop::item_drop_target(win.hwnd, &entry.pidl).ok(), false));
+                return Some(DropSpot { hover: i, tab: None, into: id, target: desktop::item_drop_target(win.hwnd, &entry.pidl).ok(), own: false });
             }
         }
+        let tab = match hit { FenceHit::Tab(i) if win.tabs[i].id != id => Some(i), _ => None };
+        let into = tab.map_or(id, |i| win.tabs[i].id);
+        let into_fence = self.config.fence(into)?;
+        let spot = |target, own| Some(DropSpot { hover: usize::MAX, tab, into, target, own });
         let from_desktop_fence = internal.is_some_and(|(src, _)| self.config.fence(*src).is_some_and(|f| f.is_desktop()));
-        if fence.is_desktop() && from_desktop_fence { return Some((usize::MAX, None, true)); }
-        if !fence.is_desktop() && internal.is_some_and(|(src, _)| *src == id) { return Some((usize::MAX, None, false)); }
-        let folder = self.target_folder(id)?;
-        Some((usize::MAX, desktop::folder_drop_target(win.hwnd, &folder).ok(), false))
+        if into_fence.is_desktop() && from_desktop_fence { return spot(None, true); }
+        if !into_fence.is_desktop() && internal.is_some_and(|(src, _)| *src == into) { return spot(None, false); }
+        let folder = self.target_folder(into)?;
+        spot(desktop::folder_drop_target(win.hwnd, &folder).ok(), false)
     }
 
     pub fn drag_enter(&mut self, id: u64, data: &IDataObject, keys: u32, point: POINT, allowed: DROPEFFECT) -> DROPEFFECT {
@@ -1503,15 +1856,15 @@ impl DesktopHost {
     }
 
     pub fn drag_over(&mut self, id: u64, keys: u32, point: POINT, allowed: DROPEFFECT) -> DROPEFFECT {
-        let Some((hover, target, own)) = self.drop_target_at(id, point) else { return DROPEFFECT_NONE };
+        let Some(DropSpot { hover, tab, into, target, own }) = self.drop_target_at(id, point) else { return DROPEFFECT_NONE };
         let pt = POINTL { x: point.x, y: point.y };
         let mut effect = allowed;
-        let same = self.drop_delegate.as_ref().is_some_and(|(f, h, _)| *f == id && *h == hover);
+        let same = self.drop_delegate.as_ref().is_some_and(|(f, h, _)| *f == into && *h == hover);
         if !same {
             if let Some((_, _, old)) = self.drop_delegate.take() { let _ = unsafe { old.DragLeave() }; }
             if let (Some(target), Some(data)) = (target, self.drop_data.clone()) {
                 if unsafe { target.DragEnter(&data, MODIFIERKEYS_FLAGS(keys), pt, &mut effect) }.is_ok() {
-                    self.drop_delegate = Some((id, hover, target));
+                    self.drop_delegate = Some((into, hover, target));
                 } else { effect = DROPEFFECT_NONE; }
             } else if !own { effect = DROPEFFECT_NONE; }
         } else if let Some((_, _, target)) = &self.drop_delegate {
@@ -1519,8 +1872,18 @@ impl DesktopHost {
         }
         if own { effect = DROPEFFECT_MOVE; }
         if let Some(index) = self.win_index(id) {
-            let show = if effect == DROPEFFECT_NONE { None } else { Some(hover) };
-            if self.fences[index].drop_hover != show { self.fences[index].drop_hover = show; self.render(id); }
+            let show = if effect == DROPEFFECT_NONE || tab.is_some() { None } else { Some(hover) };
+            let tab_show = if effect == DROPEFFECT_NONE { None } else { tab };
+            let win = &mut self.fences[index];
+            if win.drop_hover != show || win.drop_tab != tab_show { win.drop_hover = show; win.drop_tab = tab_show; self.render(id); }
+        }
+        // Resting on another tab shows it, so the drop can target its items.
+        match tab {
+            Some(_) => match self.tab_hover {
+                Some((t, since)) if t == into => if since.elapsed() >= TAB_HOVER_SWITCH { self.tab_hover = None; self.switch_tab(into); },
+                _ => self.tab_hover = Some((into, Instant::now())),
+            },
+            None => self.tab_hover = None,
         }
         effect
     }
@@ -1528,19 +1891,24 @@ impl DesktopHost {
     pub fn drag_leave(&mut self, id: u64) {
         if let Some((_, _, old)) = self.drop_delegate.take() { let _ = unsafe { old.DragLeave() }; }
         self.drop_data = None;
-        if let Some(index) = self.win_index(id) { self.fences[index].drop_hover = None; self.render(id); }
+        self.tab_hover = None;
+        if let Some(index) = self.win_index(id) { self.fences[index].drop_hover = None; self.fences[index].drop_tab = None; self.render(id); }
     }
 
     /// Prepares a drop. Returns the Shell target to call outside the borrow, if any.
     pub fn take_drop(&mut self, id: u64, data: &IDataObject, point: POINT) -> Option<IDropTarget> {
-        if let Some(index) = self.win_index(id) { self.fences[index].drop_hover = None; }
-        let own = self.drop_target_at(id, point).is_some_and(|(hover, _, own)| own && hover == usize::MAX);
+        if let Some(index) = self.win_index(id) { self.fences[index].drop_hover = None; self.fences[index].drop_tab = None; }
+        self.tab_hover = None;
+        let spot = self.drop_target_at(id, point);
+        let into = spot.as_ref().map_or(id, |s| s.into);
+        let on_tab = spot.as_ref().is_some_and(|s| s.tab.is_some());
+        let own = spot.is_some_and(|s| s.own && s.hover == usize::MAX);
         let delegate = self.drop_delegate.take().map(|(_, _, t)| t);
         self.drop_data = None;
         if own {
             if let Some(t) = delegate { let _ = unsafe { t.DragLeave() }; }
             if let Some((_, keys)) = self.internal_drag.clone() {
-                let before = self.win_index(id).and_then(|i| {
+                let before = self.win_index(id).filter(|_| !on_tab).and_then(|i| {
                     let fence = self.config.fence(id)?;
                     let win = &self.fences[i];
                     let mut client = point;
@@ -1548,25 +1916,28 @@ impl DesktopHost {
                     let at = win.geometry(fence).insertion(client.x, client.y);
                     win.entries.get(at).map(|e| e.key.clone()).filter(|k| !keys.contains(k))
                 });
-                if let Some(fence) = self.config.fence_mut(id) {
+                if let Some(fence) = self.config.fence_mut(into) {
                     if fence.sort != FenceSort::Manual && before.is_some() { fence.sort = FenceSort::Manual; }
                 }
-                self.config.assign(id, &keys, before.as_deref());
+                self.config.assign(into, &keys, before.as_deref());
                 self.schedule_save();
                 self.refresh_desktop();
             }
+            self.render(id);
             return None;
         }
         // Files dropped into a desktop fence land on the desktop and join this fence.
-        if self.config.fence(id).is_some_and(|f| f.is_desktop()) {
+        if self.config.fence(into).is_some_and(|f| f.is_desktop()) {
             let names: Vec<String> = zsdesk_windows::ole::hdrop_paths(data).iter()
                 .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).collect();
-            self.expect_new_items(id, names);
+            self.expect_new_items(into, names);
         }
         self.render(id);
         delegate
     }
 }
+
+fn fence_hidden_tab(config: &DesktopConfig, id: u64) -> bool { config.fence(id).is_some_and(Fence::is_hidden_tab) }
 
 fn entry_category(entry: &ShellEntry) -> Category {
     if entry.is_link { return Category::Apps; }

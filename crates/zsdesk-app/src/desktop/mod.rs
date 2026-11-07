@@ -355,12 +355,10 @@ unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_LBUTTONUP => { if let Some(a) = with_host(|h| h.mouse_up(id, point_of(lp))) { run_after(a); } return LRESULT(0); }
         WM_RBUTTONUP => { if let Some(a) = with_host(|h| h.right_click(id, point_of(lp))) { run_after(a); } return LRESULT(0); }
         WM_CONTEXTMENU => return LRESULT(0),
-        WM_MOUSEWHEEL => { with_host(|h| h.wheel(id, ((wp.0 >> 16) as i16) as i32)); return LRESULT(0); }
+        WM_MOUSEWHEEL => { with_host(|h| h.wheel(id, ((wp.0 >> 16) as i16) as i32, point_of(lp))); return LRESULT(0); }
         WM_MOUSELEAVE => { with_host(|h| h.mouse_leave(id)); return LRESULT(0); }
         WM_CAPTURECHANGED => {
-            with_host(|h| if let Some(i) = h.win_index(id) {
-                if h.fences[i].interaction.take().is_some() { let r = h.fences[i].window_rect(); let _ = r; h.render(id); }
-            });
+            with_host(|h| h.capture_lost(id));
             return LRESULT(0);
         }
         WM_KEYDOWN | WM_SYSKEYDOWN if msg == WM_KEYDOWN => {
@@ -424,6 +422,8 @@ unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             return LRESULT(0);
         }
         WM_MOUSEACTIVATE => return LRESULT(MA_ACTIVATE as isize),
+        // Resizes happen inside host calls, so the shape is kept here, outside the host borrow.
+        WM_SIZE => fence::shape_window(hwnd),
         _ => {}
     }
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
@@ -458,9 +458,16 @@ fn run_after(after: After) {
             let owner = with_host(|h| h.hwnd).unwrap_or_default();
             if let Some(path) = desktop::pick_folder(owner, "选择要映射到桌面格子的文件夹") { with_host(|h| h.add_folder_fence(path, replace)); }
         }
+        After::PickFolderTab { to } => {
+            let owner = with_host(|h| h.hwnd).unwrap_or_default();
+            if let Some(path) = desktop::pick_folder(owner, "选择要映射为标签的文件夹") { with_host(|h| h.add_folder_tab(to, path)); }
+        }
+        After::AddTab { fence, point } => tab_popup(fence, point, |h| h.add_tab_menu()),
+        After::TabList { fence, point } => tab_popup(fence, point, |h| h.tab_list_menu(fence)),
         After::DeleteFence(id) => {
-            let Some((hwnd, title)) = with_host(|h| h.config.fence(id).map(|f| (h.hwnd, f.title.clone()))).flatten() else { return };
-            let text = wide(&format!("删除格子“{title}”？\n\n格子中的文件和文件夹不会被删除。"));
+            let Some((hwnd, title, tab)) = with_host(|h| h.config.fence(id).map(|f| (h.hwnd, f.title.clone(), f.group != 0))).flatten() else { return };
+            let text = wide(&if tab { format!("关闭标签“{title}”？\n\n标签中的文件和文件夹不会被删除。") }
+                else { format!("删除格子“{title}”？\n\n格子中的文件和文件夹不会被删除。") });
             let answer = unsafe { MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), w!("ZSDesk 桌面格子"), MB_OKCANCEL | MB_ICONQUESTION) };
             if answer == IDOK { with_host(|h| h.delete_fence(id)); }
         }
@@ -535,6 +542,18 @@ fn fence_menu(fence: u64, point: POINT) {
             }
         }
     }
+}
+
+/// Small ZSUI menus anchored under a title-bar button ("+", "⌄ N").
+fn tab_popup(fence: u64, point: POINT, spec: impl FnOnce(&DesktopHost) -> MenuSpec) {
+    let _layer = MenuLayerRepair;
+    let Some((hwnd, spec)) = with_host(|h| h.win_index(fence).map(|i| (h.fences[i].hwnd, spec(h)))).flatten() else { return };
+    let _ = unsafe { SetForegroundWindow(hwnd) };
+    request_layer_repair();
+    if let Some(id) = popup(hwnd, &spec, point) {
+        if let Some(a) = with_host(|h| h.menu_command(Some(fence), &id, point)) { run_after(a); }
+    }
+    let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
 }
 
 fn tray_menu(point: POINT) {
