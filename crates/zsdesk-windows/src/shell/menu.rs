@@ -11,11 +11,12 @@ use windows::{
     core::{Interface, PCSTR, PCWSTR, PSTR, Result},
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
-        System::Com::CoTaskMemFree,
+        System::Com::{CoTaskMemFree, IDataObject},
         UI::{
             Shell::{
                 Common::ITEMIDLIST, IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, IShellView, IShellItem,
-                ILClone, ILFindLastID, ILRemoveLastID, SHBindToParent, SVGIO_BACKGROUND, SVGIO_SELECTION,
+                ILClone, ILRemoveLastID, SHBindToParent, SVGIO_BACKGROUND, SVGIO_SELECTION,
+                SHCreateShellItemArrayFromIDLists, BHID_DataObject,
                 CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX, CMIC_MASK_PTINVOKE,
                 CMIC_MASK_SHIFT_DOWN, CMIC_MASK_CONTROL_DOWN, CMF_NORMAL, CMF_CANRENAME, CMF_EXTENDEDVERBS,
                 CMF_EXPLORE, CMF_ASYNCVERBSTATE, CMF_OPTIMIZEFORINVOKE, GCS_VERBW, IFolderView2, DefSubclassProc, SetWindowSubclass, RemoveWindowSubclass, GetWindowSubclass,
@@ -38,8 +39,88 @@ pub const SHELL_LAST: u32 = 0x6FFF;
 /// Application items appended to a Shell menu should use ids from here.
 pub const APP_FIRST: u32 = 0x7000;
 
+#[path="quick_menu.rs"]
+mod quick_menu;
+pub use quick_menu::{QuickAction,QuickMenu};
+
+/// The file-manager front menu can be supplied without constructing any
+/// extension IContextMenu on its UI thread. Unset inside extension workers.
+pub type ViewMenuDelegate=fn(HWND,&IShellView,LPARAM)->Result<()>;
+thread_local!{static VIEW_MENU_DELEGATE:Cell<Option<ViewMenuDelegate>>=const{Cell::new(None)};}
+pub fn set_view_menu_delegate(delegate:Option<ViewMenuDelegate>){VIEW_MENU_DELEGATE.with(|current|current.set(delegate));}
+
+/// Keeps process-wide menu compatibility state alive while multiple UI STAs
+/// share it. Drop only after all those UI threads have stopped.
+pub struct SharedMenuRuntime(std::marker::PhantomData<Rc<()>>);
+impl SharedMenuRuntime {
+    pub fn new()->Self{
+        #[cfg(all(target_arch="x86_64",target_env="msvc"))]
+        unsafe{zs_menu_shared_host(1)};
+        Self(std::marker::PhantomData)
+    }
+}
+impl Drop for SharedMenuRuntime{fn drop(&mut self){
+    #[cfg(all(target_arch="x86_64",target_env="msvc"))]
+    unsafe{zs_menu_shared_host(0)};
+}}
+#[cfg(all(target_arch="x86_64",target_env="msvc"))]
+extern "C" { fn zs_menu_shared_host(enabled:i32); }
+
 /// `SEE_MASK_UNICODE`, shared by CMINVOKECOMMANDINFOEX.
 const CMIC_MASK_UNICODE: u32 = 0x4000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MenuOutcome { Dismissed, Application(u32), Rename, Open, Explore, ShellInvoked, NativeHandled }
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MenuInterceptions { pub rename: bool, pub open: bool }
+impl MenuInterceptions { fn bits(self) -> u32 { u32::from(self.rename) | (u32::from(self.open) << 1) } }
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct NativeMenuResult { kind: u32, command: u32, status: i32, phase: u32 }
+
+fn command_offset(command: u32, first: u32) -> Result<u16> {
+    command.checked_sub(first).and_then(|offset| u16::try_from(offset).ok())
+        .ok_or_else(|| windows::core::Error::from_hresult(windows::core::HRESULT(0x80070057u32 as i32)))
+}
+fn application_ids(count: usize) -> Result<Vec<u32>> {
+    let count = u32::try_from(count).ok().and_then(|count| APP_FIRST.checked_add(count))
+        .ok_or_else(|| windows::core::Error::from_hresult(windows::core::HRESULT(0x80070057u32 as i32)))?;
+    Ok((APP_FIRST..count).collect())
+}
+fn intercepted_verb(verb: Option<&str>, intercept: MenuInterceptions) -> Option<MenuOutcome> {
+    match verb {
+        Some(verb) if intercept.rename && verb.eq_ignore_ascii_case("rename") => Some(MenuOutcome::Rename),
+        Some(verb) if intercept.open && verb.eq_ignore_ascii_case("open") => Some(MenuOutcome::Open),
+        Some(verb) if intercept.open && verb.eq_ignore_ascii_case("explore") => Some(MenuOutcome::Explore),
+        _ => None,
+    }
+}
+fn decode_native_result(result: NativeMenuResult, applications: &[u32]) -> Result<Option<MenuOutcome>> {
+    let status = windows::core::HRESULT(result.status);
+    if matches!(status.0 as u32, 0x800704c7 | 0x80004004) { return Ok(Some(MenuOutcome::Dismissed)); }
+    status.ok()?;
+    Ok(match result.kind {
+        0 => Some(MenuOutcome::Dismissed),
+        1 if applications.contains(&result.command) => Some(MenuOutcome::Application(result.command)),
+        2 => Some(MenuOutcome::Rename), 3 => Some(MenuOutcome::Open), 4 => Some(MenuOutcome::Explore),
+        5 => Some(MenuOutcome::ShellInvoked), 6 => None, 7 => Some(MenuOutcome::NativeHandled),
+        _ => return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000ffffu32 as i32))),
+    })
+}
+fn can_fall_back_before_presentation(status: windows::core::HRESULT, result: NativeMenuResult) -> bool {
+    status.is_err() && result.phase == 0
+}
+struct BeforeShell<'a> { callback: &'a mut dyn FnMut() -> Result<()> }
+unsafe extern "system" fn before_shell(context: *mut core::ffi::c_void) -> windows::core::HRESULT {
+    if context.is_null() { return windows::core::HRESULT(0x80004003u32 as i32); }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let state = unsafe { &mut *context.cast::<BeforeShell<'_>>() };
+        (state.callback)()
+    }));
+    match result { Ok(Ok(())) => windows::core::HRESULT(0), Ok(Err(error)) => error.code(), Err(_) => windows::core::HRESULT(0x8000ffffu32 as i32) }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HistoryAction { Undo, Redo }
@@ -81,11 +162,18 @@ struct ActiveContext { menu: IContextMenu, filter: bool }
 thread_local! {
     static ACTIVE: RefCell<Option<ActiveContext>> = const { RefCell::new(None) };
     static OPTIONS: RefCell<ContextMenuOptions> = RefCell::new(ContextMenuOptions::default());
+    static PUBLIC_BIND_MICROS: Cell<u64> = const { Cell::new(0) };
+    static PUBLIC_POPULATE_MICROS: Cell<u64> = const { Cell::new(0) };
 }
+
+struct MenuPhaseTimer{started:std::time::Instant,populate:bool}
+impl MenuPhaseTimer{fn bind()->Self{Self{started:std::time::Instant::now(),populate:false}}fn populate()->Self{Self{started:std::time::Instant::now(),populate:true}}}
+impl Drop for MenuPhaseTimer{fn drop(&mut self){let elapsed=self.started.elapsed().as_micros().min(u64::MAX as u128)as u64;if self.populate{PUBLIC_POPULATE_MICROS.with(|value|value.set(elapsed));}else{PUBLIC_BIND_MICROS.with(|value|value.set(elapsed));}}}
+pub(crate) fn public_menu_timings()->(u64,u64){(PUBLIC_BIND_MICROS.with(Cell::get),PUBLIC_POPULATE_MICROS.with(Cell::get))}
 
 /// Preferences affect only this application's menus. Both native presentations
 /// retain Shell command identities while hiding the selected functions.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContextMenuOptions {
     pub modern: bool,
     pub hidden_verbs: Vec<String>,
@@ -119,11 +207,14 @@ pub fn failure_message() -> u32 {
 
 #[cfg(all(target_arch = "x86_64", target_env = "msvc"))]
 extern "C" {
+    fn zs_menu_for_mixed_items(owner: HWND, count: u32, pidls: *const *const ITEMIDLIST, context: *mut *mut core::ffi::c_void) -> windows::core::HRESULT;
     fn zs_menu_set_hidden_features(hidden: u32);
     fn zs_menu_set_original_callback(callback: Option<unsafe extern "system" fn(*mut core::ffi::c_void, POINT) -> windows::core::HRESULT>);
     fn zs_menu_track_standalone(owner: HWND, context: *mut core::ffi::c_void, menu: HMENU,
         count: u32, pidls: *const *const ITEMIDLIST, folder: *mut core::ffi::c_void, background: i32,
-        point: *mut POINT, choice: *mut u32) -> windows::core::HRESULT;
+        point: *mut POINT, applications: *const u32, application_count: u32, intercept: u32,
+        before: Option<unsafe extern "system" fn(*mut core::ffi::c_void) -> windows::core::HRESULT>, before_context: *mut core::ffi::c_void,
+        outcome: *mut NativeMenuResult) -> windows::core::HRESULT;
 }
 
 pub fn report_failure(owner: HWND, error: windows::core::HRESULT) {
@@ -193,23 +284,23 @@ impl ShellMenu {
         Ok(Self { menu, hmenu })
     }
 
-    /// Context menu for items that share one parent folder (absolute PIDL bytes).
+    /// A snapshot of absolute identities, including mixed-folder selections.
     pub fn for_items(owner: HWND, pidls: &[Vec<u8>]) -> Result<Self> {
-        let first = pidls.first().ok_or_else(|| windows::core::Error::from_hresult(windows::core::HRESULT(0x80070057u32 as i32)))?;
-        let mut last: *mut ITEMIDLIST = std::ptr::null_mut();
-        let parent: IShellFolder = unsafe { SHBindToParent(first.as_ptr().cast(), Some(&mut last))? };
-        let children: Vec<*const ITEMIDLIST> = pidls.iter().map(|p| unsafe { ILFindLastID(p.as_ptr().cast()) as *const ITEMIDLIST }).collect();
-        let menu: IContextMenu = unsafe { ui_object(&parent, owner, &children)? };
-        Self::new(menu)
+        let _timer=MenuPhaseTimer::bind();
+        let offsets = item_offsets(pidls)?;
+        if same_item_parent(pidls, &offsets) { Self::new(items_ui_object(owner, pidls)?) }
+        else { Self::new(mixed_item_context(owner, pidls)?) }
     }
 
     /// Background menu of a folder ("新建", "粘贴", "属性" …).
     pub fn for_folder_background(owner: HWND, folder: &IShellFolder) -> Result<Self> {
+        let _timer=MenuPhaseTimer::bind();
         let menu: IContextMenu = unsafe { folder.CreateViewObject(owner)? };
         Self::new(menu)
     }
 
     pub fn for_view(view: &IShellView, selection: bool) -> Result<Self> {
+        let _timer=MenuPhaseTimer::bind();
         let menu: IContextMenu = unsafe { view.GetItemObject(if selection { SVGIO_SELECTION } else { SVGIO_BACKGROUND })? };
         Self::new(menu)
     }
@@ -218,6 +309,7 @@ impl ShellMenu {
 
     /// Fills the popup menu. `extended` adds Shift-only verbs.
     pub fn populate(&self, rename: bool, extended: bool) -> Result<()> {
+        let _timer=MenuPhaseTimer::populate();
         // Permit handlers that support it to obtain expensive state off the
         // menu's UI path. Windows retains normal state evaluation otherwise.
         let mut flags = CMF_NORMAL | CMF_EXPLORE | CMF_ASYNCVERBSTATE;
@@ -247,38 +339,68 @@ impl ShellMenu {
         self.track_with_policy(owner, menu, point, true)
     }
 
-    /// Uses a private native Shell view for the selected PIDL snapshot. The
-    /// returned command ID is handled by the existing fence open/rename logic.
-    pub fn track_selected(&self, owner: HWND, point: POINT, pidls: &[Vec<u8>]) -> Option<u32> {
-        self.track_standalone(owner, point, pidls, None, false)
+    /// Shell commands execute against the interface supplied by the presenter.
+    /// Only explicitly intercepted application actions return to the fence.
+    pub fn track_selected(&self, owner: HWND, point: POINT, pidls: &[Vec<u8>], application_count: usize,
+            intercept: MenuInterceptions) -> Result<MenuOutcome> {
+        self.track_standalone(owner, point, pidls, None, false, application_count, intercept, &mut || Ok(()))
     }
 
-    pub fn track_folder_background(&self, owner: HWND, point: POINT, path: &std::path::Path) -> Option<u32> {
-        let folder = unsafe { super::shell_item(&zsdesk_core::model::explorer::ShellLocation::Path(path.to_path_buf())) }.ok();
-        self.track_standalone(owner, point, &[], folder.as_ref(), true)
+    /// Revalidate an asynchronous selection before a Shell operation executes.
+    pub fn track_selected_before(&self, owner: HWND, point: POINT, pidls: &[Vec<u8>], application_count: usize,
+            intercept: MenuInterceptions, before:&mut dyn FnMut()->Result<()>) -> Result<MenuOutcome> {
+        self.track_standalone(owner,point,pidls,None,false,application_count,intercept,before)
     }
 
-    fn track_standalone(&self, owner: HWND, mut point: POINT, pidls: &[Vec<u8>], folder: Option<&IShellItem>, background: bool) -> Option<u32> {
+    pub fn track_folder_background(&self, owner: HWND, point: POINT, path: &std::path::Path, application_count: usize,
+            before: &mut dyn FnMut() -> Result<()>) -> Result<MenuOutcome> {
+        let folder = if application_count==0 && context_menu_options().modern {
+            unsafe { super::shell_item(&zsdesk_core::model::explorer::ShellLocation::Path(path.to_path_buf())) }.ok()
+        } else { None };
+        self.track_standalone(owner, point, &[], folder.as_ref(), true, application_count, MenuInterceptions::default(), before)
+    }
+
+    pub fn track_background_item(&self,owner:HWND,point:POINT,folder:&IShellItem,before:&mut dyn FnMut()->Result<()>)->Result<MenuOutcome>{
+        self.track_standalone(owner,point,&[],Some(folder),true,0,MenuInterceptions::default(),before)
+    }
+
+    fn track_standalone(&self, owner: HWND, mut point: POINT, pidls: &[Vec<u8>], folder: Option<&IShellItem>, background: bool,
+            application_count: usize, intercept: MenuInterceptions, before: &mut dyn FnMut() -> Result<()>) -> Result<MenuOutcome> {
+        let applications = application_ids(application_count)?;
         #[cfg(all(target_arch = "x86_64", target_env = "msvc"))]
-        if context_menu_options().modern && (!background || folder.is_some()) {
+        // A mixed fence menu owns application IDs as well as one populated
+        // IContextMenu. Keep those IDs and that exact interface together through
+        // TrackPopupMenu/InvokeCommand; the private Win11 presenter can rebuild
+        // the command model and cannot preserve this public dispatch contract.
+        if context_menu_options().modern && application_count == 0 && (!background || folder.is_some()) {
             if let Ok(count) = u32::try_from(pidls.len()) {
                 self.filter(self.hmenu, &context_menu_options());
                 let identifiers: Vec<*const ITEMIDLIST> = pidls.iter().map(|pidl| pidl.as_ptr().cast()).collect();
-                let mut choice = 0;
+                let mut outcome = NativeMenuResult::default();
+                let mut observer = BeforeShell { callback: &mut *before };
                 let active = ActiveMenuScope::enter(&self.menu, true);
                 let result = unsafe { zs_menu_track_standalone(owner, self.menu.as_raw(), self.hmenu,
                     count, identifiers.as_ptr(), folder.map_or(std::ptr::null_mut(), Interface::as_raw),
-                    i32::from(background), &mut point, &mut choice) };
+                    i32::from(background), &mut point, applications.as_ptr(), applications.len() as u32, intercept.bits(),
+                    Some(before_shell), (&mut observer as *mut BeforeShell<'_>).cast(), &mut outcome) };
                 drop(active);
                 if result.is_ok() {
-                    if choice == u32::MAX { return self.track(owner, self.hmenu, point); }
-                    return (choice != 0).then_some(choice);
+                    if let Some(action) = decode_native_result(outcome, &applications)? { return Ok(action); }
+                } else if !can_fall_back_before_presentation(result, outcome) {
+                    // After presentation or invocation has started, retrying a
+                    // second menu could execute a user's file operation twice.
+                    return Err(windows::core::Error::from_hresult(result));
                 }
             }
         }
-        // Version/handler failures retain all application entries and the same
-        // visibility policy in the native original presentation.
-        self.track(owner, self.hmenu, point)
+        let Some(command) = self.track(owner, self.hmenu, point) else { return Ok(MenuOutcome::Dismissed) };
+        if applications.contains(&command) { return Ok(MenuOutcome::Application(command)); }
+        if !Self::is_shell_id(command) { return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80070057u32 as i32))); }
+        if let Some(action) = intercepted_verb(self.verb(command).as_deref(), intercept) { return Ok(action); }
+        before()?;
+        self.invoke(owner, command, Some(point), unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0,
+            unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0)?;
+        Ok(MenuOutcome::ShellInvoked)
     }
 
     /// Explicit command-bar menus retain their available commands independently
@@ -341,7 +463,8 @@ impl ShellMenu {
 
     /// Runs a Shell command chosen from the menu.
     pub fn invoke(&self, owner: HWND, id: u32, point: Option<POINT>, shift: bool, control: bool) -> Result<()> {
-        let offset = (id - SHELL_FIRST) as usize;
+        if !Self::is_shell_id(id) { return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80070057u32 as i32))); }
+        let offset = usize::from(command_offset(id, SHELL_FIRST)?);
         self.invoke_raw(owner, PCSTR(offset as *const u8), PCWSTR(offset as *const u16), point, shift, control)
     }
 
@@ -446,9 +569,27 @@ unsafe extern "system" fn view_menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
     }
     if let Some(result) = forward_menu_message(msg, wp, lp) { return result; }
     let state = unsafe { &*(data as *const ViewMenuState) };
+    if msg==WM_CONTEXTMENU{
+        // In Windows 11 mode the hosted Shell view owns the complete modern
+        // menu.  Let ExplorerBrowser handle the message directly; routing it
+        // through ZSDesk's worker would rebuild a classic popup and introduce
+        // a visible first-right-click delay.
+        if state.modern.get() {
+            return unsafe { DefSubclassProc(hwnd, msg, wp, lp) };
+        }
+        if let Some(delegate)=VIEW_MENU_DELEGATE.with(Cell::get){
+            let view=state.view.clone();
+            if let Err(error)=delegate(hwnd,&view,lp){report_failure(hwnd,error.code());}
+            return LRESULT(0);
+        }
+    }
     if msg == WM_CONTEXTMENU && !state.modern.get() {
         let view = state.view.clone();
-        if show_original_view_menu(hwnd, &view, lp).is_ok() { return LRESULT(0); }
+        // Both mouse and keyboard requests are owned by this filtered menu.
+        // Retrying through the Shell after a handler fails would build another
+        // menu synchronously and could reveal commands disabled by the user.
+        if let Err(error) = show_original_view_menu(hwnd, &view, lp) { report_failure(hwnd, error.code()); }
+        return LRESULT(0);
     }
     unsafe { DefSubclassProc(hwnd, msg, wp, lp) }
 }
@@ -483,7 +624,7 @@ fn show_original_view_menu_at(owner: HWND, view: &IShellView, mut point: POINT) 
     if let Some(id) = menu.track(owner, menu.hmenu(), point) {
         // The menu interaction was handled even if the selected Shell command
         // fails; falling through would open a second context menu.
-        let _ = menu.invoke(owner, id, Some(point), shift, control);
+        if let Err(error) = menu.invoke(owner, id, Some(point), shift, control) { report_failure(owner, error.code()); }
     }
     Ok(())
 }
@@ -502,11 +643,60 @@ mod policy_tests {
     }
     #[test]
     fn enabled_history_uses_the_views_exact_id_once() {
-        let calls = Cell::new(0);
-        invoke_history_command(HistoryAction::Undo, Some(HistoryCommand { id: 43, enabled: true }), |id| {
-            assert_eq!(id, 43); calls.set(calls.get() + 1); Ok(())
-        }).unwrap();
-        assert_eq!(calls.get(), 1);
+        for (action, expected) in [(HistoryAction::Undo, 43), (HistoryAction::Redo, 91)] {
+            let calls = Cell::new(0);
+            invoke_history_command(action, Some(HistoryCommand { id: expected, enabled: true }), |id| {
+                assert_eq!(id, expected); calls.set(calls.get() + 1); Ok(())
+            }).unwrap();
+            assert_eq!(calls.get(), 1);
+        }
+    }
+    #[test]
+    fn numeric_offsets_preserve_the_query_base_and_cannot_become_strings() {
+        assert_eq!(std::mem::size_of::<NativeMenuResult>(), 16);
+        assert_eq!(command_offset(1, 1).unwrap(), 0);
+        assert_eq!(command_offset(43, 17).unwrap(), 26);
+        assert_eq!(command_offset(0x10000, 1).unwrap(), 0xffff);
+        assert!(command_offset(0, 1).is_err());
+        assert!(command_offset(0x10001, 1).is_err());
+    }
+    #[test]
+    fn item_context_cannot_reinterpret_a_child_under_another_parent() {
+        let first = vec![3, 0, 10, 4, 0, 20, 21, 0, 0];
+        let sibling = vec![3, 0, 10, 3, 0, 30, 0, 0];
+        assert_eq!(sibling_item_offsets(&[first.clone(), sibling]).unwrap(), vec![3, 3]);
+        let other_parent = vec![3, 0, 11, 4, 0, 20, 21, 0, 0];
+        let mixed = [first.clone(), other_parent];
+        let offsets = item_offsets(&mixed).unwrap();
+        assert!(!same_item_parent(&mixed, &offsets));
+        assert_eq!(offsets, vec![3, 3]);
+        assert!(sibling_item_offsets(&[vec![0, 0]]).is_err());
+        assert!(sibling_item_offsets(&[vec![4, 0, 10, 0]]).is_err());
+        assert!(sibling_item_offsets(&[vec![1, 0, 0, 0]]).is_err());
+        let mut trailing = first; trailing.push(0);
+        assert!(sibling_item_offsets(&[trailing]).is_err());
+        assert_eq!(sibling_item_offsets(&[vec![3, 0, 10, 0, 0], vec![3, 0, 11, 0, 0]]).unwrap(), vec![0, 0]);
+    }
+    #[test]
+    fn native_commands_are_not_misclassified_as_application_ids_or_replayed() {
+        let applications = application_ids(2).unwrap();
+        assert_eq!(decode_native_result(NativeMenuResult { kind: 1, command: APP_FIRST + 1, status: 0, phase: 1 }, &applications).unwrap(), Some(MenuOutcome::Application(APP_FIRST + 1)));
+        assert!(decode_native_result(NativeMenuResult { kind: 1, command: 0x7c01, status: 0, phase: 1 }, &applications).is_err());
+        assert_eq!(decode_native_result(NativeMenuResult { kind: 7, command: 0x7c01, status: 0, phase: 1 }, &applications).unwrap(), Some(MenuOutcome::NativeHandled));
+        let failed = windows::core::HRESULT(0x80070005u32 as i32);
+        assert!(can_fall_back_before_presentation(failed, NativeMenuResult::default()));
+        assert!(!can_fall_back_before_presentation(failed, NativeMenuResult { phase: 1, ..Default::default() }));
+        assert!(!can_fall_back_before_presentation(failed, NativeMenuResult { phase: 2, ..Default::default() }));
+        assert!(decode_native_result(NativeMenuResult { kind: 5, command: 19, status: failed.0, phase: 2 }, &applications).is_err());
+    }
+    #[test]
+    fn only_requested_open_and_rename_interceptions_defer_shell_execution() {
+        let intercept = MenuInterceptions { open: true, rename: true };
+        assert_eq!(intercepted_verb(Some("ReName"), intercept), Some(MenuOutcome::Rename));
+        assert_eq!(intercepted_verb(Some("open"), intercept), Some(MenuOutcome::Open));
+        assert_eq!(intercepted_verb(Some("explore"), intercept), Some(MenuOutcome::Explore));
+        for verb in [Some("copy"), Some("delete"), Some("openas"), None] { assert_eq!(intercepted_verb(verb, intercept), None); }
+        assert_eq!(intercepted_verb(Some("open"), MenuInterceptions::default()), None);
     }
     #[test]
     fn modern_policy_covers_visible_functions_and_keeps_extensions_independent() {
@@ -557,12 +747,75 @@ unsafe fn ui_object<T: Interface>(parent: &IShellFolder, owner: HWND, children: 
     unsafe { parent.GetUIObjectOf::<T>(owner, children, None) }
 }
 
-/// Returns an interface implemented for a set of sibling items (IDataObject, IDropTarget …).
+/// Sibling UI objects, or a complete cross-folder IDataObject for drag and drop.
 pub fn items_ui_object<T: Interface>(owner: HWND, pidls: &[Vec<u8>]) -> Result<T> {
-    let first = pidls.first().ok_or_else(|| windows::core::Error::from_hresult(windows::core::HRESULT(0x80070057u32 as i32)))?;
+    let offsets = item_offsets(pidls)?;
+    if !same_item_parent(pidls, &offsets) {
+        if T::IID == IDataObject::IID {
+            let pointers: Vec<_> = pidls.iter().map(|pidl| pidl.as_ptr().cast()).collect();
+            let array = unsafe { SHCreateShellItemArrayFromIDLists(&pointers)? };
+            return unsafe { array.BindToHandler(None, &BHID_DataObject) };
+        }
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80004002u32 as i32)));
+    }
+    let first = &pidls[0];
     let parent: IShellFolder = unsafe { SHBindToParent(first.as_ptr().cast(), None)? };
-    let children: Vec<*const ITEMIDLIST> = pidls.iter().map(|p| unsafe { ILFindLastID(p.as_ptr().cast()) as *const ITEMIDLIST }).collect();
+    let children: Vec<*const ITEMIDLIST> = pidls.iter().zip(offsets).map(|(pidl, offset)| unsafe { pidl.as_ptr().add(offset).cast() }).collect();
     unsafe { ui_object(&parent, owner, &children) }
+}
+
+fn last_item_offset(pidl: &[u8]) -> Option<usize> {
+    let mut at = 0usize;
+    let mut last = None;
+    loop {
+        let size = u16::from_le_bytes(pidl.get(at..at.checked_add(2)?)?.try_into().ok()?) as usize;
+        if size == 0 { return (at + 2 == pidl.len()).then_some(last).flatten(); }
+        if size < 2 { return None; }
+        let next = at.checked_add(size)?;
+        if next > pidl.len() { return None; }
+        last = Some(at); at = next;
+    }
+}
+
+fn item_offsets(pidls: &[Vec<u8>]) -> Result<Vec<usize>> {
+    let invalid = || windows::core::Error::from_hresult(windows::core::HRESULT(0x80070057u32 as i32));
+    let offsets: Vec<_> = pidls.iter().map(|pidl| last_item_offset(pidl).ok_or_else(invalid)).collect::<Result<_>>()?;
+    if offsets.is_empty() { return Err(invalid()); }
+    Ok(offsets)
+}
+
+fn same_item_parent(pidls: &[Vec<u8>], offsets: &[usize]) -> bool {
+    pidls.iter().zip(offsets).all(|(pidl, &offset)| pidl[..offset] == pidls[0][..offsets[0]])
+}
+
+#[cfg(test)]
+fn sibling_item_offsets(pidls: &[Vec<u8>]) -> Result<Vec<usize>> {
+    let offsets = item_offsets(pidls)?;
+    if !same_item_parent(pidls, &offsets) { return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80070057u32 as i32))); }
+    Ok(offsets)
+}
+
+fn mixed_item_context(owner: HWND, pidls: &[Vec<u8>]) -> Result<IContextMenu> {
+    let pointers: Vec<*const ITEMIDLIST> = pidls.iter().map(|pidl| pidl.as_ptr().cast()).collect();
+    #[cfg(all(target_arch = "x86_64", target_env = "msvc"))]
+    {
+        let count = u32::try_from(pidls.len()).map_err(|_| windows::core::Error::from_hresult(windows::core::HRESULT(0x80070057u32 as i32)))?;
+        let mut raw = std::ptr::null_mut();
+        unsafe { zs_menu_for_mixed_items(owner, count, pointers.as_ptr(), &mut raw) }.ok()?;
+        if raw.is_null() { return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80004003u32 as i32))); }
+        Ok(unsafe { IContextMenu::from_raw(raw) })
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_env = "msvc")))]
+    {
+        use std::mem::ManuallyDrop;
+        use windows::Win32::UI::Shell::{SHGetDesktopFolder, SHCreateDefaultContextMenu, DEFCONTEXTMENU};
+        let desktop = unsafe { SHGetDesktopFolder()? };
+        let mut context = DEFCONTEXTMENU { hwnd: owner, psf: ManuallyDrop::new(Some(desktop)),
+            cidl: pointers.len() as u32, apidl: pointers.as_ptr() as *mut *mut ITEMIDLIST, ..Default::default() };
+        let result = unsafe { SHCreateDefaultContextMenu(&context) };
+        unsafe { ManuallyDrop::drop(&mut context.psf); }
+        result
+    }
 }
 
 /// Parent PIDL bytes of an absolute PIDL (empty list for desktop children).
@@ -574,3 +827,7 @@ pub fn parent_pidl(pidl: &[u8]) -> Vec<u8> {
     unsafe { CoTaskMemFree(Some(copy.cast())) };
     bytes
 }
+
+#[cfg(test)]
+#[path="menu_runtime_tests.rs"]
+mod runtime_tests;

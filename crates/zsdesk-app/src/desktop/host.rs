@@ -13,7 +13,7 @@ use windows::{
         UI::{
             HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
             Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT},
-            Shell::{Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW},
+            Shell::{Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIF_SHOWTIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NIM_SETFOCUS, NOTIFYICONDATAW, NOTIFYICON_VERSION_4, NOTIFY_ICON_MESSAGE},
             WindowsAndMessaging::*,
         },
     },
@@ -23,7 +23,7 @@ use zsdesk_core::model::desktop::{auto_layout, categorize, distribute, sort_item
 use zsdesk_ui::{chrome::scale, menus::{entry, menu, submenu, MenuItemSpec, MenuSpec}, theme::{FencePalette, Mode}};
 use zsdesk_windows::{desktop::{self, ShellEntry}, gfx::{Gfx, TextStyle}, shell::{icons::{IconLoader, IconRequest}, menu::HistoryAction, notify::ChangeNotify, pidl}};
 
-use super::fence::{FenceHit, FenceWin, Interaction, RenameTarget, TabMeta};
+use super::fence::{FenceHit, FenceWin, Interaction, RenameTarget, SelectionChange, TabMeta};
 
 /// Hovering a dragged file over another tab switches to it after this delay.
 const TAB_HOVER_SWITCH: Duration = Duration::from_millis(600);
@@ -40,12 +40,14 @@ pub const TIMER_FOLDER: usize = 3;
 pub const TIMER_PEEK: usize = 4;
 pub const TIMER_ICONS: usize = 5;
 pub const FENCE_CLASS: &str = "ZSDesk.Native.Fence";
+pub(super) const TRAY_ID:u32=1;
 
 /// Work that must run outside the host borrow (modal menus, Shell UI, drag loops).
 pub enum After {
     Nothing,
     ItemMenu { fence: u64, point: POINT },
     FenceMenu { fence: u64, point: POINT },
+    FolderSystemMenu { fence: u64, point: POINT },
     TrayMenu(POINT),
     Drag { fence: u64 },
     Open { fence: u64, index: usize, explorer: bool },
@@ -60,6 +62,8 @@ pub enum After {
     /// "⌄ N": tabs that do not fit.
     TabList { fence: u64, point: POINT },
     DeleteFence(u64),
+    Quit,
+    Notice(&'static str),
 }
 
 /// Where a drag over a fence would drop.
@@ -71,6 +75,18 @@ fn history_shortcut(key: u16, control: bool, shift: bool, alt: bool) -> Option<H
     if key == VK_Z.0 { Some(HistoryAction::Undo) }
     else if key == VK_Y.0 { Some(HistoryAction::Redo) }
     else { None }
+}
+
+pub(super) fn fence_startup_command(executable:&Path,config:&Path)->Option<String> {
+    let profile=config.parent()?;
+    if !executable.is_absolute() || !profile.is_absolute() {return None;}
+    let quote=crate::quick_search::control::quote_argument;
+    Some(format!("{} --desktop --profile-dir {}",quote(&executable.to_string_lossy()),quote(&profile.to_string_lossy())))
+}
+
+fn pending_collection_allowed(config: &DesktopConfig, known: &HashSet<String>, key: &str) -> bool {
+    !known.contains(key) && !config.fences.iter().any(|fence| fence.is_desktop()
+        && fence.members.iter().any(|member| member.eq_ignore_ascii_case(key)))
 }
 
 const MAX_COLD_ICONS: usize = 128;
@@ -157,6 +173,7 @@ pub struct DesktopHost {
     drop_data: Option<IDataObject>,
     pub internal_drag: Option<(u64, Vec<String>)>,
     tray: bool,
+    pub(super) tray_version4:bool,
     /// Fence whose title bar receives the fence being moved (merge as a tab).
     merge_target: Option<u64>,
     /// Tab under a file drag and when the pointer arrived there.
@@ -170,7 +187,7 @@ impl DesktopHost {
         let mut host = Self { hwnd, config_path, explorer_config, config, fences: Vec::new(), desktop_entries: Vec::new(), gfx,
             icons: HashMap::new(), icon_clock: 0, next_icon_request: 1, icon_content_active: false, shutting_down: false, desktop_anchor: None,
             loader, desktop_notify: None, guard: None, pending: Vec::new(), known: HashSet::new(),
-            taskbar_created, palette: FencePalette::new(Mode::Dark, 55), drop_delegate: None, drop_data: None, internal_drag: None, tray: false,
+            taskbar_created, palette: FencePalette::new(Mode::Dark, 55), drop_delegate: None, drop_data: None, internal_drag: None, tray: false,tray_version4:false,
             merge_target: None, tab_hover: None };
         host.update_palette();
         super::fence::set_blur(host.config.settings.blur);
@@ -216,6 +233,10 @@ impl DesktopHost {
         if let Some(mut guard) = self.guard.take() { let _ = guard.kill(); let _ = guard.wait(); }
     }
 
+    pub fn accept_icon_notification(&self, token: usize) -> bool {
+        !self.shutting_down && self.loader.accepts_notification(token)
+    }
+
     pub fn update_palette(&mut self) {
         let dark = match self.config.settings.theme {
             FenceTheme::Dark => true, FenceTheme::Light => false, FenceTheme::System => zsdesk_windows::theme::system_dark_mode(),
@@ -243,13 +264,13 @@ impl DesktopHost {
     pub fn add_tray(&mut self) {
         if self.config.settings.hide_tray || self.tray { return; }
         let mut data = tray_data(self.hwnd);
-        data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
         data.uCallbackMessage = WM_TRAY;
         let module = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None) }.unwrap_or_default();
         data.hIcon = unsafe { LoadIconW(Some(windows::Win32::Foundation::HINSTANCE(module.0)), PCWSTR(101usize as *const u16)) }.unwrap_or_default();
         let tip: Vec<u16> = "ZSDesk 桌面格子".encode_utf16().collect();
         data.szTip[..tip.len()].copy_from_slice(&tip);
-        self.tray = unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool();
+        (self.tray,self.tray_version4)=register_tray(&mut data,|message,data|unsafe{Shell_NotifyIconW(message,data)}.as_bool());
     }
 
     /// Shows the tray icon again (`--desktop --tray`, or when nothing else is visible).
@@ -261,12 +282,16 @@ impl DesktopHost {
 
     fn remove_tray(&mut self) {
         if self.tray { let data = tray_data(self.hwnd); unsafe { let _ = Shell_NotifyIconW(NIM_DELETE, &data); } self.tray = false; }
+        self.tray_version4=false;
     }
+
+    pub(super) fn restore_tray_focus(&self){if self.tray{let data=tray_data(self.hwnd);let _=unsafe{Shell_NotifyIconW(NIM_SETFOCUS,&data)};}}
 
     /// Explorer restarted: owned fence windows were destroyed with Progman.
     pub fn explorer_restarted(&mut self) {
         self.desktop_anchor = None;
         self.tray = false;
+        self.tray_version4=false;
         self.add_tray();
         for fence in &mut self.fences { fence.drop = None; fence.hwnd = HWND::default(); }
         self.fences.clear();
@@ -291,12 +316,18 @@ impl DesktopHost {
         let Ok(event) = (unsafe { windows::Win32::System::Threading::CreateEventW(None, true, false, PCWSTR(name.as_ptr())) }) else { return false };
         let mut command = std::process::Command::new(exe);
         command.arg("--desktop-guard").arg(pid.to_string());
+        command.arg("--guard-thread").arg(unsafe{windows::Win32::System::Threading::GetCurrentThreadId()}.to_string());
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
         if let Some(dir) = self.config_path.parent() { command.arg("--profile-dir").arg(dir); }
         let ready = match command.spawn() {
             Ok(child) => { self.guard = Some(child); unsafe { windows::Win32::System::Threading::WaitForSingleObject(event, 4000) }.0 == 0 }
             Err(_) => false,
         };
         let _ = unsafe { windows::Win32::Foundation::CloseHandle(event) };
+        if !ready {
+            if let Some(mut guard)=self.guard.take(){let _=guard.kill();let _=guard.wait();}
+        }
         ready
     }
 
@@ -925,7 +956,7 @@ impl DesktopHost {
             "icon_entries":self.icons.len(),"icon_pixel_bytes":self.icons.values().map(IconSlot::pixel_bytes).sum::<u64>(),
             "visible_icon_keys":visible.len(),"cold_icon_entries":cold.len(),"cold_icon_pixel_bytes":cold.iter().map(|s|s.pixel_bytes()).sum::<u64>(),
             "cold_entry_limit":MAX_COLD_ICONS,"cold_pixel_limit":MAX_COLD_ICON_BYTES,"pending_icon_requests":queue.pending,"queued_icon_requests":queue.queued,
-            "ready_icon_results":queue.ready,"ready_icon_pixel_bytes":queue.ready_pixel_bytes,"text_formats":formats,"render_target_live":target,"imaging_factory_live":self.gfx.imaging_factory_live()})
+            "ready_icon_results":queue.ready,"ready_icon_pixel_bytes":queue.ready_pixel_bytes,"text_formats":formats,"render_target_live":target,"imaging_factory_live":self.gfx.imaging_factory_live(),"context_menu":super::menu_diagnostics()})
     }
 
     pub fn write_diagnostics(&self, path: &Path) -> anyhow::Result<()> {
@@ -971,7 +1002,9 @@ impl DesktopHost {
         self.pending.retain(|(name, _, t)| t.elapsed() < Duration::from_secs(if name == "*" { 10 } else { 30 }));
         let mut assignments: Vec<(u64, String)> = Vec::new();
         for entry in &self.desktop_entries {
-            if self.known.contains(&entry.key) { continue; }
+            // A restored or temporarily unavailable member keeps its saved
+            // group even while another fence is collecting newly created files.
+            if !pending_collection_allowed(&self.config, &self.known, &entry.key) { continue; }
             let file = entry.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_lowercase());
             if let Some(index) = self.pending.iter().position(|(name, _, _)| file.as_deref() == Some(name.as_str()) || name == "*") {
                 let (name, fence, _) = self.pending[index].clone();
@@ -1338,9 +1371,10 @@ impl DesktopHost {
         match g.hit(point.x, point.y, win.dpi, true, win.collapsed(&fence)) {
             FenceHit::Item(i) => {
                 let key = win.entries[i].key.clone();
+                let changed=!win.selection.contains(&key)||win.focus!=Some(i);
                 if !win.selection.contains(&key) { win.selection = HashSet::from([key]); }
                 win.focus = Some(i);
-                self.render(id);
+                if changed { self.render(id); }
                 After::ItemMenu { fence: id, point: screen }
             }
             FenceHit::Tab(i) => {
@@ -1374,7 +1408,8 @@ impl DesktopHost {
         let Some(fence) = self.config.fence(id).cloned() else { return After::Nothing };
         let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-        if let Some(action) = history_shortcut(key, ctrl, shift, unsafe { GetKeyState(VK_MENU.0 as i32) } < 0) {
+        let alt = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
+        if let Some(action) = history_shortcut(key, ctrl, shift, alt) {
             return After::History { fence: id, action };
         }
         if ctrl && key == VK_TAB.0 { self.cycle_tab(id, if shift { -1 } else { 1 }); return After::Nothing; }
@@ -1388,7 +1423,7 @@ impl DesktopHost {
             VK_F5 => if fence.is_desktop() { self.refresh_desktop(); } else { self.refresh_folder(id); },
             VK_ESCAPE => { win.selection.clear(); self.render(id); }
             VK_BACK => if fence.browse.is_some() { self.browse_up(id); },
-            _ if ctrl && k == VK_A => { win.selection = win.entries.iter().map(|e| e.key.clone()).collect(); self.render(id); }
+            _ if ctrl && !alt && k == VK_A => { win.change_selection(if shift { SelectionChange::Invert } else { SelectionChange::All }); self.render(id); }
             _ if ctrl && k == VK_C => return After::Verb { fence: id, verb: "copy", background: false },
             _ if ctrl && k == VK_X => return After::Verb { fence: id, verb: "cut", background: false },
             _ if ctrl && k == VK_V => return After::Verb { fence: id, verb: "paste", background: true },
@@ -1540,12 +1575,16 @@ impl DesktopHost {
 
     // ---- menus ---------------------------------------------------------------
 
-    /// Fence background menu (ZSUI spec) shown above the Shell background items.
+    /// Management commands for a fence, independent of Shell command IDs.
     pub fn fence_menu(&self, id: u64) -> MenuSpec {
         let Some(fence) = self.config.fence(id) else { return menu(Vec::new()) };
         let s = &self.config.settings;
         let tabbed = self.config.tab_ids(id).len() > 1;
         let mut items = Vec::new();
+        items.push(entry("文件夹系统菜单…", "folder-system-menu", self.target_folder(id).is_some(), false));
+        let selected=self.win_index(id).is_some_and(|index|!self.fences[index].selection.is_empty());
+        if selected{items.push(submenu("所选项目",self.item_menu_items(id)));}
+        items.push(MenuItemSpec::Separator);
         if fence.is_desktop() { items.push(entry("新建格子", "new-fence", true, false)); }
         items.push(entry("新建文件夹映射格子…", "new-folder-fence", true, false));
         items.push(submenu("新建标签", vec![
@@ -1554,6 +1593,10 @@ impl DesktopHost {
         ]));
         items.push(entry(if tabbed { "重命名标签" } else { "重命名格子" }, "rename", true, false));
         if tabbed { items.push(entry("移到新格子", "split-tab", true, false)); }
+        items.push(MenuItemSpec::Separator);
+        items.push(submenu("选择", self.selection_menu_items(id)));
+        items.push(entry("撤销文件操作\tCtrl+Z", "history-undo", true, false));
+        items.push(entry("重做文件操作\tCtrl+Y", "history-redo", true, false));
         items.push(MenuItemSpec::Separator);
         items.push(submenu("查看", vec![
             entry("大图标", "icons-large", true, fence.view == FenceView::Icons && fence.icon_size == IconSize::Large),
@@ -1579,7 +1622,7 @@ impl DesktopHost {
             rules.push(entry("收取未分类项目", "catch-all", true, fence.catch_all));
             items.push(submenu("自动收取", rules));
         } else {
-            items.push(entry("在 ZSDesk 中打开", "open-explorer", true, false));
+            items.push(entry(if crate::edition::DESKTOP_ONLY{"在系统资源管理器中打开"}else{"在 ZSDesk 中打开"}, "open-explorer", true, false));
             items.push(entry("返回上一级", "browse-up", fence.browse.is_some(), false));
             items.push(entry("更改映射的文件夹…", "change-folder", true, false));
             items.push(entry("刷新", "refresh", true, false));
@@ -1594,7 +1637,10 @@ impl DesktopHost {
     }
 
     fn global_items(&self, s: &zsdesk_core::model::desktop::DesktopSettings) -> Vec<MenuItemSpec> {
-        let autostart = desktop::autostart_command().is_some();
+        let expected=std::env::current_exe().ok().and_then(|exe|fence_startup_command(&exe,&self.config_path));
+        let autostart=expected.as_ref().is_some_and(|expected|
+            desktop::autostart_command(crate::edition::desktop_startup_value()).ok().flatten()
+                .is_some_and(|current|desktop::autostart_owned(&current,expected)));
         let transparency = |opacity: u8| {
             let label = if opacity >= 100 { "不透明".to_string() } else { format!("透明度 {}%", 100 - u32::from(opacity)) };
             entry(&label, &format!("opacity-{opacity}"), true, s.opacity == opacity)
@@ -1624,7 +1670,7 @@ impl DesktopHost {
             entry("隐藏托盘图标", "hide-tray", true, s.hide_tray),
             entry("开机自动启动", "autostart", true, autostart),
             MenuItemSpec::Separator,
-            entry("打开 ZSDesk 文件管理器", "open-zsdesk", true, false),
+            entry(if crate::edition::DESKTOP_ONLY{"打开系统资源管理器"}else{"打开 ZSDesk 文件管理器"}, "open-zsdesk", true, false),
             entry("退出桌面格子", "quit", true, false),
         ]
     }
@@ -1643,11 +1689,21 @@ impl DesktopHost {
     pub fn menu_command(&mut self, fence_id: Option<u64>, id: &str, point: POINT) -> After {
         let fid = fence_id.unwrap_or(0);
         match id {
+            "folder-system-menu" if self.target_folder(fid).is_some()=>return After::FolderSystemMenu{fence:fid,point},
             "new-fence" => self.new_desktop_fence(Some(point)),
             "new-folder-fence" => return After::PickFolder { replace: None },
             "change-folder" => return After::PickFolder { replace: Some(fid) },
             "rename" => self.begin_rename(fid, RenameTarget::Title),
             "delete" => return After::DeleteFence(fid),
+            "history-undo" => return After::History { fence: fid, action: HistoryAction::Undo },
+            "history-redo" => return After::History { fence: fid, action: HistoryAction::Redo },
+            "select-all" | "select-none" | "select-invert" => {
+                if let Some(index) = self.win_index(fid) {
+                    let change = match id { "select-all" => SelectionChange::All, "select-none" => SelectionChange::Clear, _ => SelectionChange::Invert };
+                    self.fences[index].change_selection(change);
+                    self.render(fid);
+                }
+            }
             "lock" => { if let Some(f) = self.config.fence_mut(fid) { f.locked = !f.locked; } self.config.sync_group(fid); self.schedule_save(); self.render(fid); }
             "new-tab-desktop" => self.add_desktop_tab(fid),
             "new-tab-folder" => return After::PickFolderTab { to: fid },
@@ -1686,21 +1742,26 @@ impl DesktopHost {
                     self.config.settings.hide_tray = true;
                     self.remove_tray();
                     self.schedule_save();
-                    let text: Vec<u16> = "托盘图标已隐藏。\n\n右键任意格子 → 桌面格子 可取消隐藏；也可在文件管理器 ≡ → 桌面格子 → 显示托盘图标。".encode_utf16().chain(Some(0)).collect();
-                    unsafe { MessageBoxW(Some(self.hwnd), PCWSTR(text.as_ptr()), windows::core::w!("ZSDesk 桌面格子"), MB_OK | MB_ICONINFORMATION); }
+                    return After::Notice("托盘图标已隐藏。\n\n右键任意格子 → 桌面格子 可取消隐藏；也可在文件管理器 ≡ → 桌面格子 → 显示托盘图标。");
                 }
             }
             "autostart" => {
-                let enabled = desktop::autostart_command().is_some();
-                let command = std::env::current_exe().ok().map(|exe| {
-                    let mut c = format!("\"{}\" --desktop", exe.display());
-                    if let Some(dir) = self.config_path.parent() { c.push_str(&format!(" --profile-dir \"{}\"", dir.display())); }
-                    c
-                });
-                desktop::set_autostart(if enabled { None } else { command.as_deref() });
+                let Some(command)=std::env::current_exe().ok().and_then(|exe|fence_startup_command(&exe,&self.config_path)) else {
+                    return After::Notice("无法确定当前安装和配置目录，登录启动设置未更改。");
+                };
+                let value=crate::edition::desktop_startup_value();
+                let current=match desktop::autostart_command(value) {
+                    Ok(current)=>current,Err(_)=>return After::Notice("无法读取登录启动设置。"),
+                };
+                if current.as_ref().is_some_and(|current|!desktop::autostart_owned(current,&command)) {
+                    return After::Notice("已有登录启动项属于另一安装或配置，现有设置已保留。");
+                }
+                if desktop::set_autostart(value,&command,current.is_none()).is_err() {
+                    return After::Notice("无法更改登录启动设置，请重新打开设置后重试。");
+                }
             }
             "open-zsdesk" => self.open_explorer_args(&[]),
-            "quit" => unsafe { let _ = DestroyWindow(self.hwnd); },
+            "quit" => return After::Quit,
             id if id.starts_with("theme-") => {
                 self.config.settings.theme = match id { "theme-light" => FenceTheme::Light, "theme-system" => FenceTheme::System, _ => FenceTheme::Dark };
                 self.update_palette(); self.schedule_save(); self.render_all();
@@ -1762,7 +1823,7 @@ impl DesktopHost {
         let focused = self.focused_entry(id);
         if focused.is_some_and(|e| e.is_container() && e.path.is_some()) {
             if !fence.is_desktop() { items.push(entry("在格子中打开", "open-in-fence", true, false)); }
-            items.push(entry("在 ZSDesk 中打开", "open-in-zsdesk", true, false));
+            items.push(entry(if crate::edition::DESKTOP_ONLY{"在系统资源管理器中打开"}else{"在 ZSDesk 中打开"}, "open-in-zsdesk", true, false));
         }
         if fence.is_desktop() {
             let mut targets: Vec<MenuItemSpec> = self.config.fences.iter().filter(|f| f.is_desktop() && f.id != id)
@@ -1773,7 +1834,18 @@ impl DesktopHost {
             let manual = fence.members.iter().any(|m| keys.contains(m));
             items.push(entry("交给自动收取", "unassign", manual, false));
         }
+        if !items.is_empty() { items.push(MenuItemSpec::Separator); }
+        items.push(submenu("选择", self.selection_menu_items(id)));
         items
+    }
+
+    fn selection_menu_items(&self, id: u64) -> Vec<MenuItemSpec> {
+        let window = self.win_index(id).map(|index| &self.fences[index]);
+        let has_items = window.is_some_and(|window| !window.entries.is_empty());
+        let has_selection = window.is_some_and(|window| !window.selection.is_empty());
+        vec![entry("全选\tCtrl+A", "select-all", has_items, false),
+            entry("全部取消", "select-none", has_selection, false),
+            entry("反向选择\tCtrl+Shift+A", "select-invert", has_items, false)]
     }
 
     pub fn selected_keys(&self, id: u64) -> Vec<String> {
@@ -1811,6 +1883,16 @@ impl DesktopHost {
     }
 
     fn open_explorer_args(&self, args: &[std::ffi::OsString]) {
+        if crate::edition::DESKTOP_ONLY{
+            let target=args.first().cloned().unwrap_or_else(||"shell:MyComputerFolder".into());
+            if let Err(error)=crate::app::open_original_explorer(target){self.notify_error(&format!("无法打开文件夹：{error:#}"));}
+            return;
+        }
+        match crate::runtime::enqueue_local(&self.explorer_config,args.to_vec()) {
+            Ok(true)=>return,
+            Ok(false)=>{},
+            Err(error)=>{self.notify_error(&format!("无法打开文件管理器：{error:#}"));return;}
+        }
         let Ok(exe) = std::env::current_exe() else { return };
         let mut command = std::process::Command::new(exe);
         if let Some(dir) = self.explorer_config.parent() { command.arg("--profile-dir").arg(dir); }
@@ -1957,7 +2039,36 @@ fn item_info(entry: &ShellEntry) -> ItemInfo {
 }
 
 fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
-    NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: hwnd, uID: 1, ..Default::default() }
+    NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: hwnd, uID: TRAY_ID, ..Default::default() }
+}
+
+fn register_tray(data:&mut NOTIFYICONDATAW,mut notify:impl FnMut(NOTIFY_ICON_MESSAGE,&NOTIFYICONDATAW)->bool)->(bool,bool){
+    if !notify(NIM_ADD,data){return(false,false);}
+    // Explorer forgets the negotiated version whenever the icon is re-added.
+    data.Anonymous.uVersion=NOTIFYICON_VERSION_4;
+    (true,notify(NIM_SETVERSION,data))
+}
+
+#[cfg(test)]mod tray_protocol_tests{
+    use super::*;
+    #[test]fn add_and_explorer_readd_negotiate_version_four_each_time(){
+        let mut messages=Vec::new();
+        for _ in 0..2{
+            let mut data=tray_data(HWND(123usize as*mut _));
+            let state=register_tray(&mut data,|message,data|{
+                assert_eq!(data.uID,TRAY_ID);messages.push(message);
+                if message==NIM_SETVERSION{assert_eq!(unsafe{data.Anonymous.uVersion},NOTIFYICON_VERSION_4);}
+                true
+            });assert_eq!(state,(true,true));
+        }
+        assert_eq!(messages,vec![NIM_ADD,NIM_SETVERSION,NIM_ADD,NIM_SETVERSION]);
+    }
+    #[test]fn failed_add_never_negotiates_and_failed_version_retains_legacy_icon(){
+        let mut data=tray_data(HWND::default());let mut messages=Vec::new();
+        assert_eq!(register_tray(&mut data,|message,_|{messages.push(message);false}),(false,false));assert_eq!(messages,vec![NIM_ADD]);
+        messages.clear();assert_eq!(register_tray(&mut data,|message,_|{messages.push(message);message==NIM_ADD}),(true,false));
+        assert_eq!(messages,vec![NIM_ADD,NIM_SETVERSION]);
+    }
 }
 
 fn screen_below(hwnd: HWND, r: zsdesk_ui::chrome::Rect) -> POINT {
@@ -2040,6 +2151,15 @@ mod shortcut_tests {
     use super::*;
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_C, VK_Y, VK_Z};
     #[test]
+    fn fence_startup_command_binds_the_exact_profile() {
+        let exe=Path::new(r"C:\Apps\ZSDesk Theme\ZSDesk.exe");
+        let main=fence_startup_command(exe,Path::new(r"C:\Profiles\中文 Main\desktop-fences.json")).unwrap();
+        assert_eq!(main,r#""C:\Apps\ZSDesk Theme\ZSDesk.exe" --desktop --profile-dir "C:\Profiles\中文 Main""#);
+        let other=fence_startup_command(exe,Path::new(r"C:\Profiles\Other\desktop-fences.json")).unwrap();
+        assert!(!desktop::autostart_owned(&main,&other));
+        assert!(fence_startup_command(Path::new("ZSDesk.exe"),Path::new("desktop-fences.json")).is_none());
+    }
+    #[test]
     fn fence_history_shortcuts_require_exact_modifiers() {
         assert_eq!(history_shortcut(VK_Z.0, true, false, false), Some(HistoryAction::Undo));
         assert_eq!(history_shortcut(VK_Y.0, true, false, false), Some(HistoryAction::Redo));
@@ -2049,6 +2169,26 @@ mod shortcut_tests {
             assert_eq!(history_shortcut(key.0, true, false, true), None);
         }
         assert_eq!(history_shortcut(VK_C.0, true, false, false), None);
+    }
+    #[test]
+    fn restored_member_keeps_its_saved_group_during_pending_collection() {
+        let original = r"E:\fixture\恢复 文件.txt";
+        let restored = r"e:\fixture\恢复 文件.txt";
+        let mut saved = Fence::new(1, "Saved", FenceSource::Desktop, Placement::default());
+        saved.members.push(original.into());
+        let mut collecting = Fence::new(2, "Collecting", FenceSource::Desktop, Placement::default());
+        collecting.catch_all = true;
+        let config = DesktopConfig { fences: vec![saved, collecting], ..Default::default() };
+        assert!(distribute(&config.fences, &[]).iter().all(Vec::is_empty));
+        let mut config: DesktopConfig = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        config.normalize();
+        let known = HashSet::new();
+        if pending_collection_allowed(&config, &known, restored) { config.assign(2, &[restored.into()], None); }
+        assert_eq!(config.fence(1).unwrap().members, vec![original]);
+        let item = ItemInfo { key: restored.into(), name: "恢复 文件.txt".into(), is_folder: false,
+            category: Category::Documents, size: None, modified: None };
+        assert_eq!(distribute(&config.fences, &[item]), vec![vec![0], vec![]]);
+        assert!(pending_collection_allowed(&config, &known, r"E:\fixture\新建 文件.txt"));
     }
 }
 

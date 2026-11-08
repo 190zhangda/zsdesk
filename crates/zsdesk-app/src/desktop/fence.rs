@@ -38,12 +38,13 @@ pub fn shape_window(hwnd: HWND) {
         return;
     }
     let mut r = RECT::default();
-    let _ = unsafe { GetWindowRect(hwnd, &mut r) };
+    if unsafe { GetWindowRect(hwnd, &mut r) }.is_err(){return;}
     let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
     let diameter = scale(20, dpi);
     // The system owns the region after SetWindowRgn succeeds.
     let region = unsafe { CreateRoundRectRgn(0, 0, r.right - r.left + 1, r.bottom - r.top + 1, diameter, diameter) };
-    let _ = unsafe { SetWindowRgn(hwnd, Some(region), true) };
+    if region.0.is_null(){return;}
+    if unsafe { SetWindowRgn(hwnd, Some(region), true) }==0{let _=unsafe{windows::Win32::Graphics::Gdi::DeleteObject(region.into())};}
 }
 
 /// What the pointer is over.
@@ -53,6 +54,15 @@ pub enum FenceHit { None, Title, More, Back, Edge(Edges), Item(usize), Empty, Sc
 /// One tab of the fence's group as measured at the last render.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabMeta { pub id: u64, pub label: String, pub width: i32 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionChange { All, Clear, Invert }
+
+fn changed_selection<'a>(keys: impl IntoIterator<Item=&'a str>, previous: &HashSet<String>, change: SelectionChange) -> HashSet<String> {
+    keys.into_iter().filter(|key| match change {
+        SelectionChange::All => true, SelectionChange::Clear => false, SelectionChange::Invert => !previous.contains(*key),
+    }).map(str::to_owned).collect()
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Edges { pub left: bool, pub top: bool, pub right: bool, pub bottom: bool }
@@ -322,6 +332,14 @@ impl FenceWin {
         self.entries.iter().filter(|e| self.selection.contains(&e.key)).collect()
     }
 
+    pub fn change_selection(&mut self, change: SelectionChange) {
+        self.selection = changed_selection(self.entries.iter().map(|entry| entry.key.as_str()), &self.selection, change);
+        if !self.focus.and_then(|index| self.entries.get(index)).is_some_and(|entry| self.selection.contains(&entry.key)) {
+            self.focus = self.entries.iter().position(|entry| self.selection.contains(&entry.key));
+        }
+        self.anchor = self.focus;
+    }
+
     /// Paints and presents the fence. `icon` resolves item bitmaps.
     pub fn render(&mut self, gfx: &Gfx, fence: &Fence, palette: &FencePalette, show_counts: bool, mut icon: impl FnMut(&ShellEntry, i32) -> Option<ID2D1Bitmap>) {
         if self.hwnd.0.is_null() { return; }
@@ -513,6 +531,16 @@ mod tests {
     use zsdesk_core::model::desktop::{FenceSource, Placement};
 
     fn fence() -> Fence { Fence::new(1, "t", FenceSource::Desktop, Placement::default()) }
+
+    #[test]
+    fn inverse_selection_uses_the_complete_original_set() {
+        let old = HashSet::from(["a".to_string(), "gone".to_string()]);
+        let inverse = changed_selection(["a", "b", "c"], &old, SelectionChange::Invert);
+        assert_eq!(inverse, HashSet::from(["b".to_string(), "c".to_string()]));
+        assert_eq!(changed_selection(["a", "b", "c"], &inverse, SelectionChange::Invert), HashSet::from(["a".to_string()]));
+        assert!(changed_selection(["a", "b"], &old, SelectionChange::Clear).is_empty());
+        assert_eq!(changed_selection(["a", "b"], &old, SelectionChange::All), HashSet::from(["a".to_string(), "b".to_string()]));
+    }
 
     #[test]
     fn icon_grid_wraps_and_scrolls() {

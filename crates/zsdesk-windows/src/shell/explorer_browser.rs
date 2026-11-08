@@ -1,6 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
 #[cfg(all(target_arch = "x86_64", target_env = "msvc"))]
 extern "C" {
@@ -66,12 +68,30 @@ pub struct MenuDiagnostics {
     pub modern_extension_loads_skipped: u64,
     pub modern_updates_skipped: u64,
     pub modern_filter_failures: u64,
+    /// Presenter initialization only; excludes menu tracking/user dwell time.
+    pub last_presenter_create_microseconds: u64,
+    pub last_public_bind_microseconds: u64,
+    pub last_public_populate_microseconds: u64,
 }
 pub fn menu_diagnostics() -> MenuDiagnostics {
     let mut value = MenuDiagnostics::default();
     #[cfg(all(target_arch = "x86_64", target_env = "msvc"))]
     unsafe { zs_menu_diagnostics(&mut value); }
+    (value.last_public_bind_microseconds,value.last_public_populate_microseconds)=super::menu::public_menu_timings();
     value
+}
+
+/// Cumulative costs for this embedded results view, excluding backend queries.
+#[derive(Clone,Copy,Debug,Default,serde::Serialize)]
+pub struct SearchMaterializationMetrics{
+    pub batches:u64,
+    pub attempted_paths:u64,
+    pub added_paths:u64,
+    pub parse_microseconds:u64,
+    pub add_item_microseconds:u64,
+    pub longest_batch_microseconds:u64,
+    pub clear_calls:u64,
+    pub clear_microseconds:u64,
 }
 
 pub struct ExplorerBrowserHost {
@@ -88,6 +108,8 @@ pub struct ExplorerBrowserHost {
     streamed_results_used: Cell<bool>,
     results_active: Rc<Cell<bool>>,
     results_location: Rc<RefCell<Option<ShellLocation>>>,
+    search_materializing_until: Cell<Option<std::time::Instant>>,
+    search_metrics:Cell<SearchMaterializationMetrics>,
 }
 
 impl ExplorerBrowserHost {
@@ -167,6 +189,8 @@ impl ExplorerBrowserHost {
             streamed_results_used: Cell::new(false),
             results_active,
             results_location,
+            search_materializing_until: Cell::new(None),
+            search_metrics:Cell::new(SearchMaterializationMetrics::default()),
         };
         Ok(host)
     }
@@ -178,8 +202,9 @@ impl ExplorerBrowserHost {
     /// Must be called on the STA/UI thread that created this host while its
     /// parent window and COM apartment are still alive.
     pub unsafe fn navigate(&self, location: &ShellLocation) -> Result<()> {
-        if let ShellLocation::Search { query, scope: None } = location {
-            if query.trim().is_empty() || query.contains('\0') {
+        self.search_materializing_until.set(None);
+        if let ShellLocation::Search { query, .. } = location {
+            if query.contains('\0') {
                 return Err(Error::from_hresult(HRESULT(0x80070057u32 as i32)));
             }
             *self.results_location.borrow_mut() = Some(location.clone());
@@ -208,13 +233,14 @@ impl ExplorerBrowserHost {
     /// not, so a reused results view posts exactly one logical completion here.
     /// Prefer navigate(Search{scope:None,..}) to retain the query in events.
     pub fn begin_search_results(&self) -> Result<()> {
+        self.search_materializing_until.set(None);
         self.selection_revision.set(self.selection_revision.get().wrapping_add(1));
         if self.streamed_results_used.get() {
             if !self.results_active.get() {
                 return Err(Error::from_hresult(HRESULT(0x8000FFFFu32 as i32)));
             }
             let results = self.results_folder()?;
-            unsafe { results.RemoveAll()?; }
+            self.remove_all_search_results(&results)?;
             if let Some(location) = self.results_location.borrow().clone() {
                 post_location(self.owner, WM_SHELL_NAVIGATED, location);
             }
@@ -240,14 +266,213 @@ impl ExplorerBrowserHost {
         if paths.len() > 64 { return Err(Error::from_hresult(HRESULT(0x80070057u32 as i32))); }
         if !self.results_active.get() { return Err(Error::from_hresult(HRESULT(0x8000FFFFu32 as i32))); }
         let results = self.results_folder().map_err(|_| Error::from_hresult(HRESULT(0x8000000Au32 as i32)))?;
+        let started=std::time::Instant::now();
+        let mut metrics=self.search_metrics.get();
         let mut added = 0;
         for path in paths {
             if !path.is_absolute() { continue; }
-            let Ok(item) = (unsafe { shell_item(&ShellLocation::Path(path.clone())) }) else { continue };
+            metrics.attempted_paths+=1;
+            let parse_started=std::time::Instant::now();
+            let parsed=unsafe { shell_item(&ShellLocation::Path(path.clone())) };
+            metrics.parse_microseconds+=parse_started.elapsed().as_micros()as u64;
+            let Ok(item)=parsed else { continue };
+            let add_started=std::time::Instant::now();
             if unsafe { results.AddItem(&item) }.is_ok() { added += 1; }
+            metrics.add_item_microseconds+=add_started.elapsed().as_micros()as u64;
         }
-        if added > 0 { self.selection_revision.set(self.selection_revision.get().wrapping_add(1)); }
+        metrics.batches+=1;metrics.added_paths+=added as u64;
+        metrics.longest_batch_microseconds=metrics.longest_batch_microseconds.max(started.elapsed().as_micros()as u64);
+        self.search_metrics.set(metrics);
+        if added > 0 {
+            self.selection_revision.set(self.selection_revision.get().wrapping_add(1));
+            self.search_materializing_until.set(Some(std::time::Instant::now()+std::time::Duration::from_secs(2)));
+        }
         Ok(added)
+    }
+
+    /// Replaces streamed data in the existing results view. Unlike a navigation,
+    /// this deliberately emits no logical or Shell navigation completion.
+    pub fn clear_search_paths(&self) -> Result<()> {
+        self.search_materializing_until.set(None);
+        if !self.results_active.get() { return Err(Error::from_hresult(HRESULT(0x8000FFFFu32 as i32))); }
+        let results = self.results_folder().map_err(|_| Error::from_hresult(HRESULT(0x8000000Au32 as i32)))?;
+        self.remove_all_search_results(&results)?;
+        self.selection_revision.set(self.selection_revision.get().wrapping_add(1));
+        Ok(())
+    }
+
+    fn remove_all_search_results(&self,results:&IResultsFolder)->Result<()>{
+        let started=std::time::Instant::now();
+        let result=unsafe{results.RemoveAll()};
+        let mut metrics=self.search_metrics.get();metrics.clear_calls+=1;
+        metrics.clear_microseconds+=started.elapsed().as_micros()as u64;self.search_metrics.set(metrics);
+        result
+    }
+
+    pub fn search_materialization_metrics(&self)->SearchMaterializationMetrics{self.search_metrics.get()}
+
+    pub fn search_selection_revision(&self) -> u64 { self.selection_revision.get() }
+
+    /// Normalize only Win32 spelling of the root and separators. Filenames stay
+    /// case-sensitive so distinct names in an NTFS case-sensitive directory are
+    /// never treated as the same restoration candidate.
+    pub fn search_path_key(path: &Path) -> Vec<u16> {
+        let mut units: Vec<u16> = path.as_os_str().encode_wide().map(|n| if n == 47 { 92 } else { n }).collect();
+        if units.len() >= 7 && units[..4] == [92,92,63,92] && units[5] == 58 { units.drain(..4); }
+        if units.len() >= 2 && units[1] == 58 && (97..=122).contains(&units[0]) { units[0] -= 32; }
+        while units.len() > 3 && units.last() == Some(&92) { units.pop(); }
+        units
+    }
+
+    /// Reads a stable, bounded selected-item array. A concurrent selection change
+    /// declines the snapshot instead of preserving an arbitrary partial choice.
+    pub fn search_selection_snapshot(&self) -> Result<(Vec<PathBuf>, u64)> {
+        use windows::Win32::UI::Shell::{IShellItem, SVGIO_SELECTION};
+        if self.results_active.get() {
+            let (_,selected,revision)=self.search_items_snapshot()?;
+            return Ok((selected,revision));
+        }
+        let revision = self.selection_revision.get();
+        let view: IFolderView2 = unsafe { self.current_view()? }.cast()?;
+        let count = match unsafe { view.ItemCount(SVGIO_SELECTION) } {
+            Ok(count) => count.max(0) as u32,
+            Err(error) if missing_selection(&error) => 0,
+            Err(error) => return Err(error),
+        };
+        if count > 2000 { return Err(Error::from_hresult(HRESULT(0x8007000Eu32 as i32))); }
+        // ResultsFolder can report ERROR_NOT_FOUND for an empty selection and
+        // can briefly retain an old selection count after RemoveAll. Confirm
+        // empty/unstable arrays against actual view-item PIDL state instead of
+        // treating every NOT_FOUND as either failure or an assumed empty set.
+        if count == 0 { return self.search_selection_from_items(&view, revision); }
+        let mut paths = Vec::with_capacity(count as usize);
+        let mut bytes = 0usize;
+        {
+            let items = match unsafe { view.GetSelection(false) } {
+                Ok(items) => items,
+                Err(error) if missing_selection(&error) => return self.search_selection_from_items(&view, revision),
+                Err(error) => return Err(error),
+            };
+            if unsafe { items.GetCount()? } != count { return Err(search_pending()); }
+            for index in 0..count {
+                if self.selection_revision.get() != revision { return Err(search_pending()); }
+                let item: IShellItem = unsafe { items.GetItemAt(index)? };
+                if let Some(path) = search_item_path(&item)? {
+                    bytes = bytes.saturating_add(path.capacity()).saturating_add(64);
+                    if bytes > 2 * 1024 * 1024 { return Err(Error::from_hresult(HRESULT(0x8007000Eu32 as i32))); }
+                    paths.push(path);
+                }
+            }
+        }
+        let after = match unsafe { view.ItemCount(SVGIO_SELECTION) } {
+            Ok(count) => count.max(0) as u32,
+            Err(error) if missing_selection(&error) => 0,
+            Err(error) => return Err(error),
+        };
+        if self.selection_revision.get() != revision || after != count {
+            return Err(search_pending());
+        }
+        Ok((paths,revision))
+    }
+
+    fn search_selection_from_items(&self, view:&IFolderView2, revision:u64)->Result<(Vec<PathBuf>,u64)>{
+        use windows::Win32::UI::Shell::{IShellItem,SVGIO_ALLVIEW,SVSI_SELECT};
+        let count=match unsafe{view.ItemCount(SVGIO_ALLVIEW)}{
+            Ok(count)=>count.max(0),
+            Err(error) if missing_selection(&error)=>{
+                match unsafe{view.GetItem::<IShellItem>(0)}{
+                    Ok(_)=>return Err(search_pending()),
+                    Err(item_error) if missing_selection(&item_error) || item_error.code().0 as u32==0x80070057=>0,
+                    Err(item_error)=>return Err(item_error),
+                }
+            },
+            Err(error)=>return Err(error),
+        };
+        if count>2000{return Err(Error::from_hresult(HRESULT(0x8007000Eu32 as i32)));}
+        let mut paths=Vec::new();let mut bytes=0usize;
+        for index in 0..count{
+            if self.selection_revision.get()!=revision{return Err(search_pending());}
+            let pidl=SearchRelativePidl(unsafe{view.Item(index)}.map_err(materializing_error)?);
+            if pidl.0.is_null(){return Err(search_pending());}
+            let state=unsafe{view.GetSelectionState(pidl.0)}.map_err(materializing_error)?;
+            if state&SVSI_SELECT.0 as u32!=0{
+                let item:IShellItem=unsafe{view.GetItem(index)?};
+                if let Some(path)=search_item_path(&item)?{
+                    bytes+=path.capacity()+64;if bytes>2*1024*1024{return Err(Error::from_hresult(HRESULT(0x8007000Eu32 as i32)));}
+                    paths.push(path);
+                }
+            }
+        }
+        if self.selection_revision.get()!=revision{return Err(search_pending());}
+        Ok((paths,revision))
+    }
+
+    /// Snapshot current materialized rows and their actual PIDL selection state.
+    /// Used while RemoveAll notifications are still draining; a cached selected
+    /// IShellItemArray alone does not prove that those rows still exist.
+    pub fn search_items_snapshot(&self)->Result<(Vec<PathBuf>,Vec<PathBuf>,u64)>{
+        use windows::Win32::UI::Shell::{IShellItem,SVSI_SELECT};
+        let revision=self.selection_revision.get();
+        let shell=unsafe{self.current_view()}.map_err(|error|restore_context("snapshot current view",error))?;
+        let view:IFolderView2=shell.cast().map_err(|error|restore_context("snapshot folder view",error))?;
+        let count=materialized_item_count(&view).map_err(|error|restore_context("snapshot live row count",error))?;
+        if count>2000{return Err(Error::from_hresult(HRESULT(0x8007000Eu32 as i32)));}
+        let mut paths=Vec::new();let mut selected=Vec::new();let mut bytes=0usize;
+        for index in 0..count{
+            if self.selection_revision.get()!=revision{return Err(search_pending());}
+            let item:IShellItem=unsafe{view.GetItem(index)}.map_err(|error|restore_context("snapshot live GetItem",materializing_error(error)))?;
+            let Some(path)=search_item_path(&item).map_err(|error|restore_context("snapshot live filesystem path",materializing_error(error)))? else{return Err(search_pending());};
+            let pidl=SearchRelativePidl(unsafe{view.Item(index)}.map_err(|error|restore_context("snapshot live relative PIDL",materializing_error(error)))?);
+            if pidl.0.is_null(){return Err(search_pending());}
+            let state=unsafe{view.GetSelectionState(pidl.0)}.map_err(|error|restore_context("snapshot live PIDL selection state",
+                materializing_selection_error(error,self.search_materializing_until.get(),std::time::Instant::now())))?;
+            bytes+=path.capacity()+64;if bytes>2*1024*1024{return Err(Error::from_hresult(HRESULT(0x8007000Eu32 as i32)));}
+            if state&SVSI_SELECT.0 as u32!=0{selected.push(path.clone());}paths.push(path);
+        }
+        if self.selection_revision.get()!=revision || materialized_item_count(&view).map_err(|error|restore_context("snapshot final live row count",error))?!=count
+            || unsafe{self.current_view()}.map_err(|error|restore_context("snapshot final current view",error))?.cast::<IUnknown>()?!=shell.cast::<IUnknown>()? {return Err(search_pending());}
+        Ok((paths,selected,revision))
+    }
+
+    /// Select only existing results whose actual relative PIDL resolves to a
+    /// requested path. No parsing-name guess, focus change or navigation occurs.
+    /// `allowed` is checked around COM calls, including nested message pumps.
+    pub fn restore_search_paths(&self, paths: &[PathBuf], mut revision: u64, allowed: impl Fn() -> bool)
+        -> Result<(Vec<PathBuf>, u64)> {
+        use windows::Win32::UI::Shell::{IShellFolder, IShellItem, SHCreateItemWithParent,
+            SVGIO_ALLVIEW, SVSI_SELECT, SVSI_NOTAKEFOCUS};
+        if paths.len() > 2000 { return Err(Error::from_hresult(HRESULT(0x80070057u32 as i32))); }
+        if !self.results_active.get() || !allowed() || self.selection_revision.get() != revision { return Err(search_cancelled()); }
+        let shell = unsafe { self.current_view()? };
+        let view: IFolderView2 = shell.cast()?;
+        let folder: IShellFolder = unsafe { view.GetFolder() }.map_err(|error|restore_context("results parent",error))?;
+        let count = unsafe { view.ItemCount(SVGIO_ALLVIEW)? }.max(0);
+        if count > 4096 { return Err(Error::from_hresult(HRESULT(0x8007000Eu32 as i32))); }
+        let mut wanted: std::collections::HashSet<_> = paths.iter().map(|p| Self::search_path_key(p)).collect();
+        let mut restored = Vec::new();
+        for index in 0..count {
+            if wanted.is_empty() { break; }
+            if !allowed() || self.selection_revision.get() != revision { return Err(search_cancelled()); }
+            let Ok(item) = (unsafe { view.GetItem::<IShellItem>(index) }) else { continue };
+            let Some(path) = search_item_path(&item)? else { continue };
+            let key = Self::search_path_key(&path);
+            if !wanted.contains(&key) { continue; }
+            let pidl = SearchRelativePidl(unsafe { view.Item(index) }.map_err(|error|restore_context("actual relative PIDL",error))?);
+            if pidl.0.is_null() { continue; }
+            // The view can reorder while an item object is obtained. Bind this
+            // actual PIDL back through its owning results folder before selecting.
+            let bound: IShellItem = unsafe { SHCreateItemWithParent(None, &folder, pidl.0) }.map_err(|error|restore_context("relative PIDL binding",error))?;
+            let Some(bound_path) = search_item_path(&bound).map_err(|error|restore_context("bound filesystem path",error))? else { continue };
+            if Self::search_path_key(&bound_path) != key { continue; }
+            if !allowed() || self.selection_revision.get() != revision { return Err(search_cancelled()); }
+            unsafe { shell.SelectItem(pidl.0, (SVSI_SELECT.0 | SVSI_NOTAKEFOCUS.0) as u32) }.map_err(|error|restore_context("select relative PIDL",error))?;
+            revision = self.selection_revision.get();
+            if !allowed() { return Err(search_cancelled()); }
+            let selected = unsafe { view.GetSelectionState(pidl.0) }.map_err(|error|restore_context("selected relative PIDL state",error))? & SVSI_SELECT.0 as u32 != 0;
+            if !allowed() || self.selection_revision.get() != revision { return Err(search_cancelled()); }
+            if selected { wanted.remove(&key); restored.push(bound_path); }
+        }
+        Ok((restored,revision))
     }
 
     /// Resizes the hosted Shell view.
@@ -278,6 +503,70 @@ impl ExplorerBrowserHost {
             let _ = unsafe { object_with_site.SetSite(None::<&IUnknown>) };
         }
         let _ = unsafe { self.browser.Destroy() };
+    }
+}
+
+fn search_pending() -> Error { Error::from_hresult(HRESULT(0x8000000Au32 as i32)) }
+fn search_cancelled() -> Error { Error::from_hresult(HRESULT(0x800704C7u32 as i32)) }
+fn missing_selection(error:&Error)->bool{error.code().0 as u32==0x80070490}
+fn materializing_error(error:Error)->Error{if missing_selection(&error){search_pending()}else{error}}
+fn materializing_selection_error(error:Error,deadline:Option<std::time::Instant>,now:std::time::Instant)->Error{
+    // AddItem can expose a row/PIDL before its selection state exists. Only
+    // that exact argument error during our own bounded append interval is
+    // pending; it does not establish that the row is unselected.
+    if error.code().0 as u32==0x80070057 && deadline.is_some_and(|limit|now<limit){search_pending()}
+    else{materializing_error(error)}
+}
+fn materialized_item_count(view:&IFolderView2)->Result<i32>{
+    use windows::Win32::UI::Shell::{IShellItem,SVGIO_ALLVIEW};
+    match unsafe{view.ItemCount(SVGIO_ALLVIEW)}{
+        Ok(count)=>Ok(count.max(0)),
+        Err(error) if missing_selection(&error)=>match unsafe{view.GetItem::<IShellItem>(0)}{
+            Ok(_)=>Err(search_pending()),
+            Err(item_error) if missing_selection(&item_error) || item_error.code().0 as u32==0x80070057=>Ok(0),
+            Err(item_error)=>Err(item_error),
+        },
+        Err(error)=>Err(error),
+    }
+}
+fn restore_context(stage:&str,error:Error)->Error{Error::new(error.code(),format!("{stage}: {error}"))}
+struct SearchRelativePidl(*mut windows::Win32::UI::Shell::Common::ITEMIDLIST);
+impl Drop for SearchRelativePidl {
+    fn drop(&mut self) { if !self.0.is_null() { unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(self.0.cast())); } } }
+}
+fn search_item_path(item: &windows::Win32::UI::Shell::IShellItem) -> Result<Option<PathBuf>> {
+    let text = unsafe { item.GetDisplayName(windows::Win32::UI::Shell::SIGDN_FILESYSPATH)? };
+    if text.is_null() { return Ok(None); }
+    let path = unsafe {
+        let units = text.as_wide();
+        let result = (units.len() <= 32767).then(|| PathBuf::from(OsString::from_wide(units)));
+        windows::Win32::System::Com::CoTaskMemFree(Some(text.0.cast()));
+        result
+    };
+    Ok(path.filter(|p| p.is_absolute()))
+}
+
+#[cfg(test)]
+mod search_path_tests {
+    use super::*;
+    #[test]
+    fn roots_are_normalized_without_collapsing_case_sensitive_filenames() {
+        assert_eq!(ExplorerBrowserHost::search_path_key(Path::new(r"\\?\c:\资料\甲.txt")),
+            ExplorerBrowserHost::search_path_key(Path::new("C:/资料/甲.txt")));
+        assert_ne!(ExplorerBrowserHost::search_path_key(Path::new(r"C:\case\a.txt")),
+            ExplorerBrowserHost::search_path_key(Path::new(r"C:\case\A.txt")));
+        assert_ne!(ExplorerBrowserHost::search_path_key(Path::new(r"C:\甲\same.txt")),
+            ExplorerBrowserHost::search_path_key(Path::new(r"C:\乙\same.txt")));
+    }
+    #[test]
+    fn append_selection_pending_is_bounded_and_hresult_specific(){
+        let now=std::time::Instant::now();let deadline=now+std::time::Duration::from_secs(2);
+        let argument=||Error::from_hresult(HRESULT(0x80070057u32 as i32));
+        assert_eq!(materializing_selection_error(argument(),Some(deadline),now).code(),search_pending().code());
+        assert_eq!(materializing_selection_error(argument(),None,now).code(),argument().code());
+        assert_eq!(materializing_selection_error(argument(),Some(deadline),deadline).code(),argument().code());
+        let denied=Error::from_hresult(HRESULT(0x80070005u32 as i32));
+        assert_eq!(materializing_selection_error(denied.clone(),Some(deadline),now).code(),denied.code());
     }
 }
 

@@ -130,10 +130,13 @@ public:
         return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
     }
     HRESULT Track(HWND owner,IContextMenu* context,HMENU menu,UINT count,
-            PCIDLIST_ABSOLUTE const* pidls,IShellItem* folder,bool background,POINT* point,UINT* choice){
+            PCIDLIST_ABSOLUTE const* pidls,IShellItem* folder,bool background,POINT* point,
+            const UINT* applications,UINT applicationCount,uint32_t intercept,
+            menu_dispatch::BeforeInvoke before,void* beforeContext,menu_dispatch::Result* outcome){
         if(!IsWindow(owner)||GetWindowThreadProcessId(owner,nullptr)!=GetCurrentThreadId()||
-                !context||!menu||!point||!choice||(!background&&(!count||!pidls))||(background&&!folder))return E_INVALIDARG;
-        *choice=0;
+                !context||!menu||!point||!outcome||(!background&&(!count||!pidls))||(background&&!folder)||
+                (applicationCount&&!applications))return E_INVALIDARG;
+        *outcome={};
         HRESULT result=EnsureResultsHost(owner,quit_);if(FAILED(result))return result;
         // The private view supplies Shell services only. Selection is passed as
         // an immutable absolute-PIDL snapshot, never as another view's state.
@@ -158,7 +161,8 @@ public:
         result=QueryMenuPresenter(browser_.Get(),kPresenterSID,kPresenterIID,reinterpret_cast<void**>(presenter_.GetAddressOf()),owner);
         if(FAILED(result)||!active)return FAILED(result)?result:E_UNEXPECTED;
         session_=active;session_->AddRef();
-        session_->ConfigureStandalone(owner,GetMenuItemCount(extra_.value)>0?extra_.value:nullptr,*point);
+        session_->ConfigureStandalone(owner,GetMenuItemCount(extra_.value)>0?extra_.value:nullptr,*point,
+            applications,applicationCount,intercept,before,beforeContext);
         if(SUCCEEDED(context->QueryInterface(IID_PPV_ARGS(&site_)))){
             site_->GetSite(IID_PPV_ARGS(&previousSite_));
             result=site_->SetSite(static_cast<IServiceProvider*>(session_));
@@ -177,28 +181,45 @@ public:
             IShellItemArray* previous=*slot;*slot=snapshot.Detach();if(previous)previous->Release();
             ++gSelectionSnapshots;
         }
-        session_->ConfigureStandalone(owner,GetMenuItemCount(extra_.value)>0?extra_.value:nullptr,*point);
+        session_->ConfigureStandalone(owner,GetMenuItemCount(extra_.value)>0?extra_.value:nullptr,*point,
+            applications,applicationCount,intercept,before,beforeContext);
         const auto failures=menu_model_filter::failures.load();
+        outcome->phase=menu_dispatch::Presented;
         presenter_->DoContextMenu(menu,9,GUID{});
         if(menu_model_filter::failures.load()!=failures)return E_UNEXPECTED;
         // Keep Shell callbacks and XAML command objects alive until the native
-        // flyout dismisses. Legacy command IDs return to the owning fence.
-        while(IsWindow(owner)&&!session_->StandaloneDone()&&presenter_->IsContextMenuOpen()){
-            quit_=PumpPending();if(quit_.quit)break;
+        // completion callback. IsContextMenuOpen is already false while a click
+        // is still queued behind the closing animation.
+        bool aborted=false;
+        for(;;){
+            const auto wait=session_->StandaloneWait(IsWindow(owner)!=FALSE,quit_.quit,presenter_->IsContextMenuOpen()!=FALSE,GetTickCount64());
+            if(wait==menu_dispatch::Completion::Complete)break;
+            if(wait==menu_dispatch::Completion::Aborted){aborted=true;break;}
+            if(wait==menu_dispatch::Completion::TimedOut)return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            MSG message{};
+            if(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){
+                if(message.message==WM_QUIT){quit_.quit=true;quit_.exitCode=static_cast<int>(message.wParam);continue;}
+                TranslateMessage(&message);DispatchMessageW(&message);
+            }
             MsgWaitForMultipleObjectsEx(0,nullptr,20,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
         }
-        *choice=session_->StandaloneChoice();
-        if(*choice==UINT_MAX)*point=session_->StandalonePoint();
+        *outcome=aborted?menu_dispatch::Result{}:session_->StandaloneResult();
+        outcome->phase=(std::max)(outcome->phase,static_cast<uint32_t>(menu_dispatch::Presented));
+        if(outcome->kind==menu_dispatch::Expanded)*point=session_->StandalonePoint();
         return S_OK;
     }
 };
 } // namespace standalone_menu
 
 extern "C" HRESULT zs_menu_track_standalone(HWND owner,IContextMenu* context,HMENU menu,
-        UINT count,PCIDLIST_ABSOLUTE const* pidls,IShellItem* folder,BOOL background,POINT* point,UINT* choice) noexcept {
+        UINT count,PCIDLIST_ABSOLUTE const* pidls,IShellItem* folder,BOOL background,POINT* point,
+        const UINT* applications,UINT applicationCount,uint32_t intercept,
+        menu_dispatch::BeforeInvoke before,void* beforeContext,menu_dispatch::Result* outcome) noexcept {
+    if(!outcome)return E_POINTER;*outcome={};
     try{
         standalone_menu::Host host;
-        const HRESULT result=host.Track(owner,context,menu,count,pidls,folder,background!=FALSE,point,choice);
+        const HRESULT result=host.Track(owner,context,menu,count,pidls,folder,background!=FALSE,point,
+            applications,applicationCount,intercept,before,beforeContext,outcome);
         if(FAILED(result))InterlockedExchange(&gLastFailure,result);
         return result;
     }catch(const std::bad_alloc&){InterlockedExchange(&gLastFailure,E_OUTOFMEMORY);return E_OUTOFMEMORY;}

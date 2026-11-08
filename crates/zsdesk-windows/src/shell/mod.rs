@@ -1,6 +1,7 @@
 //! Native Windows Shell hosts used by the Explorer workspace and desktop fences.
 
 pub mod commands;
+pub mod file_transfer;
 mod events;
 mod explorer_browser;
 pub mod icons;

@@ -24,3 +24,14 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+Everything search engine
+========================
+Everything 1.4.1.1032 x64 standard (non-Lite) is redistributed as an unmodified
+official executable and language pack under engines/everything/.
+Official distribution: https://www.voidtools.com/Everything-1.4.1.1032.x64.zip
+Copyright (C) 2018 David Carpenter.
+The complete license, including the Perl-Compatible Regular Expressions
+copyright and redistribution terms, is included in
+packaging/licenses/Everything-1.4.1.1032-License.txt and in release packages as
+engines/everything/License.txt.

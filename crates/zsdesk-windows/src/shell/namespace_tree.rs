@@ -4,12 +4,12 @@
 //! folders. Known folders remain available on systems without that namespace.
 //! Roots use the Shell's group padding and DPI-scaled, comfortably spaced rows.
 
-use std::cell::RefCell;
+use std::{cell::{Cell, RefCell}, collections::HashMap, rc::{Rc,Weak}, time::{Duration,Instant}};
 
 use windows::{
     core::{implement, Error, Interface, Ref, Result, BOOL, HRESULT, PCWSTR, PWSTR},
     Win32::{
-        Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM},
+        Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::Gdi::{GetObjectW, HGDIOBJ, LOGFONTW},
         Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES,
         System::{
@@ -20,17 +20,18 @@ use windows::{
         },
         UI::{
             Controls::{TVGN_CARET, TVM_SELECTITEM, TVM_SETBKCOLOR, TVM_SETTEXTCOLOR, TVM_SETEXTENDEDSTYLE, TVM_SETINDENT,
-                TVM_SETITEMHEIGHT, TVS_EX_DOUBLEBUFFER},
+                TVM_SETITEMHEIGHT, TVS_EX_DOUBLEBUFFER, TVM_EXPAND, TVE_COLLAPSE},
             HiDpi::GetDpiForWindow,
+            Input::KeyboardAndMouse::{GetFocus, SetFocus, IsWindowEnabled},
             Shell::{
                 IContextMenu, INameSpaceTreeControl, INameSpaceTreeControl2, INameSpaceTreeControlEvents,
                 INameSpaceTreeControlEvents_Impl, IShellItem, IShellItemArray, IShellItemFilter, IShellItemFilter_Impl,
                 NamespaceTreeControl, SHGetFileInfoW, SHGetIDListFromObject, SHGetKnownFolderItem, NSTCECT_BUTTON,
+                DefSubclassProc, SetWindowSubclass, RemoveWindowSubclass,
                 NSTCECT_LBUTTON, NSTCECT_MBUTTON, NSTCEHT_ONITEM, NSTCEHT_ONITEMBUTTON, NSTCEHT_ONITEMINDENT,
                 NSTCEHT_ONITEMRIGHT, NSTCIS_EXPANDED, NSTCIS_SELECTED, NSTCIS_SELECTEDNOEXPAND, NSTCRS_EXPANDED, NSTCRS_VISIBLE,
-                SICHINT_CANONICAL,
+                SICHINT_CANONICAL, SICHINT_TEST_FILESYSPATH_IF_NOT_EQUAL, NSTCGNI_PARENT, NSTCGNI_NEXTVISIBLE,
                 NSTCS_AUTOHSCROLL, NSTCS_FULLROWSELECT, NSTCS_HASEXPANDOS, NSTCS_NOEDITLABELS,
-                NSTCGNI_NEXTVISIBLE, SICHINT_TEST_FILESYSPATH_IF_NOT_EQUAL,
                 NSTCS_SHOWSELECTIONALWAYS, NSTCS_FADEINOUTEXPANDOS, NSTCS_TABSTOP, NSTCS_ROOTHASEXPANDO,
                 NSTCS_ALLOWJUNCTIONS, NSTCS2_DISPLAYPADDING, NSTCS2_INTERRUPTNOTIFICATIONS,
                 NTSCS2_NOSINGLETONAUTOEXPAND,
@@ -39,8 +40,9 @@ use windows::{
                 FOLDERID_Music, FOLDERID_Videos, FOLDERID_RecycleBinFolder, FOLDERID_NetworkFolder,
                 KF_FLAG_DEFAULT,
             },
-            WindowsAndMessaging::{EnumChildWindows, FindWindowExW, GetClassNameW, GetClientRect, MoveWindow,
-                PostMessageW, ShowWindow, SW_HIDE, SW_SHOW, SendMessageW, WM_GETFONT},
+            WindowsAndMessaging::{EnumChildWindows, FindWindowExW, GetClassNameW, GetWindowRect, MoveWindow,
+                PostMessageW, ShowWindow, SW_HIDE, SW_SHOW, SendMessageW, WM_GETFONT,
+                IsChild, IsWindow, IsWindowVisible, SetTimer, KillTimer, WM_KEYDOWN, WM_SYSKEYDOWN, WM_NCDESTROY},
         },
     },
 };
@@ -52,6 +54,11 @@ use super::{
 };
 
 const S_FALSE: HRESULT = HRESULT(1);
+const SYNC_TIMER:usize=0x5a53_5359;
+
+thread_local! {
+    static PENDING_SYNCS:RefCell<HashMap<isize,Weak<PendingTreeSync>>>=RefCell::new(HashMap::new());
+}
 
 #[cfg(test)]
 thread_local! {
@@ -69,7 +76,10 @@ pub struct NamespaceTreeHost {
     _filter: IShellItemFilter,
     advise_cookie: u32,
     hwnd: HWND,
-    last_location: RefCell<Option<IShellItem>>,
+    last_location: Rc<RefCell<Option<IShellItem>>>,
+    last_auto_expand: Cell<bool>,
+    syncing: Rc<Cell<u32>>,
+    pending_sync:Rc<PendingTreeSync>,
 }
 
 impl NamespaceTreeHost {
@@ -119,10 +129,18 @@ impl NamespaceTreeHost {
             }
         }
 
-        let events: INameSpaceTreeControlEvents = TreeEvents { hwnd: parent.0 as isize }.into();
+        let syncing=Rc::new(Cell::new(0));
+        let last_location=Rc::new(RefCell::new(None));
+        let pending_sync=Rc::new(PendingTreeSync{tree:tree.clone(),hwnd,native_tree:Cell::new(HWND::default()),syncing:syncing.clone(),
+            generation:Rc::new(Cell::new(0)),request:RefCell::new(None),last_location:last_location.clone()});
+        let events: INameSpaceTreeControlEvents = TreeEvents { hwnd: parent.0 as isize, syncing: syncing.clone(),pending_sync:Rc::downgrade(&pending_sync) }.into();
         let advise_cookie = unsafe { tree.TreeAdvise(&events)? };
-        let host = Self { tree, events, _filter: filter, advise_cookie, hwnd, last_location: RefCell::new(None) };
+        PENDING_SYNCS.with(|pending|{pending.borrow_mut().insert(hwnd.0 as isize,Rc::downgrade(&pending_sync));});
+        let host = Self { tree, events, _filter: filter, advise_cookie, hwnd, last_location,
+            last_auto_expand: Cell::new(false), syncing,pending_sync };
         if let Some(view) = host.tree_view() {
+            unsafe {SetWindowSubclass(view,Some(tree_sync_subclass),SYNC_TIMER,hwnd.0 as usize)}.ok()?;
+            host.pending_sync.native_tree.set(view);
             unsafe { SendMessageW(view, TVM_SETEXTENDEDSTYLE, Some(WPARAM(TVS_EX_DOUBLEBUFFER as usize)), Some(LPARAM(TVS_EX_DOUBLEBUFFER as isize))); }
         }
         host.apply_metrics();
@@ -190,104 +208,87 @@ impl NamespaceTreeHost {
         if !self.hwnd.0.is_null() { let _ = unsafe { ShowWindow(self.hwnd, if visible { SW_SHOW } else { SW_HIDE }) }; }
     }
 
-    /// Follows a navigation made outside the tree (file view, address bar,
-    /// history, tabs), the way Explorer's navigation pane does.
-    ///
-    /// A folder that is already on screen (a Quick access entry, a root, or a
-    /// child of a branch the user opened) is selected without opening
-    /// anything. Otherwise the tree is only expanded down to the folder when
-    /// Explorer's "展开到打开的文件夹" option is on; with it off (the Windows
-    /// default) the tree keeps its shape and simply drops the selection.
+    /// Synchronizes a visible item without opening collapsed branches.
     ///
     /// # Safety
     ///
     /// Must be called on the STA/UI thread that created this host while its COM
     /// apartment remains initialized.
     pub unsafe fn select_location(&self, location: &ShellLocation) {
+        unsafe { self.select_location_with_policy(location,Self::system_auto_expand()); }
+    }
+
+    /// `auto_expand` permits expanding the destination's ancestors. Sync never
+    /// navigates the right pane or transfers keyboard focus to this tree.
+    ///
+    /// # Safety
+    /// Must be called on the creating STA while the host and its parent live.
+    pub unsafe fn select_location_with_policy(&self, location: &ShellLocation, auto_expand: bool) {
+        self.pending_sync.cancel();
+        let _sync=TreeSyncScope::new(self.hwnd,self.syncing.clone(),self.pending_sync.generation.clone());
         let Ok(item) = (unsafe { shell_item(location) }) else { self.clear_selection(); return };
-        let previous = self.last_location.borrow().clone();
-        if previous.as_ref().is_some_and(|previous| unsafe { previous.Compare(&item, SICHINT_CANONICAL.0 as u32) }.is_ok_and(|order| order == 0)) {
-            return;
-        }
-        // Only rows the tree is showing qualify: selecting one hidden under a
-        // collapsed branch would open that branch. Quick access rows are
-        // different shell items for the same folder, so match by path too.
-        if let Some(row) = unsafe { self.shown_row(&item) } {
-            if unsafe { self.select(&row) } {
-                unsafe { self.reveal_selection(&row); }
+        self.last_auto_expand.set(auto_expand);
+        // Prefer an existing Quick access entry instead of expanding the same
+        // folder again beneath its drive and pushing quick links off-screen.
+        if let Some(row)=unsafe {self.shown_row(&item)} {
+            if unsafe {self.select_exposed(&row)} {
                 *self.last_location.borrow_mut() = Some(item);
                 return;
             }
         }
-        if !expand_to_open_folder() {
-            self.clear_selection();
-            return;
-        }
+        if !auto_expand {self.clear_selection();return;}
         let mut chain = Vec::new();
         let mut cursor = unsafe { item.GetParent() };
         while let Ok(parent) = cursor {
+            let exposed=unsafe {self.item_is_exposed(&parent)};
             cursor = unsafe { parent.GetParent() };
             chain.push(parent);
-            if chain.len() > 64 { break; }
+            // A visible shortcut/root is the anchor. Expanding beyond it would
+            // also open a second copy of the path beneath This PC.
+            if exposed || chain.len() >= 64 { break; }
         }
-        unsafe {
-            for ancestor in chain.iter().rev() {
-                let _ = self.tree.SetItemState(ancestor, NSTCIS_EXPANDED.0 as u32, NSTCIS_EXPANDED.0 as u32);
-            }
-            if self.select(&item) {
-                self.reveal_selection(&item);
-                *self.last_location.borrow_mut() = Some(item);
-            } else {
-                // Archives and other filtered folders have no row.
-                self.clear_selection();
-            }
-        }
+        self.pending_sync.begin(item,chain);
     }
 
-    /// Records a navigation started by clicking the tree. The clicked row is
-    /// already selected by the tree itself and must stay as the user left it:
-    /// no re-selection (which could jump to a duplicate row) and no expanding.
-    ///
+    /// Leaves a clicked tree row intact when its navigation completes.
     /// # Safety
-    ///
-    /// Must be called on the STA/UI thread that created this host while its COM
-    /// apartment remains initialized.
-    pub unsafe fn adopt_location(&self, location: &ShellLocation) {
-        *self.last_location.borrow_mut() = unsafe { shell_item(location) }.ok();
+    /// Call on the creating STA while its COM apartment remains initialized.
+    pub unsafe fn adopt_location(&self,location:&ShellLocation) {
+        self.pending_sync.cancel();
+        *self.last_location.borrow_mut()=unsafe {shell_item(location)}.ok();
     }
 
-    /// First displayed row (every ancestor expanded) for the same folder as `item`.
-    unsafe fn shown_row(&self, item: &IShellItem) -> Option<IShellItem> {
-        let hint = (SICHINT_CANONICAL.0 | SICHINT_TEST_FILESYSPATH_IF_NOT_EQUAL.0) as u32;
-        let mut row = unsafe { self.tree.GetRootItems().and_then(|roots| roots.GetItemAt(0)) }.ok();
-        // Bounded walk; a tree that size is far beyond any real expansion.
+    unsafe fn shown_row(&self,item:&IShellItem)->Option<IShellItem> {
+        let hint=(SICHINT_CANONICAL.0|SICHINT_TEST_FILESYSPATH_IF_NOT_EQUAL.0)as u32;
+        let mut row=unsafe {self.tree.GetRootItems().and_then(|items|items.GetItemAt(0))}.ok();
         for _ in 0..4096 {
-            let current = row?;
-            if unsafe { current.Compare(item, hint) }.is_ok_and(|order| order == 0) { return Some(current); }
-            row = unsafe { self.tree.GetNextItem(&current, NSTCGNI_NEXTVISIBLE) }.ok();
+            let current=row?;
+            if unsafe {current.Compare(item,hint)}.is_ok_and(|order|order==0){return Some(current);}
+            row=unsafe {self.tree.GetNextItem(&current,NSTCGNI_NEXTVISIBLE)}.ok();
         }
         None
     }
 
-    unsafe fn select(&self, item: &IShellItem) -> bool {
-        let selected = NSTCIS_SELECTED.0 as u32;
-        unsafe { self.tree.SetItemState(item, NSTCIS_SELECTEDNOEXPAND.0 as u32, NSTCIS_SELECTEDNOEXPAND.0 as u32) }.is_ok()
-            && unsafe { self.tree.GetItemState(item, selected) }.is_ok_and(|state| state & selected != 0)
-    }
-
     fn clear_selection(&self) {
-        *self.last_location.borrow_mut() = None;
-        if let Some(view) = self.tree_view() {
-            unsafe { SendMessageW(view, TVM_SELECTITEM, Some(WPARAM(TVGN_CARET as usize)), Some(LPARAM(0))); }
+        *self.last_location.borrow_mut()=None;
+        if let Some(view)=self.tree_view() {
+            unsafe {SendMessageW(view,TVM_SELECTITEM,Some(WPARAM(TVGN_CARET as usize)),Some(LPARAM(0)));}
         }
     }
 
-    unsafe fn reveal_selection(&self, item: &IShellItem) {
-        let mut client = RECT::default();
-        let _ = unsafe { GetClientRect(self.hwnd, &mut client) };
-        let visible = unsafe { self.tree.GetItemRect(item) }.is_ok_and(|rect|
-            rect.bottom > rect.top && rect.top >= 0 && rect.bottom <= client.bottom);
-        if !visible { let _ = unsafe { self.tree.EnsureItemVisible(item) }; }
+    pub fn system_auto_expand()->bool {
+        let mut value=0u32;let mut size=4u32;
+        let result=unsafe {RegGetValueW(HKEY_CURRENT_USER,windows::core::w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"),
+            windows::core::w!("NavPaneExpandToCurrentFolder"),RRF_RT_REG_DWORD,None,Some((&mut value as *mut u32).cast()),Some(&mut size))};
+        result.is_ok() && value!=0
+    }
+
+    unsafe fn select_exposed(&self,item:&IShellItem)->bool {
+        unsafe {select_exposed(&self.tree,self.hwnd,item)}
+    }
+
+    unsafe fn item_is_exposed(&self,item:&IShellItem)->bool {
+        unsafe {item_is_exposed(&self.tree,item)}
     }
 
     /// Disconnects the namespace tree event sink.
@@ -297,18 +298,146 @@ impl NamespaceTreeHost {
     /// Must be called exactly once on the STA/UI thread that created this host,
     /// before the COM apartment is uninitialized.
     pub unsafe fn destroy(&self) {
+        self.pending_sync.cancel();
+        let view=self.pending_sync.native_tree.replace(HWND::default());
+        if !view.0.is_null() {let _=unsafe {RemoveWindowSubclass(view,Some(tree_sync_subclass),SYNC_TIMER)};}
+        PENDING_SYNCS.with(|pending|{
+            let mut pending=pending.borrow_mut();
+            if pending.get(&(self.hwnd.0 as isize)).is_some_and(|state|Weak::ptr_eq(state,&Rc::downgrade(&self.pending_sync))) {
+                pending.remove(&(self.hwnd.0 as isize));
+            }
+        });
         let _keep_events_alive = &self.events;
         let _ = unsafe { self.tree.TreeUnadvise(self.advise_cookie) };
     }
 }
 
-/// Explorer's 文件夹选项 › 导航窗格 › "展开到打开的文件夹" (off unless set).
-fn expand_to_open_folder() -> bool {
-    let mut value = 0u32;
-    let mut size = 4u32;
-    let ok = unsafe { RegGetValueW(HKEY_CURRENT_USER, windows::core::w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"),
-        windows::core::w!("NavPaneExpandToCurrentFolder"), RRF_RT_REG_DWORD, None, Some((&mut value as *mut u32).cast()), Some(&mut size)) }.is_ok();
-    ok && value != 0
+struct TreeSyncRequest {
+    item:IShellItem,
+    ancestors:Vec<IShellItem>,
+    expansion_requested:Vec<bool>,
+    deadline:Instant,
+    attempts:u32,
+}
+
+struct PendingTreeSync {
+    tree:INameSpaceTreeControl,
+    hwnd:HWND,
+    native_tree:Cell<HWND>,
+    syncing:Rc<Cell<u32>>,
+    generation:Rc<Cell<u64>>,
+    request:RefCell<Option<TreeSyncRequest>>,
+    last_location:Rc<RefCell<Option<IShellItem>>>,
+}
+
+impl PendingTreeSync {
+    fn stop_timer(&self) {
+        let owned=PENDING_SYNCS.with(|pending|pending.borrow().get(&(self.hwnd.0 as isize))
+            .is_some_and(|state|state.as_ptr()==self as *const Self));
+        if owned {let _=unsafe {KillTimer(Some(self.hwnd),SYNC_TIMER)};}
+    }
+    fn cancel(&self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
+        self.request.borrow_mut().take();self.stop_timer();
+    }
+    fn begin(&self,item:IShellItem,ancestors:Vec<IShellItem>) {
+        let expansion_requested=vec![false;ancestors.len()];
+        *self.request.borrow_mut()=Some(TreeSyncRequest{item,ancestors,expansion_requested,
+            deadline:Instant::now()+Duration::from_secs(5),attempts:0});
+        self.advance();
+    }
+    fn advance(&self) {
+        // COM can pump messages. Never hold a request borrow across native calls;
+        // a new navigation, click or collapse must be able to cancel this work.
+        let Some(mut request)=self.request.borrow_mut().take() else {self.stop_timer();return;};
+        if Instant::now()>=request.deadline || request.attempts>=100 || !unsafe {IsWindow(Some(self.hwnd))}.as_bool() {
+            self.stop_timer();return;
+        }
+        request.attempts+=1;
+        let generation=self.generation.get();
+        let _sync=TreeSyncScope::new(self.hwnd,self.syncing.clone(),self.generation.clone());
+        // NamespaceTreeControl materializes each level asynchronously. Request a
+        // level once and let its native enumeration finish before descending.
+        for index in (0..request.ancestors.len()).rev() {
+            if self.generation.get()!=generation {return;}
+            let ancestor=&request.ancestors[index];
+            let state=unsafe {self.tree.GetItemState(ancestor,NSTCIS_EXPANDED.0 as u32)};
+            let Ok(state)=state else {break;};
+            if state&NSTCIS_EXPANDED.0 as u32==0 {
+                if !request.expansion_requested[index] {
+                    let result=unsafe {self.tree.SetItemState(ancestor,NSTCIS_EXPANDED.0 as u32,NSTCIS_EXPANDED.0 as u32)};
+                    request.expansion_requested[index]=result.is_ok();
+                    #[cfg(test)]
+                    eprintln!("tree-sync async expand attempt={} item={:?} result={result:?}",request.attempts,unsafe {location_from_shell_item(ancestor)});
+                }
+                break;
+            }
+        }
+        if self.generation.get()!=generation {return;}
+        if unsafe {select_exposed(&self.tree,self.hwnd,&request.item)} {
+            if self.generation.get()==generation {*self.last_location.borrow_mut()=Some(request.item);self.stop_timer();}
+            return;
+        }
+        if self.generation.get()!=generation {return;}
+        // While descendants load, keep the nearest exposed ancestor selected.
+        for ancestor in &request.ancestors {
+            if unsafe {select_exposed(&self.tree,self.hwnd,ancestor)} {
+                if self.generation.get()==generation {*self.last_location.borrow_mut()=Some(ancestor.clone());}
+                break;
+            }
+            if self.generation.get()!=generation {return;}
+        }
+        if self.generation.get()!=generation {return;}
+        *self.request.borrow_mut()=Some(request);
+        if unsafe {SetTimer(Some(self.hwnd),SYNC_TIMER,50,Some(tree_sync_timer))}==0 {self.request.borrow_mut().take();}
+    }
+}
+
+unsafe extern "system" fn tree_sync_timer(hwnd:HWND,_message:u32,id:usize,_time:u32) {
+    if id!=SYNC_TIMER {return;}
+    let pending=PENDING_SYNCS.with(|pending|pending.borrow().get(&(hwnd.0 as isize)).and_then(Weak::upgrade));
+    if let Some(pending)=pending {pending.advance();}
+}
+
+unsafe extern "system" fn tree_sync_subclass(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM,id:usize,reference:usize)->LRESULT {
+    let pending=PENDING_SYNCS.with(|pending|pending.borrow().get(&(reference as isize)).and_then(Weak::upgrade));
+    if let Some(pending)=pending.filter(|pending|pending.native_tree.get()==hwnd) {
+        // Native SetItemState collapse does not consistently raise the namespace
+        // state-changing event. Observe the underlying TreeView command instead.
+        // TVE_TOGGLE also contains COLLAPSE's bit and represents a user decision.
+        if message==TVM_EXPAND && wp.0&TVE_COLLAPSE.0 as usize!=0 {
+            #[cfg(test)]
+            eprintln!("tree-sync native-collapse flags={} pending={}",wp.0,pending.request.borrow().is_some());
+            pending.cancel();
+        }
+        if message==WM_NCDESTROY {pending.cancel();pending.native_tree.set(HWND::default());}
+    }
+    if message==WM_NCDESTROY {let _=unsafe {RemoveWindowSubclass(hwnd,Some(tree_sync_subclass),id)};}
+    unsafe {DefSubclassProc(hwnd,message,wp,lp)}
+}
+
+unsafe fn item_is_exposed(tree:&INameSpaceTreeControl,item:&IShellItem)->bool {
+    if !unsafe {tree.GetItemRect(item)}.is_ok_and(|rect|rect.bottom>rect.top) {return false;}
+    let mut cursor=item.clone();
+    for _ in 0..64 {
+        let Ok(parent)=(unsafe {tree.GetNextItem(&cursor,NSTCGNI_PARENT)}) else {return true;};
+        if !unsafe {tree.GetItemState(&parent,NSTCIS_EXPANDED.0 as u32)}.is_ok_and(|state|state&NSTCIS_EXPANDED.0 as u32!=0) {return false;}
+        cursor=parent;
+    }
+    false
+}
+
+unsafe fn select_exposed(tree:&INameSpaceTreeControl,hwnd:HWND,item:&IShellItem)->bool {
+    if !unsafe {item_is_exposed(tree,item)} {return false;}
+    let selected=unsafe {tree.GetItemState(item,NSTCIS_SELECTED.0 as u32)}.is_ok_and(|state|state&NSTCIS_SELECTED.0 as u32!=0);
+    if !selected && (unsafe {tree.SetItemState(item,NSTCIS_SELECTEDNOEXPAND.0 as u32,NSTCIS_SELECTEDNOEXPAND.0 as u32)}.is_err()
+        || !unsafe {tree.GetItemState(item,NSTCIS_SELECTED.0 as u32)}.is_ok_and(|state|state&NSTCIS_SELECTED.0 as u32!=0)) {return false;}
+    let mut bounds=RECT::default();
+    // GetItemRect reports screen coordinates, including for offscreen hosts.
+    let visible=unsafe {GetWindowRect(hwnd,&mut bounds)}.is_ok() && unsafe {tree.GetItemRect(item)}.is_ok_and(|rect|
+        rect.bottom>rect.top && rect.top>=bounds.top && rect.bottom<=bounds.bottom);
+    if !visible {let _=unsafe {tree.EnsureItemVisible(item)};}
+    true
 }
 
 fn scale(value: i32, dpi: u32) -> i32 {
@@ -358,15 +487,40 @@ impl IShellItemFilter_Impl for FolderFilter_Impl {
 #[implement(INameSpaceTreeControlEvents)]
 struct TreeEvents {
     hwnd: isize,
+    syncing: Rc<Cell<u32>>,
+    pending_sync:Weak<PendingTreeSync>,
 }
 
 impl TreeEvents {
+    fn cancel_sync(&self) {if let Some(pending)=self.pending_sync.upgrade(){pending.cancel();}}
     fn post_item(&self, item: &IShellItem, new_tab: bool) {
         let Some(location) = (unsafe { location_from_shell_item(item) }) else { return };
         let location = Box::into_raw(Box::new(location));
         if unsafe { PostMessageW(Some(HWND(self.hwnd as *mut _)), WM_TREE_NAVIGATE, WPARAM(new_tab as usize), LPARAM(location as isize)) }.is_err() {
             unsafe { drop(Box::from_raw(location)); }
         }
+    }
+}
+
+struct TreeSyncScope { tree: HWND, previous_focus: HWND, syncing: Rc<Cell<u32>>, generation:Rc<Cell<u64>>, initial_generation:u64 }
+impl TreeSyncScope {
+    fn new(tree:HWND,syncing:Rc<Cell<u32>>,generation:Rc<Cell<u64>>)->Self {
+        syncing.set(syncing.get().saturating_add(1));
+        let initial_generation=generation.get();
+        Self {tree,previous_focus:unsafe{GetFocus()},syncing,generation,initial_generation}
+    }
+}
+impl Drop for TreeSyncScope {
+    fn drop(&mut self) {
+        let current=unsafe {GetFocus()};
+        if self.generation.get()==self.initial_generation && current!=self.previous_focus
+            && (current==self.tree || unsafe {IsChild(self.tree,current)}.as_bool()) {
+            let previous=self.previous_focus;
+            let target=(!previous.0.is_null() && unsafe {IsWindow(Some(previous))}.as_bool()
+                && unsafe {IsWindowVisible(previous)}.as_bool() && unsafe {IsWindowEnabled(previous)}.as_bool()).then_some(previous);
+            let _=unsafe {SetFocus(target)};
+        }
+        self.syncing.set(self.syncing.get().saturating_sub(1));
     }
 }
 
@@ -401,6 +555,9 @@ unsafe fn system_icon_indices(item: &IShellItem) -> Option<(i32, i32)> {
 #[allow(non_snake_case)]
 impl INameSpaceTreeControlEvents_Impl for TreeEvents_Impl {
     fn OnItemClick(&self, shell_item: Ref<IShellItem>, hit_test: u32, click_type: u32) -> Result<()> {
+        // Click events represent actual input; unlike selection notifications,
+        // they must override any pending programmatic synchronization.
+        self.cancel_sync();
         #[cfg(test)]
         CLICK_TRACE.with(|trace| trace.borrow_mut().push((hit_test, click_type,
             unsafe { windows::Win32::UI::WindowsAndMessaging::GetMessagePos() })));
@@ -413,10 +570,16 @@ impl INameSpaceTreeControlEvents_Impl for TreeEvents_Impl {
         Err(Error::from_hresult(S_FALSE))
     }
     fn OnPropertyItemCommit(&self, _item: Ref<IShellItem>) -> Result<()> { Err(Error::from_hresult(S_FALSE)) }
-    fn OnItemStateChanging(&self, _item: Ref<IShellItem>, _mask: u32, _state: u32) -> Result<()> { Ok(()) }
+    fn OnItemStateChanging(&self, _item: Ref<IShellItem>, mask: u32, state: u32) -> Result<()> {
+        if self.syncing.get()==0 && mask&NSTCIS_EXPANDED.0 as u32!=0 && state&NSTCIS_EXPANDED.0 as u32==0 {self.cancel_sync();}
+        Ok(())
+    }
     fn OnItemStateChanged(&self, _item: Ref<IShellItem>, _mask: u32, _state: u32) -> Result<()> { Ok(()) }
     fn OnSelectionChanged(&self, _selection: Ref<IShellItemArray>) -> Result<()> { Ok(()) }
-    fn OnKeyboardInput(&self, _message: u32, _wparam: WPARAM, _lparam: LPARAM) -> Result<()> { Err(Error::from_hresult(S_FALSE)) }
+    fn OnKeyboardInput(&self, message: u32, _wparam: WPARAM, _lparam: LPARAM) -> Result<()> {
+        if message==WM_KEYDOWN || message==WM_SYSKEYDOWN {self.cancel_sync();}
+        Err(Error::from_hresult(S_FALSE))
+    }
     fn OnBeforeExpand(&self, _item: Ref<IShellItem>) -> Result<()> { Ok(()) }
     fn OnAfterExpand(&self, _item: Ref<IShellItem>) -> Result<()> { Ok(()) }
     fn OnBeginLabelEdit(&self, _item: Ref<IShellItem>) -> Result<()> { Ok(()) }
@@ -476,5 +639,104 @@ mod tests {
         assert_eq!(navigation_click(hit, (NSTCECT_RBUTTON.0 | NSTCECT_DBLCLICK.0) as u32), None);
         assert_eq!(navigation_click(hit, NSTCECT_RBUTTON.0 as u32), None);
         assert_eq!(navigation_click(hit, 0), None);
+    }
+
+    #[test]
+    #[ignore="Local Shell focus/expansion regression; requires ZSDESK_NATIVE_TEST_OUTPUT"]
+    fn navigation_sync_preserves_focus_and_expansion_policy()->std::result::Result<(),Box<dyn std::error::Error>> {
+        use windows::Win32::{Foundation::{HINSTANCE,LRESULT}, System::{LibraryLoader::GetModuleHandleW,Ole::{OleInitialize,OleUninitialize}},UI::WindowsAndMessaging::*};
+        use std::{path::PathBuf,time::{Duration,Instant},thread};
+        thread_local! {static NAVIGATIONS:Cell<u32>=const {Cell::new(0)};}
+        unsafe extern "system" fn owner_proc(window:HWND,message:u32,wp:WPARAM,lp:LPARAM)->LRESULT {
+            if message==WM_TREE_NAVIGATE {
+                if lp.0!=0 {unsafe {drop(Box::from_raw(lp.0 as*mut ShellLocation));}}
+                NAVIGATIONS.with(|n|n.set(n.get()+1));return LRESULT(0);
+            }
+            unsafe {DefWindowProcW(window,message,wp,lp)}
+        }
+        fn pump_for(milliseconds:u64){let start=Instant::now();while start.elapsed()<Duration::from_millis(milliseconds){let mut message=MSG::default();while unsafe{PeekMessageW(&mut message,None,0,0,PM_REMOVE)}.as_bool(){unsafe{let _=TranslateMessage(&message);DispatchMessageW(&message);}}thread::sleep(Duration::from_millis(4));}}
+        fn pump(){pump_for(120);}
+        fn trace(host:&NamespaceTreeHost,stage:&str,items:&[(&str,&IShellItem)]) {
+            let selected=unsafe {host.tree.GetSelectedItems()}.ok().map(|items|(0..unsafe {items.GetCount()}.unwrap_or(0))
+                .filter_map(|index|unsafe {items.GetItemAt(index)}.ok()).filter_map(|item|unsafe {location_from_shell_item(&item)}).collect::<Vec<_>>());
+            eprintln!("tree-sync stage={stage} selected={selected:?} pending={}",host.pending_sync.request.borrow().is_some());
+            for (label,item) in items {eprintln!("tree-sync stage={stage} item={label} state={:?} rect={:?} exposed={}",
+                unsafe {host.tree.GetItemState(*item,(NSTCIS_EXPANDED.0|NSTCIS_SELECTED.0|NSTCIS_SELECTEDNOEXPAND.0)as u32)},
+                unsafe {host.tree.GetItemRect(*item)},unsafe {host.item_is_exposed(item)});}
+        }
+        struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}
+        struct Window(HWND);impl Drop for Window{fn drop(&mut self){let _=unsafe{DestroyWindow(self.0)};}}
+        let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").ok_or("set native test output")?);
+        assert!(output.is_absolute(),"native test output must be absolute");
+        let fixture=output.join("tree-sync-fixture");let branch=fixture.join("branch");let target=branch.join("target");
+        let target_child=target.join("child");let unrelated=fixture.join("unrelated");let unrelated_child=unrelated.join("child");
+        std::fs::create_dir_all(&target_child)?;std::fs::create_dir_all(&unrelated_child)?;
+        struct Dirs(Vec<PathBuf>);impl Drop for Dirs{fn drop(&mut self){for directory in self.0.iter().rev(){let _=std::fs::remove_dir(directory);}}}
+        let _directories=Dirs(vec![fixture.clone(),branch.clone(),target.clone(),target_child,unrelated.clone(),unrelated_child]);
+        let foreground=unsafe{GetForegroundWindow()};
+        unsafe{OleInitialize(None)?;}let apartment=Apartment;
+        let instance=HINSTANCE(unsafe{GetModuleHandleW(None)?}.0);
+        let class=windows::core::w!("ZSDesk.Tree.SyncRegression");
+        let wc=WNDCLASSW{lpfnWndProc:Some(owner_proc),hInstance:instance,lpszClassName:class,..Default::default()};unsafe{RegisterClassW(&wc);}
+        let x=unsafe{GetSystemMetrics(SM_XVIRTUALSCREEN)+GetSystemMetrics(SM_CXVIRTUALSCREEN)}+1000;
+        let y=unsafe{GetSystemMetrics(SM_YVIRTUALSCREEN)+GetSystemMetrics(SM_CYVIRTUALSCREEN)}+1000;
+        let owner=Window(unsafe{CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,class,windows::core::w!("tree sync"),WS_POPUP,x,y,520,600,None,None,Some(instance),None)?});
+        let host=unsafe{NamespaceTreeHost::create(owner.0,RECT{left:0,top:0,right:280,bottom:570})?};
+        unsafe{host.tree.RemoveAllRoots()?;}
+        let root_item=unsafe{shell_item(&ShellLocation::Path(fixture.clone()))?};
+        unsafe{host.tree.AppendRoot(&root_item,SHCONTF_FOLDERS.0 as u32,NSTCRS_VISIBLE.0 as u32,&host._filter)?;}
+        let edit=unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),windows::core::w!("EDIT"),windows::core::w!("focus stays here"),WS_CHILD|WS_VISIBLE,300,20,200,24,Some(owner.0),None,Some(instance),None)?};
+        unsafe{let _=ShowWindow(owner.0,SW_SHOWNOACTIVATE);let _=SetFocus(Some(edit));}pump();
+        assert!(unsafe{GetFocus()}==edit,"owned edit did not receive focus");
+        NAVIGATIONS.with(|n|n.set(0));
+        let location=ShellLocation::Path(target.clone());
+        let branch_item=unsafe{shell_item(&ShellLocation::Path(branch.clone()))?};
+        let target_item=unsafe{shell_item(&location)?};
+        let unrelated_item=unsafe{shell_item(&ShellLocation::Path(unrelated))?};
+        let trace_items=[("root",&root_item),("branch",&branch_item),("target",&target_item),("unrelated",&unrelated_item)];
+        trace(&host,"before-default",&trace_items);
+        unsafe{host.select_location_with_policy(&location,false);}pump();
+        trace(&host,"after-default",&trace_items);
+        assert!(unsafe{host.tree.GetItemState(&root_item,NSTCIS_EXPANDED.0 as u32)?}&NSTCIS_EXPANDED.0 as u32==0,"default synchronization expanded a branch");
+        assert!(unsafe{host.tree.GetItemState(&root_item,NSTCIS_SELECTED.0 as u32)?}&NSTCIS_SELECTED.0 as u32==0,"outside navigation selected an unrelated ancestor");
+        assert!(unsafe{GetFocus()}==edit,"default synchronization stole focus");
+        unsafe{host.select_location_with_policy(&location,true);}
+        trace(&host,"auto-immediate",&trace_items);
+        let started=Instant::now();while host.pending_sync.request.borrow().is_some() && started.elapsed()<Duration::from_secs(3) {pump();}
+        trace(&host,"auto-pumped",&trace_items);
+        let selected_by_production=unsafe{host.tree.GetItemState(&target_item,NSTCIS_SELECTED.0 as u32)?}&NSTCIS_SELECTED.0 as u32!=0;
+        assert!(selected_by_production,"explicit auto expansion did not select its destination");
+        assert!(host.pending_sync.request.borrow().is_none(),"successful synchronization retained a retry");
+        assert!(unsafe{host.tree.GetItemState(&target_item,NSTCIS_EXPANDED.0 as u32)?}&NSTCIS_EXPANDED.0 as u32==0,"synchronization expanded the destination itself");
+        assert!(unsafe{host.tree.GetItemState(&unrelated_item,NSTCIS_EXPANDED.0 as u32)?}&NSTCIS_EXPANDED.0 as u32==0,"synchronization expanded an unrelated branch");
+        assert!(unsafe{GetFocus()}==edit,"expanded synchronization stole focus");
+        assert!(NAVIGATIONS.with(Cell::get)==0,"programmatic synchronization navigated the right pane");
+        let fresh=||->Result<()> {host.pending_sync.cancel();unsafe {host.tree.RemoveAllRoots()?;
+            host.tree.AppendRoot(&root_item,SHCONTF_FOLDERS.0 as u32,NSTCRS_VISIBLE.0 as u32,&host._filter)?;}
+            *host.last_location.borrow_mut()=None;pump();unsafe {host.select_location_with_policy(&location,true);}
+            assert!(host.pending_sync.request.borrow().is_some(),"cancellation fixture did not enter asynchronous loading");Ok(())};
+        fresh()?;
+        let _=unsafe {host.events.OnItemClick(&root_item,NSTCEHT_ONITEMBUTTON.0 as u32,NSTCECT_LBUTTON.0 as u32)};
+        pump();trace(&host,"cancel-click",&trace_items);
+        assert!(host.pending_sync.request.borrow().is_none(),"user tree click retained a pending sync");
+        assert!(unsafe {host.tree.GetItemState(&target_item,NSTCIS_SELECTED.0 as u32)}.unwrap_or(0)&NSTCIS_SELECTED.0 as u32==0,"click cancellation later selected the old destination");
+        fresh()?;
+        let _=unsafe {host.events.OnKeyboardInput(WM_KEYDOWN,WPARAM(0x28),LPARAM(0))};
+        pump();assert!(host.pending_sync.request.borrow().is_none(),"keyboard input retained a pending sync");
+        fresh()?;
+        let started=Instant::now();while unsafe {host.tree.GetItemState(&root_item,NSTCIS_EXPANDED.0 as u32)}.unwrap_or(0)&NSTCIS_EXPANDED.0 as u32==0
+            && started.elapsed()<Duration::from_secs(2) {pump_for(5);}
+        assert!(host.pending_sync.request.borrow().is_some(),"collapse fixture finished before user cancellation");
+        unsafe {host.tree.SetItemState(&root_item,NSTCIS_EXPANDED.0 as u32,0)?;}
+        pump();trace(&host,"cancel-collapse",&trace_items);
+        assert!(host.pending_sync.request.borrow().is_none(),"user collapse retained a pending sync");
+        assert!(unsafe {host.tree.GetItemState(&root_item,NSTCIS_EXPANDED.0 as u32)?}&NSTCIS_EXPANDED.0 as u32==0,"cancelled sync reopened the collapsed root");
+        assert!(unsafe {GetFocus()}==edit,"cancelled sync stole focus");
+        assert!(NAVIGATIONS.with(Cell::get)==0,"structural cancellation navigated the right pane");
+        fresh()?;let tree_hwnd=host.hwnd.0 as isize;
+        drop(host);assert!(PENDING_SYNCS.with(|pending|!pending.borrow().contains_key(&tree_hwnd)),"destroyed tree retained its retry route");
+        drop(owner);pump();drop(apartment);
+        assert!(foreground==unsafe{GetForegroundWindow()},"foreground changed during tree regression");
+        Ok(())
     }
 }

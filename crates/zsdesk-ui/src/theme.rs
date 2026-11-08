@@ -86,7 +86,21 @@ impl Palette {
         }
     }
 
-    pub const fn for_mode(mode: Mode) -> Self { match mode { Mode::Light => Self::light(), Mode::Dark => Self::dark() } }
+    pub fn for_mode(mode: Mode) -> Self {
+        let mut palette=match mode { Mode::Light => Self::light(), Mode::Dark => Self::dark() };
+        if let Some(native)=high_contrast_palette(mode){
+            let role=|value|native.resolve(value);
+            palette.strip=role(ColorRole::Surface);palette.layer=role(ColorRole::SurfaceRaised);palette.content=role(ColorRole::Surface);
+            palette.text=role(ColorRole::PrimaryText);palette.text_secondary=role(ColorRole::SecondaryText);palette.text_disabled=role(ColorRole::DisabledText);
+            palette.accent=role(ColorRole::Accent);palette.accent_text=role(ColorRole::AccentText);
+            palette.hover=role(ColorRole::Control);palette.pressed=role(ColorRole::Control);
+            palette.input=role(ColorRole::Surface);palette.input_focused=role(ColorRole::Surface);
+            palette.input_border=role(ColorRole::Border);palette.input_underline=role(ColorRole::StrongStroke);
+            palette.stroke=role(ColorRole::Border);palette.divider=role(ColorRole::Border);palette.danger=role(ColorRole::Danger);
+            palette.inactive_tab_separator=role(ColorRole::StrongStroke);
+        }
+        palette
+    }
 
     /// Resolves a ZSUI semantic role.
     pub const fn role(&self, role: ColorRole) -> Color {
@@ -128,6 +142,16 @@ pub struct FencePalette {
 impl FencePalette {
     /// `opacity` is the background opacity in percent (10–100).
     pub fn new(mode: Mode, opacity: u8) -> Self {
+        if let Some(native)=high_contrast_palette(mode){
+            let role=|value|native.resolve(value);
+            return Self{background:role(ColorRole::Surface),title:role(ColorRole::SurfaceRaised),border:role(ColorRole::StrongStroke),
+                text:role(ColorRole::PrimaryText),text_secondary:role(ColorRole::SecondaryText),text_shadow:Color::rgba(0,0,0,0),
+                hover:role(ColorRole::Control),chip:role(ColorRole::Control),selected:role(ColorRole::Surface),
+                selected_border:role(ColorRole::Accent),accent:role(ColorRole::Accent)};
+        }
+        Self::configured(mode,opacity)
+    }
+    fn configured(mode:Mode,opacity:u8)->Self{
         let a = (opacity.clamp(10, 100) as u32 * 255 / 100) as u8;
         match mode {
             Mode::Dark => Self {
@@ -158,6 +182,11 @@ impl FencePalette {
             },
         }
     }
+}
+
+fn high_contrast_palette(mode:Mode)->Option<zsui::PlatformPalette>{
+    let mode=match mode{Mode::Light=>zsui::ZsuiThemeMode::Light,Mode::Dark=>zsui::ZsuiThemeMode::Dark};
+    zsui::PlatformPalette::current(mode).ok().filter(|palette|palette.mode==zsui::ZsuiThemeMode::HighContrast)
 }
 
 /// Segoe Fluent Icons / Segoe MDL2 Assets code points. Semantic icons come
@@ -211,8 +240,8 @@ mod tests {
     }
     #[test]
     fn fence_opacity_is_clamped() {
-        assert_eq!(FencePalette::new(Mode::Dark, 0).background.a, 25);
-        assert_eq!(FencePalette::new(Mode::Dark, 200).background.a, 255);
+        assert_eq!(FencePalette::configured(Mode::Dark, 0).background.a, 25);
+        assert_eq!(FencePalette::configured(Mode::Dark, 200).background.a, 255);
     }
     #[test]
     fn zsui_glyphs_are_private_use_code_points() {

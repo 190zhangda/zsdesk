@@ -1,5 +1,5 @@
 use super::*;
-use zsdesk_ui::{chrome::CommandId, menus::{self, MenuItemSpec, MenuSpec, ShowState, SortKey, UiCommand}};
+use zsdesk_ui::{chrome::{CommandId, SearchPanelHit}, menus::{self, MenuItemSpec, MenuSpec, ShowState, SortKey, UiCommand}};
 use zsdesk_windows::shell::commands::{folder_settings, set_folder_settings, Column};
 
 impl WindowState {
@@ -16,12 +16,15 @@ impl WindowState {
             ACTION_COMMIT_RENAME => unsafe { self.commit_bookmark_rename() },
             ACTION_CANCEL_RENAME => unsafe { self.cancel_rename() },
             ACTION_SEARCH => unsafe { self.search() },
+            ACTION_SEARCH_PAGE => unsafe { self.request_integrated_search(false) },
+            ACTION_CLOSE_SEARCH => unsafe { self.close_integrated_search() },
+            ACTION_SEARCH_SETTINGS => unsafe { self.search_settings_menu() },
             ACTION_FOCUS_VIEW => { self.end_address_edit(); self.focus_view(); }
             _ => if let Some(command) = Command::from_id(id as u16) { unsafe { self.execute(command); } },
         }
     }
 
-    fn focus_view(&self) { if let Some(browser) = &self.browser { unsafe { browser.focus(); } } }
+    pub(super) fn focus_view(&self) { if let Some(browser) = &self.browser { unsafe { browser.focus(); } } }
 
     unsafe fn execute(&mut self, command: Command) {
         match command {
@@ -42,18 +45,27 @@ impl WindowState {
             Command::Up => unsafe { self.go_up() },
             Command::FocusAddress => unsafe { self.focus_address() },
             Command::Refresh => unsafe {
-                if matches!(self.current_location(),ShellLocation::Search{scope:None,..}){if let Some(engine)=&self.fast_search{engine.cancel();engine.refresh();}}
-                self.capture_active(); self.navigate_current();
+                if matches!(self.current_location(), ShellLocation::Search { .. }) {
+                    self.cancel_fast_search();
+                    self.request_integrated_search(false);
+                } else {
+                    self.capture_active(); self.navigate_current();
+                }
             },
             Command::AddBookmark => self.add_current_bookmark(),
-            Command::FocusSearch => {
-                let _ = unsafe { SetFocus(Some(self.search_edit)) };
-                unsafe { SendMessageW(self.search_edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1))); }
-            }
+            Command::FocusSearch => unsafe { self.open_integrated_search() },
             Command::NewFolder => self.shell_result(self.browser.as_ref().map(|b| b.invoke_background(self.hwnd, "NewFolder"))),
             Command::CopyPath => self.copy_paths(),
             Command::TogglePreview => { let d = self.session.ui.show_details; self.set_panes(!self.session.ui.show_preview, d && self.session.ui.show_preview); }
             Command::ToggleDetails => { let p = self.session.ui.show_preview; self.set_panes(p && self.session.ui.show_details, !self.session.ui.show_details); }
+            Command::NewWindow => self.new_window(),
+            Command::ToggleFullscreen => self.toggle_fullscreen(),
+            Command::FocusNext => self.cycle_focus(false),
+            Command::FocusPrevious => self.cycle_focus(true),
+            Command::ZoomIn => self.zoom_view(true),
+            Command::ZoomOut => self.zoom_view(false),
+            Command::ResetZoom => self.set_view_dimensions(windows::Win32::UI::Shell::FVM_ICON.0,48),
+            Command::ViewPreset(number) => if let Some((mode,size))=super::window_actions::view_preset(number) {self.set_view_dimensions(mode,size);},
         }
     }
 
@@ -73,7 +85,8 @@ impl WindowState {
         self.hover = hit;
         self.hover_crumb = crumb;
         self.update_tooltip();
-        let rows = [self.layout.strip, self.layout.nav_row, self.layout.command_row, self.layout.bookmarks_row, self.layout.status];
+        let rows = [self.layout.strip,self.layout.tab_panel, self.layout.nav_row, self.layout.command_row,
+            self.layout.search_panel.card, self.layout.bookmarks_row, self.layout.status];
         for row in rows {
             let touches = |h: Hit| self.row_of(h) == Some(row);
             if touches(old) || touches(hit) { self.invalidate_rect(row); }
@@ -84,7 +97,10 @@ impl WindowState {
     fn row_of(&self, hit: Hit) -> Option<LayoutRect> {
         Some(match hit {
             Hit::None | Hit::Splitter => return None,
+            Hit::Tab(_) | Hit::TabClose(_) | Hit::NewTab if self.layout.vertical_tabs=>self.layout.tab_panel,
             Hit::Caption | Hit::Tab(_) | Hit::TabClose(_) | Hit::NewTab | Hit::TabList | Hit::AppMenu => self.layout.strip,
+            Hit::Search if self.search_panel.open => self.layout.search,
+            Hit::SearchPanel(_) => self.layout.search,
             Hit::Back | Hit::Forward | Hit::Up | Hit::Refresh | Hit::Address | Hit::Search => self.layout.nav_row,
             Hit::Command(_) => self.layout.command_row,
             Hit::Bookmark(_) | Hit::BookmarkOverflow | Hit::BookmarksBar => self.layout.bookmarks_row,
@@ -105,6 +121,30 @@ impl WindowState {
             Hit::Forward => ("前进 (Alt+右箭头)".into(), self.layout.forward),
             Hit::Up => ("上移到上一级 (Alt+上箭头)".into(), self.layout.up),
             Hit::Refresh => ("刷新 (F5)".into(), self.layout.refresh),
+            Hit::Search => ("搜索文件和文件夹 (Ctrl+F)".into(), self.layout.search),
+            Hit::SearchPanel(action) => {
+                let panel = &self.layout.search_panel;
+                match action {
+                    SearchPanelHit::Category(index) => {
+                        let labels = ["全部文件和文件夹", "只显示文件夹", "只显示文档", "只显示图片", "只显示视频", "只显示音频"];
+                        (labels.get(index as usize).copied().unwrap_or("").into(), panel.categories.get(index as usize).copied().unwrap_or_default())
+                    }
+                    SearchPanelHit::Scope => {
+                        let scope = self.search_controls().scope.map(|path| path.to_string_lossy().into_owned()).unwrap_or_else(|| "全部磁盘".into());
+                        (format!("搜索范围：{scope}；点击更改"), panel.scope)
+                    }
+                    SearchPanelHit::Sort => ("更改全部搜索结果的排序方式".into(), panel.sort),
+                    SearchPanelHit::Previous => ("上一页搜索结果".into(), panel.previous),
+                    SearchPanelHit::Next => ("下一页搜索结果".into(), panel.next),
+                    SearchPanelHit::Clear => ("清空搜索内容".into(), panel.clear),
+                    SearchPanelHit::Close => ("关闭搜索并返回原文件夹 (Esc)".into(), panel.close),
+                    SearchPanelHit::Submit => ("开始搜索 (Enter)".into(), panel.submit),
+                    SearchPanelHit::IndexSettings => ("打开 Everything 索引设置".into(), panel.index_settings),
+                    SearchPanelHit::Retry => if let Some(error) = self.search_controls().error {
+                        (format!("重试搜索：{error}"), panel.retry)
+                    } else { (String::new(), LayoutRect::default()) },
+                }
+            }
             Hit::Command(id) => (id.tooltip().into(), self.layout.command_rect(id).unwrap_or_default()),
             Hit::Bookmark(i) => (self.session.bookmarks.get(i).map(|b| b.target.address()).unwrap_or_default(), self.layout.bookmarks.get(i).copied().unwrap_or_default()),
             Hit::StatusDetails => ("在窗口中显示每一项的相关信息 (Ctrl+Shift+6)".into(), self.layout.status_details),
@@ -137,16 +177,18 @@ impl WindowState {
             return;
         }
         if let Some(mut drag) = self.tab_drag {
-            let threshold = unsafe { GetSystemMetricsForDpi(SM_CXDRAG, self.dpi) };
-            if !drag.moved && (p.x - drag.start_x).abs() > threshold { drag.moved = true; }
+            let threshold = unsafe { GetSystemMetricsForDpi(if self.layout.vertical_tabs { SM_CYDRAG } else { SM_CXDRAG }, self.dpi) };
+            let axis=if self.layout.vertical_tabs{p.y}else{p.x};
+            if !drag.moved && (axis - drag.start_axis).abs() > threshold { drag.moved = true; }
             if drag.moved {
-                if let Some(target) = self.layout.tab_index_at(p.x).filter(|&t| t != drag.index && t < self.session.tabs.len()) {
+                let target = self.layout.tab_drag_target(p.x, p.y);
+                if let Some(target) = target.filter(|&t| t != drag.index && t < self.session.tabs.len()) {
                     let tab = self.session.tabs.remove(drag.index);
                     self.session.tabs.insert(target, tab);
                     self.session.active_tab = target;
                     drag.index = target;
                     self.relayout();
-                    self.invalidate_rect(self.layout.strip);
+                    self.invalidate_rect(if self.layout.vertical_tabs { self.layout.tab_panel } else { self.layout.strip });
                 }
             }
             self.tab_drag = Some(drag);
@@ -159,16 +201,18 @@ impl WindowState {
 
     pub(super) fn mouse_down(&mut self, p: POINT) {
         let hit = self.layout.hit(p.x, p.y);
+        if hit != Hit::Address { self.end_address_edit(); }
         self.pressed = Some(hit);
         match hit {
             Hit::Tab(i) => {
                 unsafe { self.select_tab(i); }
-                self.tab_drag = Some(TabDrag { index: self.session.active_tab, start_x: p.x, moved: false });
+                self.tab_drag = Some(TabDrag { index: self.session.active_tab, start_axis: if self.layout.vertical_tabs{p.y}else{p.x}, moved: false });
                 unsafe { SetCapture(self.hwnd); }
             }
             Hit::Splitter => { self.splitter_drag = Some((p.x, self.layout.tree.width)); unsafe { SetCapture(self.hwnd); } }
             Hit::Address if self.crumb_at(p.x, p.y).is_none() && !self.address_editing => { self.pressed = None; unsafe { self.focus_address(); } return; }
-            Hit::Search => { self.pressed = None; let _ = unsafe { SetFocus(Some(self.search_edit)) }; return; }
+            Hit::Search => { self.pressed = None; unsafe { self.open_integrated_search(); } return; }
+            Hit::SearchPanel(_) => unsafe { let _ = SetCapture(self.hwnd); },
             Hit::None | Hit::Status | Hit::BookmarksBar => {}
             _ => unsafe { let _ = SetCapture(self.hwnd); },
         }
@@ -198,6 +242,7 @@ impl WindowState {
             Hit::Forward => unsafe { self.execute(Command::Forward) },
             Hit::Up => unsafe { self.execute(Command::Up) },
             Hit::Refresh => unsafe { self.execute(Command::Refresh) },
+            Hit::SearchPanel(action) => unsafe { self.search_panel_action(action) },
             Hit::Address => if let Some(part) = self.crumb_at(p.x, p.y) { unsafe { self.crumb_click(part, ctrl); } },
             Hit::Command(id) => unsafe { self.command(id) },
             Hit::Bookmark(i) => unsafe { self.open_bookmark(i, ctrl) },
@@ -297,7 +342,11 @@ impl WindowState {
             CommandId::Rename => { let r = self.browser.as_ref().map(|b| b.rename_selection()); self.shell_result(r); }
             CommandId::Share => { let r = self.browser.as_ref().map(|b| b.invoke_selection(hwnd, "Windows.ModernShare", false)); self.shell_result(r); }
             CommandId::Delete => { let r = self.browser.as_ref().map(|b| b.invoke_selection(hwnd, "delete", shift)); self.shell_result(r); }
-            CommandId::Sort => unsafe { self.sort_menu() },
+            CommandId::Sort => unsafe {
+                if matches!(self.current_location(), ShellLocation::Search { .. }) {
+                    self.search_panel_action(SearchPanelHit::Sort);
+                } else { self.sort_menu(); }
+            },
             CommandId::View => unsafe { self.view_menu() },
             CommandId::More => unsafe { self.more_menu() },
             CommandId::DetailsPane => unsafe { self.execute(Command::ToggleDetails) },
@@ -312,10 +361,12 @@ impl WindowState {
         p
     }
 
-    fn set_panes(&mut self, preview: bool, details: bool) {
+    pub(super) fn set_panes(&mut self, preview: bool, details: bool) {
+        let details_changed=self.session.ui.show_details!=details;
         self.session.ui.show_preview = preview;
         self.session.ui.show_details = details;
         self.save();
+        if !details_changed {unsafe{self.resize();}return;}
         // IExplorerBrowser reads pane visibility only while initializing, so the
         // view is recreated and returns to the same folder, selection and layout.
         unsafe { self.capture_active(); }
@@ -323,11 +374,16 @@ impl WindowState {
         self.pending = None;
         self.queued = None;
         self.shown_tab = None;
-        let panes = Panes { preview, details };
-        match unsafe { ExplorerBrowserHost::create(self.hwnd, win_rect(self.layout.browser), self.modern, panes) } {
+        let panes = Panes { preview:false, details };
+        let created=if cfg!(test) {
+            unsafe { ExplorerBrowserHost::create_transient(self.hwnd, win_rect(self.layout.browser), self.modern, panes) }
+        } else { unsafe { ExplorerBrowserHost::create(self.hwnd, win_rect(self.layout.browser), self.modern, panes) } };
+        match created {
             Ok(browser) => {browser.set_context_menu_options(crate::context_preferences::native(&self.session.ui.context_menu));self.browser = Some(browser);},
             Err(error) => self.show_message(format!("无法切换窗格：{error}")),
         }
+        self.icons.clear();
+        unsafe { self.resize(); }
         self.theme_children();
         unsafe { self.navigate_current(); }
         self.invalidate_rect(self.layout.command_row);
@@ -358,7 +414,7 @@ impl WindowState {
                 // A hidden tree is not synced while navigating; catch up when shown again.
                 if let Some(tree) = self.tree.as_ref().filter(|_| self.session.ui.show_tree) {
                     let current = self.current_location().clone();
-                    if !matches!(current, ShellLocation::Search { .. }) { unsafe { tree.select_location(&current); } }
+                    if !matches!(current, ShellLocation::Search { .. }) { unsafe { tree.select_location_with_policy(&current,self.navigation_auto_expand()); } }
                 }
             }
             Some("show-preview") => self.set_panes(!show.preview, false),
@@ -395,12 +451,19 @@ impl WindowState {
 
     unsafe fn more_menu(&mut self) {
         let anchor = self.layout.command_rect(CommandId::More);
-        let choice = popup(self.hwnd, &menus::more_menu(self.view_status.selected > 0, crate::edition::NETWORK), anchor);
+        let mut spec=menus::more_menu(self.view_status.selected > 0, crate::edition::NETWORK);
+        spec.items.push(MenuItemSpec::Separator);
+        spec.items.push(self.search_options_menu());
+        let choice = popup(self.hwnd, &spec, anchor);
+        if let Some(id)=choice.as_deref(){if unsafe{self.apply_search_option(id)}{return;}}
         let hwnd = self.hwnd;
         match choice.as_deref() {
             Some("select-all") => if let Some(b) = &self.browser { b.select_all(true) },
             Some("select-none") => if let Some(b) = &self.browser { b.select_all(false) },
-            Some("select-invert") => if let Some(b) = &self.browser { b.invert_selection() },
+            Some("select-invert") => {
+                let result = self.browser.as_ref().map(|b| b.invert_selection());
+                self.shell_result(result);
+            }
             Some("copy-path") => self.copy_paths(),
             Some("terminal") => self.open_terminal(),
             Some("properties") => {
@@ -438,37 +501,72 @@ impl WindowState {
     }
 
     fn open_terminal(&mut self) {
-        let Some(path) = self.current_location().as_path().map(PathBuf::from) else { self.show_message("此位置不是文件夹".into()); return };
-        let wt = std::process::Command::new("wt.exe").arg("-d").arg(&path).spawn();
-        if wt.is_err() {
-            let _ = std::process::Command::new("cmd.exe").arg("/K").current_dir(&path).spawn();
-        }
+        self.launch_default_terminal();
     }
 
     unsafe fn app_menu(&mut self) {
         use zsdesk_windows::integration::{self, Integration};
         let state = menus::AppMenuState {
+            forward_unhandled_windows:self.session.ui.forward_unhandled_windows,
             desktop_running: crate::edition::DESKTOP.then(desktop_host_running),
             integration: match integration::current() { Integration::Off => 0, Integration::ContextMenu => 1, Integration::Default => 2 },
         };
         let anchor = Some(self.layout.app_menu);
-        let choice = popup(self.hwnd, &menus::app_menu(state), anchor);
+        let choice = popup(self.hwnd, &menus::app_menu_with_capabilities(state, crate::edition::THEMED), anchor);
         match choice.as_deref() {
             Some("new-tab") => unsafe { self.new_tab(ShellLocation::ThisPc) },
             Some("quick-search") => unsafe{self.execute(Command::FocusSearch)},
+            Some("quick-search-window") => unsafe { self.open_integrated_search(); },
+            Some("quick-search-settings") => unsafe { self.search_settings_menu(); },
+            Some(id @ ("search-index-settings" | "search-everything-service")) => { self.search_engine_menu_action(id); },
+            Some("appearance-settings") if crate::edition::THEMED => {
+                if self.pending.is_some(){self.show_message("当前文件夹正在加载，请完成后切换主题".into());return;}
+                let old=self.session.ui.appearance.clone();
+                let spec=menus::appearance_menu(&old);
+                if let Some(id)=popup(self.hwnd,&spec,Some(self.layout.app_menu)) {
+                    if menus::apply_appearance(&mut self.session.ui.appearance,&id) {
+                        self.apply_theme();self.theme_children();
+                        if old.color_scheme!=self.session.ui.appearance.color_scheme {
+                            self.set_panes(self.session.ui.show_preview,self.session.ui.show_details);
+                        }
+                        self.save();self.relayout();self.position_children();self.invalidate();
+                        let _=crate::quick_search::control::signal(&self.config_path,"reload");
+                    }
+                }
+            },
             Some("search-rebuild-index") => {
-                if self.fast_search.is_none(){match crate::fast_search::FastSearch::new(self.config_path.with_file_name("search-index.sqlite"),self.hwnd,WM_FAST_SEARCH){Ok(engine)=>self.fast_search=Some(engine),Err(error)=>{self.show_message(format!("无法建立文件名索引：{error}"));return;}}}
-                if let Some(engine)=&self.fast_search{engine.rebuild();}
-                if matches!(self.current_location(),ShellLocation::Search{scope:None,..}){unsafe{self.navigate_current();}}
-                else{self.show_message("已请求重建文件名索引，可在快速搜索中查看结果".into());}
+                self.rebuild_search_index();
             },
             Some("interface-settings") => {
-                let spec=menus::interface_settings_menu(&self.session.ui);
+                let mut menu_ui=self.session.ui.clone();
+                menu_ui.navigation_auto_expand=Some(self.navigation_auto_expand());
+                let spec=menus::interface_settings_menu(&menu_ui);
                 if let Some(id)=popup(self.hwnd,&spec,Some(self.layout.app_menu)){
+                    if self.search_engine_menu_action(&id) { return; }
+                    if menus::interface_requires_dialog(&id){
+                        match crate::fast_search::everything::choose_executable(self.hwnd){
+                            Ok(Some(path))=>{self.session.ui.everything_executable=Some(path);self.session.ui.search_backend=zsdesk_core::model::explorer::SearchBackendPreference::Everything;self.save();self.search_backend_changed();},
+                            Ok(None)=>{},Err(error)=>self.show_message(error.to_string()),
+                        }return;
+                    }
+                    if id=="navigation-auto-expand" {self.session.ui.navigation_auto_expand=menu_ui.navigation_auto_expand;}
                     if menus::apply_interface_setting(&mut self.session.ui,&id){
                         self.crumbs_for=None;
-                        if id=="search-all-files" || id=="search-current-folder"{unsafe{SetTimer(Some(self.hwnd),TIMER_SEARCH,20,None);}}
+                        if id=="search-all-files" || id=="search-current-folder"{
+                            let scope=if self.session.ui.search_all_files{None}else{
+                                self.search_scope.as_ref().unwrap_or_else(||self.current_location()).as_path().map(PathBuf::from)
+                            };
+                            self.search_controls_mut().scope=scope;
+                            unsafe{SetTimer(Some(self.hwnd),TIMER_SEARCH,20,None);}
+                        }
                         self.save();self.measure_bookmarks();self.relayout();self.position_children();
+                        if id.starts_with("search-backend-"){self.search_backend_changed();}
+                        if (id=="navigation-auto-expand" || id=="navigation-expand-system" || id=="interface-navigation") && self.pending.is_none() && self.session.ui.show_tree {
+                            if let Some(tree)=&self.tree {
+                                let location=self.current_location();
+                                if !matches!(location,ShellLocation::Search{..}) { unsafe {tree.select_location_with_policy(location,self.navigation_auto_expand());} }
+                            }
+                        }
                         unsafe{self.update_address();}self.invalidate();
                     }
                 }
@@ -495,6 +593,7 @@ impl WindowState {
             Some("desktop-quit") => self.launch_desktop(&["--quit".into()]),
             Some("desktop-tray") => self.launch_desktop(&["--tray".into()]),
             Some(id @ ("integration-off" | "integration-context" | "integration-default" | "integration-restore")) => self.set_integration(id),
+            Some("integration-forward-unhandled") => {self.session.ui.forward_unhandled_windows=!self.session.ui.forward_unhandled_windows;self.save();let _=crate::quick_search::start_if_enabled(&self.config_path);},
             Some("bookmark") => self.add_current_bookmark(),
             Some("folder-options") => open_folder_options(),
             Some("shortcuts") => {
@@ -513,12 +612,22 @@ impl WindowState {
         }
     }
 
+    /// Index administration is reached only through explicit menu actions.
+    fn search_engine_menu_action(&mut self, id: &str) -> bool {
+        match id {
+            "search-index-settings" => self.launch_search_settings(false),
+            "search-everything-service" => self.launch_search_settings(true),
+            _ => return false,
+        };
+        true
+    }
+
     /// 规划 §6.1.8: per-user takeover with backup and one-click restore.
     fn set_integration(&mut self, id: &str) {
         use zsdesk_windows::integration::{self, Integration};
         let level = match id { "integration-context" => Integration::ContextMenu, "integration-default" => Integration::Default, _ => Integration::Off };
         if level == Integration::Default {
-            let text = wide("双击文件夹、磁盘或桌面上的文件夹时将用 ZSDesk 打开（仅当前用户）。\n\n修改前会备份原有设置，可随时在 ≡ → 系统集成 → 恢复系统资源管理器 中还原。\n\n继续？");
+            let text = wide("Win+E、文件夹、磁盘和桌面“此电脑”将用 ZSDesk 打开（仅当前用户）。\n\n修改前会备份原有设置，可随时在 ≡ → 系统集成 → 恢复系统资源管理器 中还原。\n\n继续？");
             if unsafe { MessageBoxW(Some(self.hwnd), pcwstr(&text), PCWSTR(wide("默认用 ZSDesk 打开").as_ptr()), MB_OKCANCEL | MB_ICONQUESTION) } != IDOK { return; }
         }
         let Ok(exe) = std::env::current_exe() else { return };
@@ -528,9 +637,10 @@ impl WindowState {
                 let message=match level {
                 Integration::Off => "已恢复接管前的文件夹设置".into(),
                 Integration::ContextMenu => "已添加右键菜单“使用 ZSDesk 打开”".into(),
-                Integration::Default => "文件夹和磁盘将默认用 ZSDesk 打开".into(),
+                Integration::Default => "Win+E、文件夹、磁盘和此电脑将默认用 ZSDesk 打开".into(),
                 };self.show_message(message);
                 if let Err(error)=crate::routing_control::configure(&self.config_path,level==Integration::Default,self.hwnd){self.show_message(format!("文件夹设置已保存；文件位置转发未更新：{error}"));}
+                if let Err(error)=crate::quick_search::start_if_enabled(&self.config_path){self.show_message(format!("后台接管未启动：{error}"));}
             },
             Err(error) => self.show_message(format!("系统集成失败，已回滚：{error}")),
         }
@@ -591,44 +701,16 @@ impl WindowState {
 
     unsafe fn search(&mut self) {
         let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_SEARCH) };
-        let query = navigation::window_text(self.search_edit);
-        if query.trim().is_empty() { let _ = unsafe { SetFocus(Some(self.search_edit)) }; return; }
-        unsafe { self.run_search(query.trim()); }
+        unsafe { self.request_integrated_search(true); }
     }
 
     /// Called after typing pauses: searches, or returns to the folder when cleared.
     pub(super) unsafe fn live_search(&mut self) {
-        let query = navigation::window_text(self.search_edit);
-        let query = query.trim();
-        if query.is_empty() {
-            if let Some(scope) = self.search_scope.take().filter(|_| self.in_search_results()) {
-                self.search_result = None;
-                unsafe { self.navigate_to(scope); }
-            }
-            return;
-        }
-        unsafe { self.run_search(query); }
+        unsafe { self.request_integrated_search(true); }
     }
 
     pub(super) fn in_search_results(&self) -> bool { self.search_result.as_ref() == Some(self.current_location()) }
 
-    unsafe fn run_search(&mut self, query: &str) {
-        if self.pending.is_some() { unsafe { SetTimer(Some(self.hwnd), TIMER_SEARCH, 400, None); } return; }
-        // Refining a search keeps the original folder as its scope.
-        let scope = match (&self.search_scope, self.in_search_results()) {
-            (Some(scope), true) => scope.clone(),
-            _ => self.current_location().clone(),
-        };
-        let search_target=if self.session.ui.search_all_files {ShellLocation::ThisPc} else {scope.clone()};
-        match zsdesk_windows::shell::search_location(&search_target, query) {
-            Ok(location) => {
-                self.search_scope = Some(scope);
-                self.search_result = Some(location.clone());
-                unsafe { self.navigate_to(location) };
-            }
-            Err(error) => self.show_message(format!("无法搜索：{error}")),
-        }
-    }
 }
 
 const SHORTCUTS: &str = "文件管理器\nCtrl+T 新建标签　Ctrl+W / Ctrl+F4 关闭标签　Ctrl+Shift+T 恢复标签\nCtrl+Tab / Ctrl+Shift+Tab 切换标签　Ctrl+1…9 第 N 个标签\nAlt+← / Backspace 后退　Alt+→ 前进　Alt+↑ 上一级　F5 刷新\nCtrl+L / Alt+D / F4 地址栏　Ctrl+F / Ctrl+E / F3 搜索（输入即搜）\nCtrl+Shift+N 新建文件夹　Ctrl+Shift+C 复制路径　Ctrl+D 收藏\nAlt+P 预览窗格　Alt+Shift+P 详细信息窗格\nF2 重命名　Del 删除　Shift+Del 永久删除　Alt+Enter 属性　Ctrl+A 全选\n标签：中键关闭，拖动排序；收藏：中键在新标签打开\n\n桌面格子\n鼠标悬停 展开折叠的格子　双击标题 折叠/展开　拖动标题 移动　拖动边缘 调整大小\nEnter 打开　F2 重命名　Del 删除　Ctrl+A / C / X / V\n方向键 选择　Backspace 返回上一级（文件夹格子）　F5 刷新\n双击桌面空白处 隐藏/显示全部格子";

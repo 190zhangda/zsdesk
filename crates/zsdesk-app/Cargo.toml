@@ -18,12 +18,15 @@ serde.workspace = true
 roxmltree = "0.21.1"
 sha2 = "0.10.9"
 rusqlite.workspace = true
+zsui = { path = "../../../zsui", default-features = false }
 
 [features]
-# Editions: 标准版 = no features, 网络版 = network, 桌面版 = desktop, 全量版 = both.
+# Editions: standard, network, desktop, full, and a separate themed edition.
 default = ["network", "desktop"]
 network = []
 desktop = []
+desktop-box = ["desktop"]
+themed = ["network", "desktop"]
 
 [[example]]
 name = "desktop_probe"
@@ -47,10 +50,16 @@ windows = { version = "0.62.2", features = [
   "Win32_Graphics_Imaging",
   "Win32_System_Memory",
   "Win32_System_Registry",
+  "Win32_System_Variant",
+  "Win32_System_SystemServices",
+  "Win32_System_SystemInformation",
   "Win32_UI_Accessibility",
   "Win32_Security",
   "Win32_System_Threading",
+  "Win32_System_JobObjects",
   "Win32_System_DataExchange",
+  "Win32_System_IO",
+  "Win32_System_Ioctl",
   "Win32_Graphics_Gdi",
   "Win32_Storage_FileSystem",
   "Win32_System_Com",
@@ -63,6 +72,7 @@ windows = { version = "0.62.2", features = [
   "Win32_System_LibraryLoader",
   "Win32_System_Ole",
   "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Input_Ime",
   "Win32_UI_WindowsAndMessaging",
 ] }
 

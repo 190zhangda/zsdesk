@@ -9,11 +9,12 @@ use zsdesk_windows::shell::menu::{HistoryAction, ShellMenu};
 pub(super) struct Modifiers { pub control: bool, pub shift: bool, pub alt: bool }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum FileShortcut { Copy, Cut, Paste, SelectAll, Rename, Delete { permanent: bool }, Properties, Undo, Redo }
+pub(super) enum FileShortcut { Copy, Cut, Paste, SelectAll, InvertSelection, Rename, Delete { permanent: bool }, Properties, Undo, Redo }
 
 pub(super) fn resolve(key: u16, modifiers: Modifiers, file_context: bool, text_editing: bool) -> Option<FileShortcut> {
     if !file_context || text_editing { return None; }
     let Modifiers { control, shift, alt } = modifiers;
+    if control && shift && !alt && key == VK_A.0 { return Some(FileShortcut::InvertSelection); }
     if control && !shift && !alt {
         return match key {
             key if key == VK_C.0 || key == VK_INSERT.0 => Some(FileShortcut::Copy),
@@ -53,6 +54,15 @@ fn translate_history_then_invoke(translate: impl FnOnce() -> HRESULT, invoke: im
 
 /// Must run on the view's STA without holding the application state RefCell.
 pub(super) fn execute(view: &IShellView, owner: HWND, action: FileShortcut) -> Result<()> {
+    use zsdesk_windows::shell::file_transfer;
+    match action{
+        FileShortcut::Copy=>return file_transfer::copy_view(view,owner,false),
+        FileShortcut::Cut=>return file_transfer::copy_view(view,owner,true),
+        FileShortcut::Paste=>return file_transfer::paste_view(view,owner),
+        FileShortcut::Delete{permanent}=>return file_transfer::delete_view(view,owner,permanent),
+        _=>{},
+    }
+    if action == FileShortcut::InvertSelection { return zsdesk_windows::shell::commands::invert_view_selection(view); }
     if matches!(action, FileShortcut::Undo | FileShortcut::Redo) {
         let menu = ShellMenu::for_view(view, false)?;
         let action = if action == FileShortcut::Undo { HistoryAction::Undo } else { HistoryAction::Redo };
@@ -126,5 +136,10 @@ mod tests {
             }
         }
         assert_eq!(resolve(VK_C.0, Modifiers { control: true, shift: true, alt: false }, true, false), None);
+        let invert = Modifiers { control: true, shift: true, alt: false };
+        assert_eq!(resolve(VK_A.0, invert, true, false), Some(FileShortcut::InvertSelection));
+        assert_eq!(resolve(VK_A.0, invert, true, true), None);
+        assert_eq!(resolve(VK_A.0, invert, false, false), None);
+        assert_eq!(resolve(VK_A.0, Modifiers { alt: true, ..invert }, true, false), None);
     }
 }

@@ -1,6 +1,6 @@
 //! Menu definitions shared by the native Explorer chrome and desktop fences.
 pub use zsui::{core::Command as UiCommand, menu::{MenuItemSpec, MenuSpec}};
-use zsdesk_core::model::explorer::{CommandBarItem, CommandBarPreferences, ContextMenuMode, ContextMenuPreferences, ExplorerUi};
+use zsdesk_core::model::explorer::{AppearancePreferences, BackdropStyle, ColorScheme, CommandBarItem, CommandBarPreferences, ContextMenuMode, ContextMenuPreferences, ExplorerUi, PreviewProviderPreference, SearchBackendPreference};
 
 pub fn entry(label: &str, id: &str, enabled: bool, checked: bool) -> MenuItemSpec {
     let item = MenuItemSpec::command(label, UiCommand::custom(id)).checked(checked);
@@ -107,7 +107,7 @@ pub fn more_menu(has_selection: bool, network: bool) -> MenuSpec {
     let mut items = vec![
         entry("全选\tCtrl+A", "select-all", true, false),
         entry("全部取消", "select-none", has_selection, false),
-        entry("反向选择", "select-invert", true, false),
+        entry("反向选择 (Ctrl+Shift+A)", "select-invert", true, false),
         MenuItemSpec::Separator,
         entry("复制路径\tCtrl+Shift+C", "copy-path", true, false),
         entry("在终端中打开", "terminal", true, false),
@@ -143,23 +143,54 @@ pub fn interface_settings_menu(ui: &ExplorerUi) -> MenuSpec {
         item("恢复命令栏默认设置", "command-bar-defaults"),
         MenuItemSpec::Separator,
         entry("导航窗格", "interface-navigation", true, ui.show_tree),
+        entry("展开到当前文件夹", "navigation-auto-expand", true, ui.navigation_auto_expand.unwrap_or(false)),
+        item("跟随系统导航展开设置", "navigation-expand-system"),
         entry("收藏栏", "interface-bookmarks", true, ui.show_bookmarks),
+        submenu("标签栏位置",vec![
+            entry("上方","tab-placement-top",true,ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top),
+            entry("左侧","tab-placement-left",true,ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Left),
+            entry("右侧","tab-placement-right",true,ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Right),
+        ]),
         entry("空格快速预览", "space-preview", true, ui.space_preview),
+        submenu("快速预览插件优先级", vec![
+            entry("系统默认", "preview-provider-system", true, ui.preview_provider == PreviewProviderPreference::System),
+            entry("Office 优先", "preview-provider-office", true, ui.preview_provider == PreviewProviderPreference::Office),
+            entry("WPS 优先", "preview-provider-wps", true, ui.preview_provider == PreviewProviderPreference::Wps),
+        ]),
+        entry("悬停预览文件", "hover-preview", true, ui.hover_preview),
         submenu("搜索范围", vec![
             entry("搜索全部本地磁盘", "search-all-files", true, ui.search_all_files),
             entry("仅搜索当前文件夹", "search-current-folder", true, !ui.search_all_files),
+        ]),
+        submenu("Everything 搜索", vec![
+            item("索引设置…", "search-index-settings"),
+            item("启用快速索引服务…", "search-everything-service"),
+            item("选择已安装的 Everything…","search-everything-program"),
         ]),
     ])
 }
 
 /// Applies a recognized settings choice; the host then saves and relayouts.
+pub fn interface_requires_dialog(choice:&str)->bool{matches!(choice,"search-everything-program"|"search-index-settings"|"search-everything-service")}
+
 pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
     match choice {
         "command-bar-visible" => ui.command_bar.visible = !ui.command_bar.visible,
         "command-bar-defaults" => ui.command_bar = CommandBarPreferences::default(),
         "interface-navigation" => ui.show_tree = !ui.show_tree,
+        "navigation-auto-expand" => ui.navigation_auto_expand = Some(!ui.navigation_auto_expand.unwrap_or(false)),
+        "navigation-expand-system" => ui.navigation_auto_expand = None,
         "interface-bookmarks" => ui.show_bookmarks = !ui.show_bookmarks,
+        "tab-placement-top"=>ui.tab_placement=zsdesk_core::model::explorer::TabPlacement::Top,
+        "tab-placement-left"=>ui.tab_placement=zsdesk_core::model::explorer::TabPlacement::Left,
+        "tab-placement-right"=>ui.tab_placement=zsdesk_core::model::explorer::TabPlacement::Right,
         "space-preview" => ui.space_preview = !ui.space_preview,
+        "preview-provider-system" => ui.preview_provider = PreviewProviderPreference::System,
+        "preview-provider-office" => ui.preview_provider = PreviewProviderPreference::Office,
+        "preview-provider-wps" => ui.preview_provider = PreviewProviderPreference::Wps,
+        "search-backend-auto"|"search-backend-native"|"search-backend-directory" => ui.search_backend = SearchBackendPreference::Everything,
+        "search-backend-everything"=>ui.search_backend=SearchBackendPreference::Everything,
+        "hover-preview" => ui.hover_preview = !ui.hover_preview,
         "search-all-files" => ui.search_all_files = true,
         "search-current-folder" => ui.search_all_files = false,
         _ => {
@@ -185,13 +216,12 @@ pub fn context_menu_settings_menu(options: &ContextMenuPreferences) -> MenuSpec 
         entry("WPS", "context-action-wps", true, options.show_wps),
     ]);
     menu(vec![
-        submenu("文件管理器菜单样式", vec![
-            entry("原版菜单（可自定义）", "context-menu-original", true, original),
-            entry("Windows 11（可自定义）", "context-menu-windows11", true, !original),
+        submenu("系统扩展菜单样式", vec![
+            entry("经典系统菜单", "context-menu-original", true, original),
+            entry("Windows 11 原生菜单", "context-menu-windows11", true, !original),
         ]),
         MenuItemSpec::Separator,
         functions,
-        entry("功能开关对原版与 Win11 菜单均生效", "context-menu-windows11-hint", false, false),
         MenuItemSpec::Separator,
         item("恢复默认右键设置", "context-menu-defaults"),
     ])
@@ -219,6 +249,7 @@ pub fn apply_context_menu_setting(options: &mut ContextMenuPreferences, choice: 
 /// State shown in the application menu.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AppMenuState {
+    pub forward_unhandled_windows: bool,
     /// `None` when this edition has no desktop fences.
     pub desktop_running: Option<bool>,
     /// 0 = 不接管, 1 = 右键菜单, 2 = 默认打开.
@@ -227,7 +258,14 @@ pub struct AppMenuState {
 
 /// Application menu (≡) next to the window buttons.
 pub fn app_menu(state: AppMenuState) -> MenuSpec {
-    let mut items = vec![item("新建标签页\tCtrl+T", "new-tab"),item("快速搜索\tCtrl+F","quick-search"),item("重建文件名索引","search-rebuild-index"), MenuItemSpec::Separator];
+    app_menu_with_capabilities(state, false)
+}
+
+pub fn app_menu_with_capabilities(state: AppMenuState, themed: bool) -> MenuSpec {
+    let mut items = vec![item("新建标签页\tCtrl+T", "new-tab"),item("窗口内搜索\tCtrl+F","quick-search"),
+        item("开机启动与搜索快捷键…", "quick-search-settings"),
+        item("重建文件名索引","search-rebuild-index"), MenuItemSpec::Separator];
+    if themed { items.push(item("主题与材质", "appearance-settings")); }
     if let Some(running) = state.desktop_running {
         items.push(submenu("桌面格子", vec![
             item(if running { "显示桌面格子" } else { "启动桌面格子" }, "desktop-start"),
@@ -241,7 +279,8 @@ pub fn app_menu(state: AppMenuState) -> MenuSpec {
     items.push(submenu("系统集成", vec![
         entry("不接管", "integration-off", true, state.integration == 0),
         entry("右键菜单“使用 ZSDesk 打开”", "integration-context", true, state.integration == 1),
-        entry("默认用 ZSDesk 打开文件夹和磁盘", "integration-default", true, state.integration == 2),
+        entry("默认打开文件夹、磁盘和此电脑", "integration-default", true, state.integration == 2),
+        entry("接管新出现的系统浏览窗口", "integration-forward-unhandled", state.integration == 2, state.forward_unhandled_windows),
         MenuItemSpec::Separator,
         entry("恢复系统资源管理器", "integration-restore", state.integration != 0, false),
         MenuItemSpec::Separator,
@@ -260,6 +299,35 @@ pub fn app_menu(state: AppMenuState) -> MenuSpec {
     ];
     items.append(&mut rest);
     menu(items)
+}
+
+pub fn appearance_menu(preferences: &AppearancePreferences) -> MenuSpec {
+    menu(vec![
+        entry("亚克力", "appearance-acrylic", true, preferences.backdrop == BackdropStyle::Acrylic),
+        entry("Mica", "appearance-mica", true, preferences.backdrop == BackdropStyle::Mica),
+        entry("纯色浅色", "appearance-light", true, preferences.backdrop == BackdropStyle::Solid && preferences.color_scheme == ColorScheme::Light),
+        entry("纯色深色", "appearance-dark", true, preferences.backdrop == BackdropStyle::Solid && preferences.color_scheme == ColorScheme::Dark),
+        entry("跟随系统", "appearance-system", true, *preferences == AppearancePreferences::default()),
+        MenuItemSpec::Separator,
+        submenu("配色", vec![entry("系统", "appearance-color-system", true, preferences.color_scheme == ColorScheme::System),
+            entry("浅色", "appearance-color-light", true, preferences.color_scheme == ColorScheme::Light),
+            entry("深色", "appearance-color-dark", true, preferences.color_scheme == ColorScheme::Dark)]),
+    ])
+}
+
+pub fn apply_appearance(preferences: &mut AppearancePreferences, choice: &str) -> bool {
+    match choice {
+        "appearance-acrylic" => preferences.backdrop = BackdropStyle::Acrylic,
+        "appearance-mica" => preferences.backdrop = BackdropStyle::Mica,
+        "appearance-light" => { preferences.backdrop = BackdropStyle::Solid; preferences.color_scheme = ColorScheme::Light; }
+        "appearance-dark" => { preferences.backdrop = BackdropStyle::Solid; preferences.color_scheme = ColorScheme::Dark; }
+        "appearance-system" => *preferences = AppearancePreferences::default(),
+        "appearance-color-system" => preferences.color_scheme = ColorScheme::System,
+        "appearance-color-light" => preferences.color_scheme = ColorScheme::Light,
+        "appearance-color-dark" => preferences.color_scheme = ColorScheme::Dark,
+        _ => return false,
+    }
+    true
 }
 
 /// Every open tab plus restore.
@@ -321,12 +389,32 @@ mod tests {
         assert!(app.contains(&"interface-settings".into()));
         assert!(app.contains(&"context-menu-settings".into()));
         for id in nested_ids(&interface_settings_menu(&ui)) {
-            assert!(apply_interface_setting(&mut ui.clone(), &id), "unhandled setting {id}");
+            assert!(apply_interface_setting(&mut ui.clone(), &id)||interface_requires_dialog(&id), "unhandled setting {id}");
         }
         assert!(apply_interface_setting(&mut ui, "command-bar-defaults"));
         assert_eq!(ui.command_bar, CommandBarPreferences::default());
         assert!(!ui.show_bookmarks, "restoring command buttons must preserve the bookmark preference");
         assert_eq!(COMMAND_BAR_CHOICES.len(), CommandBarItem::ALL.len());
+    }
+    #[test]
+    fn navigation_expansion_is_an_explicit_reversible_preference() {
+        let mut ui=ExplorerUi::default();
+        assert_eq!(ui.navigation_auto_expand, None);
+        assert!(nested_ids(&interface_settings_menu(&ui)).contains(&"navigation-auto-expand".into()));
+        assert!(apply_interface_setting(&mut ui,"navigation-auto-expand"));
+        assert_eq!(ui.navigation_auto_expand, Some(true));
+        assert!(apply_interface_setting(&mut ui,"navigation-auto-expand"));
+        assert_eq!(ui.navigation_auto_expand, Some(false));
+    }
+
+    #[test]
+    fn hover_preview_starts_disabled_and_does_not_change_space_preview() {
+        let mut ui=ExplorerUi::default();
+        assert!(!ui.hover_preview);
+        assert!(apply_interface_setting(&mut ui,"hover-preview"));
+        assert!(ui.hover_preview && ui.space_preview);
+        assert!(apply_interface_setting(&mut ui,"hover-preview"));
+        assert!(!ui.hover_preview && ui.space_preview);
     }
 
     #[test]
@@ -350,7 +438,6 @@ mod tests {
         assert_eq!(options.mode, ContextMenuMode::Windows11);
         assert!(spec.items.iter().any(|item| matches!(item,
             MenuItemSpec::Submenu { label, enabled: true, .. } if label == "菜单功能")));
-        assert!(spec.items.iter().any(|item| matches!(item,
-            MenuItemSpec::Command { label, enabled: false, .. } if label == "功能开关对原版与 Win11 菜单均生效")));
+        assert!(!available.contains(&"context-menu-windows11-hint".into()));
     }
 }

@@ -7,9 +7,12 @@ pub(super) struct NavigationRequest {
     /// user's choice and is left alone when the folder opens.
     pub from_tree:bool,
 }
-impl NavigationRequest { fn new(tab:ExplorerTab)->Self {Self{tab,from_tree:false}} }
+impl NavigationRequest { pub(super) fn new(tab:ExplorerTab)->Self {Self{tab,from_tree:false}} }
 
 impl WindowState {
+    pub(super) fn navigation_auto_expand(&self)->bool {
+        self.session.ui.navigation_auto_expand.unwrap_or_else(NamespaceTreeHost::system_auto_expand)
+    }
     pub(super) unsafe fn open_requested(&mut self,request:crate::instance::OpenRequest){
         if self.pending.is_some(){
             if self.open_requests.len()<32{self.open_requests.push_back(request);}
@@ -33,13 +36,15 @@ impl WindowState {
         if let Some(tab)=self.session.tabs.iter_mut().find(|t|t.id==id) {tab.view=snapshot;}
     }
     pub(super) unsafe fn request_navigation(&mut self,request:NavigationRequest) {
+        self.end_address_edit();
         if self.pending.is_some() {self.queued=Some(request);return;}
         if !self.session.tabs.iter().any(|t|t.id==request.tab.id) {return;}
         let target=request.tab.current().clone();
         self.pending=Some(request);
+        self.publish_listary_folder();
         // Invalidate the old query before clearing/replacing its native view.
         self.cancel_fast_search();
-        let global=matches!(&target,ShellLocation::Search{scope:None,..});
+        let global=matches!(&target,ShellLocation::Search{..});
         if global && self.browser_role==BrowserRole::Ordinary{
             if let Err(error)=self.reset_browser_host(){self.show_message(format!("无法创建搜索结果视图：{error}"));unsafe{self.navigation_failed();}return;}
         }
@@ -66,17 +71,45 @@ impl WindowState {
     }
     pub(super) unsafe fn navigation_completed(&mut self,location:ShellLocation) {
         let completed_request=self.pending.is_some();
+        let completed_tab = self.pending.as_ref().map(|request| request.tab.id).or(self.shown_tab);
+        let active_completion = completed_tab == Some(self.session.active_tab().id);
         let location=self.pending.as_ref().map(|p|p.tab.current()).filter(|l|matches!(l,ShellLocation::Search{..})).cloned().unwrap_or(location);
         let to_search=matches!(&location,ShellLocation::Search{..}) || self.pending.as_ref().is_some_and(|p|Some(p.tab.current())==self.search_result.as_ref());
         if to_search {
-            self.search_result=Some(location.clone());
-            if self.search_scope.is_none(){if let ShellLocation::Search{scope,..}=&location{self.search_scope=Some(scope.clone().map(ShellLocation::Path).unwrap_or(ShellLocation::ThisPc));}}
-            if unsafe{GetFocus()}!=self.search_edit {if let ShellLocation::Search{query,..}=&location{let _=unsafe{SetWindowTextW(self.search_edit,PCWSTR(wide(query).as_ptr()))};}}
+            if active_completion { self.search_result=Some(location.clone()); }
+            if completed_request {
+                if let ShellLocation::Search { scope, .. } = &location {
+                    let tab = self.pending.as_ref().map_or(self.session.active_tab().id, |request| request.tab.id);
+                    let leaving = self.queued.as_ref().is_some_and(|request| request.tab.id == tab && !matches!(request.tab.current(), ShellLocation::Search { .. }));
+                    if !leaving {
+                        let origin = self.session.tabs.iter().find(|candidate| candidate.id == tab)
+                            .map(|candidate| candidate.current().clone()).filter(|current| !matches!(current, ShellLocation::Search { .. }))
+                            .unwrap_or_else(|| scope.clone().map(ShellLocation::Path).unwrap_or(ShellLocation::ThisPc));
+                        let controls = self.search_panel.tabs.entry(tab).or_default();
+                        controls.scope = scope.clone();
+                        controls.origin.get_or_insert(origin);
+                        if active_completion { self.search_panel.open = true; }
+                    }
+                }
+            }
+            if active_completion {
+                self.search_scope = self.search_controls().origin;
+                if self.queued.is_none() && unsafe{GetFocus()}!=self.search_edit {
+                    if let ShellLocation::Search{query,..}=&location {
+                        self.search_controls_mut().draft = Some(query.clone());
+                        let _=unsafe{SetWindowTextW(self.search_edit,PCWSTR(wide(query).as_ptr()))};
+                    }
+                }
+            }
         }
-        else if self.pending.is_some() {
+        else if self.pending.is_some() && active_completion {
             // Leaving the results: forget the scope and clear the box (unless typing).
             self.search_scope=None; self.search_result=None;
-            if unsafe {GetFocus()}!=self.search_edit { let _=unsafe {SetWindowTextW(self.search_edit,PCWSTR::null())}; }
+            self.search_controls_mut().origin = None;
+            if unsafe {GetFocus()}!=self.search_edit {
+                self.search_controls_mut().draft = Some(String::new());
+                let _=unsafe {SetWindowTextW(self.search_edit,PCWSTR::null())};
+            }
         }
         let mut from_tree=false;
         if let Some(mut request)=self.pending.take() {
@@ -109,11 +142,11 @@ impl WindowState {
             // click keeps the clicked row; any other navigation never opens
             // tree branches unless "展开到打开的文件夹" is on.
             if !matches!(&current,ShellLocation::Search{..}){if let Some(tree)=self.tree.as_ref().filter(|_|self.session.ui.show_tree) {
-                if from_tree {unsafe {tree.adopt_location(&current);}} else {unsafe {tree.select_location(&current);}}
+                if from_tree {unsafe {tree.adopt_location(&current);}} else {unsafe {tree.select_location_with_policy(&current,self.navigation_auto_expand());}}
             }}
             self.theme_children();
             self.refresh_status();
-            if completed_request{if let ShellLocation::Search{query,scope:None}=&current{self.start_fast_search(query);}}
+            if completed_request{if let ShellLocation::Search{query,..}=&current{self.start_fast_search(query);}}
             self.relayout();self.position_children();
         }
         if let Some(request)=self.queued.take() {unsafe {self.request_navigation(request);}}
@@ -141,6 +174,7 @@ impl WindowState {
     }
     pub(super) unsafe fn select_tab(&mut self,index:usize) {
         if index>=self.session.tabs.len() || index==self.session.active_tab {return;}
+        self.end_address_edit();
         unsafe {self.capture_active();}
         self.session.active_tab=index;
         unsafe {self.rebuild_tabs();self.navigate_current();}
@@ -187,6 +221,8 @@ impl WindowState {
     }
     /// Refreshes breadcrumb, window title, search hint and button states.
     pub(super) unsafe fn update_address(&mut self) {
+        self.publish_listary_folder();
+        unsafe { self.sync_search_tab_edit(); }
         let target=self.pending.as_ref().filter(|p|p.tab.id==self.session.active_tab().id).map(|p|p.tab.current().clone()).unwrap_or_else(||self.current_location().clone());
         if self.crumbs_for.as_ref()!=Some(&target) {
             self.crumbs=if let ShellLocation::Search{query,scope}=&target{
@@ -200,8 +236,18 @@ impl WindowState {
             let cue=wide(&if self.session.ui.search_all_files {"快速搜索全部本地磁盘".to_string()} else {format!("搜索 {}",target.title())});
             unsafe {SendMessageW(self.search_edit,EM_SETCUEBANNER,Some(WPARAM(1)),Some(LPARAM(cue.as_ptr() as isize)));}
         }
+        // Switching tabs restores that tab's query; live typing owns the EDIT
+        // text until its pending navigation catches up.
+        if self.pending.is_none() && self.queued.is_none() && self.shown_tab == Some(self.session.active_tab().id)
+            && unsafe { GetFocus() } != self.search_edit {
+            let query = match &target { ShellLocation::Search { query, .. } => query.as_str(), _ => "" };
+            if window_text(self.search_edit) != query {
+                let _ = unsafe { SetWindowTextW(self.search_edit, PCWSTR(wide(query).as_ptr())) };
+            }
+        }
         // Do not overwrite an address while the user is editing it.
         if self.address_editing && unsafe {GetFocus()}!=self.address_edit {
+            self.end_address_edit();
             let _=unsafe {SetWindowTextW(self.address_edit,PCWSTR(wide(&target.address()).as_ptr()))};
         }
         let _=unsafe {SetWindowTextW(self.hwnd,PCWSTR(wide(&format!("{} - ZSDesk",target.title())).as_ptr()))};
@@ -225,6 +271,13 @@ impl WindowState {
     }
     pub(super) unsafe fn commit_address(&mut self) {
         let text=window_text(self.address_edit);
+        if let Some(request)=super::terminal::parse(&text) {
+            match request {
+                Ok(request)=>if self.launch_terminal(&request) { self.end_address_edit(); },
+                Err(message)=>self.show_message(message.into()),
+            }
+            return;
+        }
         let lower=text.trim().to_ascii_lowercase();
         if !crate::edition::NETWORK && ["ftp://","sftp://","ssh://","smb://"].iter().any(|s|lower.starts_with(s)) {
             self.show_message(format!("ZSDesk {} 不支持 FTP/SSH 地址，请使用网络版或全量版",crate::edition::name()));

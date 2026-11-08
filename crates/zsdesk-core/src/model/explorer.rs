@@ -12,7 +12,6 @@ pub enum ShellLocation {
     /// Stable query parameters; transient Shell search addresses are not persisted.
     Search { query: String, scope: Option<PathBuf> },
 }
-
 impl ShellLocation {
     pub fn title(&self) -> String {
         match self {
@@ -136,7 +135,19 @@ impl ExplorerTab {
     }
 }
 
-/// Per-tab view settings and relative Shell identities. No live COM objects are retained.
+/// Serializable Shell property identity, independent of COM object lifetimes.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ViewPropertyKey { pub format_id: String, pub property_id: u32 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ViewSortColumn { pub key: ViewPropertyKey, pub ascending: bool }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ViewColumn { pub key: ViewPropertyKey, pub width: u32 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ViewGrouping { pub key: Option<ViewPropertyKey>, pub ascending: bool }
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShellViewState {
     pub mode: i32,
@@ -144,6 +155,14 @@ pub struct ShellViewState {
     pub selected: Vec<Vec<u8>>,
     pub focused: Option<Vec<u8>>,
     pub first_visible: Option<Vec<u8>>,
+    #[serde(default)]
+    pub sort_columns: Vec<ViewSortColumn>,
+    #[serde(default)]
+    pub columns: Vec<ViewColumn>,
+    #[serde(default)]
+    pub grouping: Option<ViewGrouping>,
+    #[serde(default)]
+    pub column_dpi: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -235,10 +254,47 @@ impl Default for ContextMenuPreferences {
     }
 }
 
+/// Legacy variants remain readable so existing profiles migrate without data loss.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchBackendPreference { Auto, NativeNtfs, DirectoryScan, #[default] Everything }
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorScheme { #[default] System, Light, Dark }
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackdropStyle { #[default] System, Solid, Mica, Acrylic }
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all="snake_case")]
+pub enum TabPlacement { #[default] Top, Left, Right }
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewProviderPreference { #[default] System, Office, Wps }
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AppearancePreferences { pub color_scheme: ColorScheme, pub backdrop: BackdropStyle }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct QuickSearchPreferences {
+    pub enabled: bool,
+    pub start_with_windows: bool,
+    pub hotkey: String,
+}
+impl Default for QuickSearchPreferences {
+    fn default() -> Self { Self { enabled: false, start_with_windows: false, hotkey: "Ctrl+Alt+Space".into() } }
+}
+
 /// Chrome preferences shared by every tab.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ExplorerUi {
+    pub tab_placement: TabPlacement,
     pub show_tree: bool,
     /// Navigation tree width in DIP.
     pub tree_width: i32,
@@ -248,15 +304,27 @@ pub struct ExplorerUi {
     pub command_bar: CommandBarPreferences,
     pub context_menu: ContextMenuPreferences,
     pub search_all_files: bool,
+    pub search_backend: SearchBackendPreference,
+    pub everything_executable: Option<PathBuf>,
     pub space_preview: bool,
+    pub hover_preview: bool,
+    pub forward_unhandled_windows: bool,
+    pub preview_provider: PreviewProviderPreference,
+    pub navigation_auto_expand: Option<bool>,
+    pub appearance: AppearancePreferences,
     pub window: Option<WindowPlacement>,
 }
 
 impl Default for ExplorerUi {
     fn default() -> Self {
-        Self { show_tree: true, tree_width: 220, show_bookmarks: true, show_preview: false, show_details: false,
+        Self { tab_placement:TabPlacement::Top, show_tree: true, tree_width: 220, show_bookmarks: true, show_preview: false, show_details: false,
             command_bar: CommandBarPreferences::default(), context_menu: ContextMenuPreferences::default(),
-            search_all_files: true, space_preview: true, window: None }
+            search_all_files: true, search_backend: SearchBackendPreference::Everything, space_preview: true,
+            everything_executable:None,
+            hover_preview: false, preview_provider: PreviewProviderPreference::System,
+            forward_unhandled_windows: true,
+            navigation_auto_expand: None, appearance: AppearancePreferences::default(),
+            window: None }
     }
 }
 
@@ -284,6 +352,7 @@ impl Default for ExplorerSession {
 
 impl ExplorerSession {
     pub fn normalize(&mut self) {
+        self.ui.search_backend=SearchBackendPreference::Everything;
         if self.tabs.is_empty() {
             let id = self.take_id();
             self.tabs.push(ExplorerTab::new(id, ShellLocation::ThisPc));
@@ -402,5 +471,25 @@ mod tests {
         session.normalize();
         assert_eq!(session.tabs.len(), 1);
         assert_eq!(session.current_location(), &ShellLocation::ThisPc);
+    }
+
+    #[test]
+    fn old_preferences_do_not_enable_hover_or_background_features() {
+        let ui: ExplorerUi = serde_json::from_str(r#"{"tree_width":271,"space_preview":false}"#).unwrap();
+        assert_eq!(ui.tree_width, 271);
+        assert!(!ui.space_preview && !ui.hover_preview && ui.navigation_auto_expand.is_none());
+        assert_eq!(ui.appearance, AppearancePreferences::default());
+        assert_eq!(ui.search_backend, SearchBackendPreference::Everything);
+        let background: QuickSearchPreferences = serde_json::from_str("{}").unwrap();
+        assert!(!background.enabled && !background.start_with_windows);
+        assert_eq!(background.hotkey, "Ctrl+Alt+Space");
+    }
+
+    #[test]
+    fn old_view_snapshots_keep_selection_without_invented_column_settings() {
+        let snapshot: ShellViewState = serde_json::from_str(r#"{"mode":4,"icon_size":16,"selected":[[4,0,1,2,0,0]],"focused":null,"first_visible":null}"#).unwrap();
+        assert_eq!(snapshot.selected, vec![vec![4,0,1,2,0,0]]);
+        assert!(snapshot.columns.is_empty() && snapshot.sort_columns.is_empty() && snapshot.grouping.is_none());
+        assert_eq!(snapshot.column_dpi, 0);
     }
 }
