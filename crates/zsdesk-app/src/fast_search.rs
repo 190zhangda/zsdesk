@@ -1117,8 +1117,14 @@ mod tests {
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!("zsdesk-file-index-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-            fs::create_dir(&root).unwrap(); Self(root)
+            Self::under(&std::env::temp_dir())
+        }
+        fn under(parent: &Path) -> Self {
+            let root = parent.join(format!("zsdesk-file-index-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            fs::create_dir(&root).unwrap();
+            // Windows TEMP can contain an 8.3 alias. Results use canonical
+            // spelling, so fixture roots and expected paths must use it too.
+            Self(plain_path(&fs::canonicalize(&root).unwrap()))
         }
         fn service(&self) -> FastSearch {
             FastSearch::with_roots(self.0.join("index/search-index.sqlite"), HWND::default(), 0, Some(vec![self.0.join("files")])).unwrap()
@@ -1145,6 +1151,30 @@ mod tests {
         service.shared.stop.store(true, Ordering::Release);
         drop(control); service.shared.wake.notify_all();
         if let Some(worker) = service.worker.take() { worker.join().unwrap(); }
+    }
+    #[test]
+    fn temporary_root_aliases_keep_explicit_fixture_queries_in_scope() {
+        #[link(name="kernel32")]
+        unsafe extern "system" {
+            fn GetShortPathNameW(long: *const u16, short: *mut u16, capacity: u32) -> u32;
+        }
+        let parent=Fixture::new();
+        let name:Vec<u16>=parent.0.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut short=vec![0u16;32768];
+        let length=unsafe{GetShortPathNameW(name.as_ptr(),short.as_mut_ptr(),short.len()as u32)}as usize;
+        // Volumes without short-name support still exercise the same explicit
+        // scope and canonical-root contract; no environment variables change.
+        let alias=if length>0&&length<short.len(){PathBuf::from(OsString::from_wide(&short[..length]))}else{parent.0.clone()};
+        let fixture=Fixture::under(&alias);
+        assert_eq!(fixture.0,plain_path(&fs::canonicalize(&fixture.0).unwrap()));
+        assert!(matches!(fixture.0.components().next(),Some(Component::Prefix(prefix))if matches!(prefix.kind(),Prefix::Disk(_))));
+        let files=fixture.0.join("files");fs::create_dir(&files).unwrap();
+        let expected=files.join("显式范围 中文.txt");fs::write(&expected,b"fixture").unwrap();
+        let service=fixture.service();
+        let generation=service.start("显式范围",Some(files));
+        let(paths,event)=collect(&service,generation);
+        assert_eq!(paths,HashSet::from([expected]));assert!(!event.scanning);
+        stop(service);
     }
     #[test]
     fn persistent_index_finds_unicode_names_and_removes_dead_results() {
