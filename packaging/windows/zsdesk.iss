@@ -89,7 +89,7 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs 
 [Icons]
 Name: "{group}\{#ProductName}"; Filename: "{app}\ZSDesk.exe"; AppUserModelID: "{#ProductModelId}"; Check: not WizardNoIcons
 Name: "{autodesktop}\{#ProductName}"; Filename: "{app}\ZSDesk.exe"; AppUserModelID: "{#ProductModelId}"; Tasks: desktopicon; Check: not WizardNoIcons
-#if HasDesktop && (Edition != "desktop-box")
+#if (Int(HasDesktop) != 0) && (Edition != "desktop-box")
 Name: "{group}\{cm:Fences}"; Filename: "{app}\ZSDesk.exe"; Parameters: "--desktop"; Check: not WizardNoIcons
 #endif
 
