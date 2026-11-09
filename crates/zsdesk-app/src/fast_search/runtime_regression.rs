@@ -54,7 +54,11 @@ fn collect(service:&FastSearch,generation:u64)->Result<(Vec<PathBuf>,SearchEvent
     let second=FastSearch::new_with_roots_for_test(fixture.index.clone(),vec![fixture.files.clone()])?;
     let stale=first.start("alpha",None);let current=first.start("beta",None);assert!(current>stale);
     assert_eq!(collect(&first,current)?.0,vec![beta]);let other=second.start("alpha",None);assert_eq!(collect(&second,other)?.0,vec![alpha]);
-    let a=native::shared(&fixture.index);let b=native::shared(&fixture.index);assert!(Arc::ptr_eq(&a,&b));assert_eq!(native::inspect(&a).2,1);
+    let a=native::shared(&fixture.index);let b=native::shared(&fixture.index);assert!(Arc::ptr_eq(&a,&b));
+    // Live USN catchup may legitimately rebuild after unrelated filesystem changes.
+    // An explicit rebuild by the second client must update the shared catalog once.
+    let builds=native::inspect(&a).2;assert!(builds>=1);let rebuilt=second.rebuild();collect(&second,rebuilt)?;
+    assert_eq!(native::inspect(&a).2,builds+1);assert_eq!(native::inspect(&a).0,3);
     first.cancel();assert!(first.poll().is_empty());stop(first);stop(second);Ok(())
 }
 
