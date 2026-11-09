@@ -17,7 +17,7 @@ serde_json.workspace = true
 serde.workspace = true
 roxmltree = "0.21.1"
 sha2 = "0.10.9"
-rusqlite.workspace = true
+pinyin = { version = "=0.11.0", default-features = false, features = ["plain"] }
 zsui = { path = "../../../zsui", default-features = false }
 
 [features]
@@ -58,6 +58,7 @@ windows = { version = "0.62.2", features = [
   "Win32_System_Threading",
   "Win32_System_JobObjects",
   "Win32_System_DataExchange",
+  "Win32_System_Diagnostics_Debug",
   "Win32_System_IO",
   "Win32_System_Ioctl",
   "Win32_Graphics_Gdi",

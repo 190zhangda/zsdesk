@@ -1,8 +1,10 @@
-//! Navigation tree (`INameSpaceTreeControl`) using the current system's metrics.
+//! Navigation tree (`INameSpaceTreeControl`) with system-aware navigation density.
 //!
 //! The system Quick access namespace provides the user's pinned/frequent
 //! folders. Known folders remain available on systems without that namespace.
-//! Root expansion follows the initial location; spacing is owned by the native Shell.
+//! Root expansion follows the initial location. Windows 11 navigation density
+//! follows compact mode, per-monitor DPI and the control's actual system font;
+//! older Shell versions retain their native item height and indentation.
 
 use std::{cell::{Cell, RefCell}, collections::HashMap, rc::{Rc,Weak}, time::{Duration,Instant}};
 
@@ -10,16 +12,17 @@ use windows::{
     core::{implement, Error, Interface, Ref, Result, BOOL, HRESULT, PCWSTR, PWSTR},
     Win32::{
         Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Graphics::Gdi::{GetObjectW, HGDIOBJ, LOGFONTW},
         Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES,
         System::{
             Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER},
             Ole::IOleWindow,
             Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
-            SystemServices::{SFGAO_FOLDER, SFGAO_STREAM},
+            SystemServices::SFGAO_STREAM,
         },
         UI::{
             Controls::{TVGN_CARET, TVM_SELECTITEM, TVM_SETBKCOLOR, TVM_SETTEXTCOLOR, TVM_SETEXTENDEDSTYLE,
-                TVS_EX_DOUBLEBUFFER, TVM_EXPAND, TVE_COLLAPSE},
+                TVS_EX_DOUBLEBUFFER, TVM_EXPAND, TVE_COLLAPSE, TVM_SETITEMHEIGHT, TVM_GETITEMHEIGHT},
             HiDpi::GetDpiForWindow,
             Input::KeyboardAndMouse::{GetFocus, SetFocus, IsWindowEnabled},
             Shell::{
@@ -32,16 +35,16 @@ use windows::{
                 SICHINT_CANONICAL, SICHINT_TEST_FILESYSPATH_IF_NOT_EQUAL, NSTCGNI_PARENT, NSTCGNI_NEXTVISIBLE,
                 NSTCS_AUTOHSCROLL, NSTCS_FULLROWSELECT, NSTCS_HASEXPANDOS, NSTCS_NOEDITLABELS,
                 NSTCS_SHOWSELECTIONALWAYS, NSTCS_FADEINOUTEXPANDOS, NSTCS_TABSTOP, NSTCS_ROOTHASEXPANDO,
-                NSTCS_ALLOWJUNCTIONS, NSTCS2_INTERRUPTNOTIFICATIONS,
+                NSTCS_ALLOWJUNCTIONS, NSTCS2_INTERRUPTNOTIFICATIONS, NSTCS2_DISPLAYPADDING,
                 NTSCS2_NOSINGLETONAUTOEXPAND,
-                SHCONTF_FOLDERS, SHFILEINFOW, SHGFI_OPENICON, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_SYSICONINDEX,
+                SHCONTF_FOLDERS, SHCONTF_NAVIGATION_ENUM, SHFILEINFOW, SHGFI_OPENICON, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_SYSICONINDEX,
                 FOLDERID_Desktop, FOLDERID_Downloads, FOLDERID_Documents, FOLDERID_Pictures,
                 FOLDERID_Music, FOLDERID_Videos, FOLDERID_RecycleBinFolder, FOLDERID_NetworkFolder,
                 KF_FLAG_DEFAULT,
             },
             WindowsAndMessaging::{EnumChildWindows, FindWindowExW, GetClassNameW, GetWindowRect, MoveWindow,
                 PostMessageW, ShowWindow, SW_HIDE, SW_SHOW, SendMessageW,
-                IsChild, IsWindow, IsWindowVisible, SetTimer, KillTimer, WM_KEYDOWN, WM_SYSKEYDOWN, WM_NCDESTROY},
+                IsChild, IsWindow, IsWindowVisible, SetTimer, KillTimer, WM_GETFONT, WM_KEYDOWN, WM_SYSKEYDOWN, WM_NCDESTROY},
         },
     },
 };
@@ -114,6 +117,7 @@ pub struct NamespaceTreeHost {
     last_auto_expand: Cell<bool>,
     syncing: Rc<Cell<u32>>,
     pending_sync:Rc<PendingTreeSync>,
+    bounds:Cell<RECT>,
 }
 
 impl NamespaceTreeHost {
@@ -147,14 +151,16 @@ impl NamespaceTreeHost {
         let hwnd = unsafe { tree.cast::<IOleWindow>().and_then(|w| w.GetWindow()).unwrap_or_default() };
 
         if let Ok(extended) = tree.cast::<INameSpaceTreeControl2>() {
-            let styles = NSTCS2_INTERRUPTNOTIFICATIONS | NTSCS2_NOSINGLETONAUTOEXPAND;
-            // Do not change DISPLAYPADDING: the Shell version and its display
-            // preferences own root spacing, independently of navigation policy.
+            // A bare namespace control has no root separation by default.
+            // Ask the Shell to supply its own group padding instead of adding
+            // application-owned blank rows or pixel offsets between roots.
+            let mut styles = NSTCS2_INTERRUPTNOTIFICATIONS | NTSCS2_NOSINGLETONAUTOEXPAND;
+            if crate::theme::os_build() >= 22000 { styles |= NSTCS2_DISPLAYPADDING; }
             let _ = unsafe { extended.SetControlStyle2(styles, styles) };
         }
 
         let filter: IShellItemFilter = FolderFilter.into();
-        let enum_flags = SHCONTF_FOLDERS.0 as u32;
+        let enum_flags = navigation_enum_flags();
 
         let quick_access = ShellLocation::Shell {
             parsing_name: QUICK_ACCESS.into(),
@@ -190,12 +196,13 @@ impl NamespaceTreeHost {
         let advise_cookie = unsafe { tree.TreeAdvise(&events)? };
         PENDING_SYNCS.with(|pending|{pending.borrow_mut().insert(hwnd.0 as isize,Rc::downgrade(&pending_sync));});
         let host = Self { tree, events, _filter: filter, advise_cookie, hwnd, last_location,
-            last_auto_expand: Cell::new(false), syncing,pending_sync };
+            last_auto_expand: Cell::new(false), syncing,pending_sync,bounds:Cell::new(bounds) };
         if let Some(view) = host.tree_view() {
             unsafe {SetWindowSubclass(view,Some(tree_sync_subclass),SYNC_TIMER,hwnd.0 as usize)}.ok()?;
             host.pending_sync.native_tree.set(view);
             unsafe { SendMessageW(view, TVM_SETEXTENDEDSTYLE, Some(WPARAM(TVS_EX_DOUBLEBUFFER as usize)), Some(LPARAM(TVS_EX_DOUBLEBUFFER as isize))); }
         }
+        host.refresh_metrics();
         Ok(host)
     }
 
@@ -213,6 +220,33 @@ impl NamespaceTreeHost {
 
     pub fn hwnd(&self) -> HWND { self.hwnd }
 
+    /// Re-read display preferences without changing any Windows settings.
+    pub fn refresh_metrics(&self) {
+        let Some(view) = self.tree_view() else { return };
+        let build = crate::theme::os_build();
+        if build < 22000 { return; }
+        let mut compact = 0u32;
+        let mut bytes = std::mem::size_of_val(&compact) as u32;
+        let _ = unsafe { RegGetValueW(HKEY_CURRENT_USER,
+            windows::core::w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"),
+            windows::core::w!("UseCompactMode"), RRF_RT_REG_DWORD, None,
+            Some((&mut compact as *mut u32).cast()), Some(&mut bytes)) };
+        let mut font = LOGFONTW::default();
+        let handle = unsafe { SendMessageW(view, WM_GETFONT, None, None) };
+        if handle.0 != 0 {
+            unsafe { GetObjectW(HGDIOBJ(handle.0 as *mut _), std::mem::size_of::<LOGFONTW>() as i32,
+                Some((&mut font as *mut LOGFONTW).cast())); }
+        }
+        if let Some(height) = navigation_row_height(build, unsafe { GetDpiForWindow(view) },
+            compact != 0, font.lfHeight.saturating_abs()) {
+            if unsafe { SendMessageW(view, TVM_GETITEMHEIGHT, None, None) }.0 != height as isize {
+                unsafe { SendMessageW(view, TVM_SETITEMHEIGHT, Some(WPARAM(height as usize)), None); }
+            }
+        }
+        // Indentation is left to the current Shell/theme rather than applying
+        // one fixed indentation to every OS and accessibility configuration.
+    }
+
     /// Applies light/dark colors to the tree.
     pub fn apply_theme(&self, dark: bool, background: u32, text: u32) {
         crate::theme::theme_control(self.hwnd, dark);
@@ -223,6 +257,7 @@ impl NamespaceTreeHost {
                 SendMessageW(view, TVM_SETTEXTCOLOR, None, Some(LPARAM(COLORREF(text).0 as isize)));
             }
         }
+        self.refresh_metrics();
     }
 
     /// Resizes the native namespace tree.
@@ -233,7 +268,13 @@ impl NamespaceTreeHost {
     pub unsafe fn resize(&self, rect: RECT) {
         if self.hwnd.0.is_null() { return; }
         let rect = navigation_rect(rect, unsafe { GetDpiForWindow(self.hwnd) });
-        let _ = unsafe { MoveWindow(self.hwnd, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, true) };
+        // Layout notifications can repeat while the native view scrolls or
+        // updates its selection. An unchanged rectangle must not force a
+        // synchronous erase/repaint of the entire navigation tree.
+        if self.bounds.get()!=rect && unsafe { MoveWindow(self.hwnd, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, true) }.is_ok() {
+            self.bounds.set(rect);
+        }
+        self.refresh_metrics();
     }
 
     pub fn set_visible(&self, visible: bool) {
@@ -485,6 +526,15 @@ fn scale(value: i32, dpi: u32) -> i32 {
     ((i64::from(value) * i64::from(dpi.max(96)) + 48) / 96) as i32
 }
 
+fn navigation_row_height(build: u32, dpi: u32, compact: bool, font_height: i32) -> Option<i32> {
+    if build < 22000 { return None; }
+    // Density is expressed in logical pixels, never in the host machine's
+    // physical pixels. Larger accessibility fonts must not be clipped.
+    let (row, padding) = if compact { (24, 8) } else { (32, 12) };
+    let height = scale(row, dpi).max(font_height.saturating_add(scale(padding, dpi)));
+    Some(height.saturating_add(1) & !1)
+}
+
 fn launch_location(value:Option<u32>)->ShellLocation {
     if value==Some(1) {ShellLocation::ThisPc}
     else {ShellLocation::Shell{parsing_name:QUICK_ACCESS.into(),title:"快速访问".into()}}
@@ -515,7 +565,15 @@ impl Drop for NamespaceTreeHost {
     fn drop(&mut self) { unsafe { self.destroy(); } }
 }
 
-/// Shows folders only; compressed files stay out of the tree.
+fn navigation_enum_flags()->u32 {
+    // Namespace providers distinguish their navigation hierarchy (including
+    // network containers and library roots) from an ordinary contents view.
+    (SHCONTF_FOLDERS.0 | SHCONTF_NAVIGATION_ENUM.0) as u32
+}
+
+/// The Shell enumerator selects folders; only positively identified streams
+/// are removed here. An unavailable optional attribute must not hide a remote
+/// container or prevent the Shell from expanding it after authentication.
 #[implement(IShellItemFilter)]
 struct FolderFilter;
 
@@ -523,11 +581,10 @@ struct FolderFilter;
 impl IShellItemFilter_Impl for FolderFilter_Impl {
     fn IncludeItem(&self, item: Ref<IShellItem>) -> Result<()> {
         let Some(item) = item.as_ref() else { return Err(Error::from_hresult(S_FALSE)) };
-        // Hidden folders follow the enumeration flags; only compressed files are removed.
-        let attrs = unsafe { item.GetAttributes(SFGAO_FOLDER | SFGAO_STREAM) }.map(|a| a.0).unwrap_or(0);
-        if attrs & SFGAO_FOLDER.0 != 0 && attrs & SFGAO_STREAM.0 == 0 { Ok(()) } else { Err(Error::from_hresult(S_FALSE)) }
+        let stream=unsafe { item.GetAttributes(SFGAO_STREAM) }.is_ok_and(|attrs|attrs.0 & SFGAO_STREAM.0 != 0);
+        if stream { Err(Error::from_hresult(S_FALSE)) } else { Ok(()) }
     }
-    fn GetEnumFlagsForItem(&self, _item: Ref<IShellItem>) -> Result<u32> { Ok(SHCONTF_FOLDERS.0 as u32) }
+    fn GetEnumFlagsForItem(&self, _item: Ref<IShellItem>) -> Result<u32> { Ok(navigation_enum_flags()) }
 }
 
 #[implement(INameSpaceTreeControlEvents)]
@@ -655,8 +712,83 @@ impl INameSpaceTreeControlEvents_Impl for TreeEvents_Impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::{System::{Com::IBindCtx,SystemServices::{SFGAO_FLAGS,SFGAO_FOLDER}},
+        UI::Shell::{IShellItem_Impl,SIGDN}};
     use windows::Win32::UI::Shell::{NSTCECT_DBLCLICK, NSTCECT_RBUTTON,
         NSTCEHT_NOWHERE, NSTCEHT_ONITEMICON, NSTCEHT_ONITEMLABEL, NSTCEHT_ONITEMSTATEICON};
+
+    #[implement(IShellItem)]
+    struct FilterItem{attributes:Option<u32>}
+    #[allow(non_snake_case)]
+    impl IShellItem_Impl for FilterItem_Impl{
+        fn BindToHandler(&self,_:Ref<IBindCtx>,_:*const windows::core::GUID,_:*const windows::core::GUID,_:*mut*mut core::ffi::c_void)->Result<()>{Err(Error::from_hresult(HRESULT(0x80004001u32 as i32)))}
+        fn GetParent(&self)->Result<IShellItem>{Err(Error::from_hresult(HRESULT(0x80004001u32 as i32)))}
+        fn GetDisplayName(&self,_:SIGDN)->Result<PWSTR>{Err(Error::from_hresult(HRESULT(0x80004001u32 as i32)))}
+        fn GetAttributes(&self,mask:SFGAO_FLAGS)->Result<SFGAO_FLAGS>{self.attributes.map(|value|SFGAO_FLAGS(value&mask.0))
+            .ok_or_else(||Error::from_hresult(HRESULT(0x80070035u32 as i32)))}
+        fn Compare(&self,_:Ref<IShellItem>,_:u32)->Result<i32>{Err(Error::from_hresult(HRESULT(0x80004001u32 as i32)))}
+    }
+
+    #[test]
+    fn namespace_filter_preserves_deferred_network_containers(){
+        let filter:IShellItemFilter=FolderFilter.into();
+        // The namespace enumerator already restricted candidates to folders.
+        // Remote providers may not expose optional stream attributes until a
+        // connection is ready; do not turn that into a permanent empty branch.
+        for attributes in [None,Some(0),Some(SFGAO_FOLDER.0)]{
+            let item:IShellItem=FilterItem{attributes}.into();
+            let result=unsafe{(Interface::vtable(&filter).IncludeItem)(Interface::as_raw(&filter),Interface::as_raw(&item))};
+            assert_eq!(result,HRESULT(0));
+            let flags=unsafe{filter.GetEnumFlagsForItem(&item)}.unwrap();
+            assert_ne!(flags&SHCONTF_NAVIGATION_ENUM.0 as u32,0);
+            assert_ne!(flags&SHCONTF_FOLDERS.0 as u32,0);
+            assert_eq!(flags&windows::Win32::UI::Shell::SHCONTF_NONFOLDERS.0 as u32,0);
+        }
+        let archive:IShellItem=FilterItem{attributes:Some(SFGAO_FOLDER.0|SFGAO_STREAM.0)}.into();
+        assert_eq!(unsafe{(Interface::vtable(&filter).IncludeItem)(Interface::as_raw(&filter),Interface::as_raw(&archive))},S_FALSE);
+    }
+
+    #[test]
+    #[ignore="Hidden namespace hierarchy probe over owned local fixture directories; no network access or input"]
+    fn native_navigation_tree_expands_nested_folders()->std::result::Result<(),Box<dyn std::error::Error>>{
+        use std::{path::PathBuf,os::windows::fs::MetadataExt};
+        use windows::Win32::{System::Ole::{OleInitialize,OleUninitialize},UI::WindowsAndMessaging::*};
+        let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").ok_or("isolated output required")?);
+        assert!(output.is_absolute());
+        let root=output.join("namespace-hierarchy-fixture");
+        let server=root.join("server");let share=server.join("share");let child=share.join("child");
+        struct Dirs(Vec<PathBuf>);impl Drop for Dirs{fn drop(&mut self){for path in self.0.iter().rev(){let _=std::fs::remove_dir(path);}}}
+        let mut directories=Dirs(Vec::new());
+        for path in [&root,&server,&share,&child]{
+            if !path.exists(){std::fs::create_dir(path)?;directories.0.push(path.clone());}
+            assert_eq!(std::fs::symlink_metadata(path)?.file_attributes()&0x400,0,"fixture is a reparse point");
+        }
+        unsafe{OleInitialize(None)?;}
+        struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
+        struct Window(HWND);impl Drop for Window{fn drop(&mut self){let _=unsafe{DestroyWindow(self.0)};}}
+        let owner=Window(unsafe{CreateWindowExW(WS_EX_NOACTIVATE,windows::core::w!("STATIC"),windows::core::w!("Namespace hierarchy"),
+            WS_POPUP,0,0,320,400,None,None,None,None)?});
+        let tree:INameSpaceTreeControl=unsafe{CoCreateInstance(&NamespaceTreeControl,None,CLSCTX_INPROC_SERVER)?};
+        unsafe{tree.Initialize(owner.0,&RECT{left:0,top:0,right:300,bottom:380},(NSTCS_HASEXPANDOS.0|NSTCS_ROOTHASEXPANDO.0)as u32)?;}
+        let items=[&root,&server,&share,&child].map(|path|unsafe{shell_item(&ShellLocation::Path(path.clone()))}).into_iter().collect::<Result<Vec<_>>>()?;
+        let filter:IShellItemFilter=FolderFilter.into();
+        unsafe{tree.AppendRoot(&items[0],navigation_enum_flags(),NSTCRS_VISIBLE.0 as u32,&filter)?;}
+        for pair in items.windows(2){
+            unsafe{tree.SetItemState(&pair[0],NSTCIS_EXPANDED.0 as u32,NSTCIS_EXPANDED.0 as u32)?;}
+            let deadline=Instant::now()+Duration::from_secs(3);
+            loop{
+                let mut message=MSG::default();while unsafe{PeekMessageW(&mut message,None,0,0,PM_REMOVE)}.as_bool(){
+                    unsafe{let _=TranslateMessage(&message);DispatchMessageW(&message);}
+                }
+                if unsafe{tree.GetItemRect(&pair[1])}.is_ok(){break;}
+                assert!(Instant::now()<deadline,"folder expansion did not expose its child");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(!unsafe{IsWindowVisible(owner.0)}.as_bool(),"hierarchy probe became visible");
+        unsafe{tree.RemoveAllRoots()?;}drop(tree);drop(items);drop(owner);
+        Ok(())
+    }
 
     #[test]
     fn initial_root_follows_explicit_location() {
@@ -709,8 +841,26 @@ mod tests {
     }
 
     #[test]
-    #[ignore="Native Shell metric comparison; requires an interactive Windows session"]
-    fn native_navigation_metrics_follow_system_tree()->std::result::Result<(),Box<dyn std::error::Error>> {
+    fn navigation_density_adapts_to_os_dpi_compact_mode_and_large_text() {
+        for build in [0, 7601, 19045] {
+            assert_eq!(navigation_row_height(build, 96, false, 12), None);
+            assert_eq!(navigation_row_height(build, 192, true, 40), None);
+        }
+        for build in [22000, 22631, 26100] {
+            for (dpi, normal, compact) in [(96, 32, 24), (120, 40, 30), (144, 48, 36), (192, 64, 48)] {
+                let font = scale(12, dpi);
+                assert_eq!(navigation_row_height(build, dpi, false, font), Some(normal));
+                assert_eq!(navigation_row_height(build, dpi, true, font), Some(compact));
+            }
+        }
+        assert_eq!(navigation_row_height(22631, 96, false, 45), Some(58));
+        assert_eq!(navigation_row_height(22631, 96, true, 45), Some(54));
+        assert_eq!(navigation_row_height(22631, 0, false, 0), Some(32));
+    }
+
+    #[test]
+    #[ignore="Hidden native Shell metric comparison; no desktop input"]
+    fn native_navigation_metrics_follow_display_policy()->std::result::Result<(),Box<dyn std::error::Error>> {
         use windows::Win32::{System::Ole::{OleInitialize,OleUninitialize},UI::{WindowsAndMessaging::*,
             Controls::{TVM_GETITEMHEIGHT,TVM_GETINDENT},Shell::NSTCS2_DISPLAYPADDING}};
         unsafe{OleInitialize(None)?;}
@@ -726,15 +876,36 @@ mod tests {
         assert!(!baseline.0.is_null());
         let host=unsafe{NamespaceTreeHost::create_for_location(owner.0,rect,&ShellLocation::ThisPc)?};
         let actual=host.tree_view().ok_or("native tree window")?;
+        unsafe extern "system" fn count_layout(window:HWND,message:u32,wp:WPARAM,lp:LPARAM,_:usize,data:usize)->LRESULT{
+            if message==WM_WINDOWPOSCHANGED||message==TVM_SETITEMHEIGHT{
+                let count=unsafe{&*(data as*const Cell<u32>)};count.set(count.get()+1);
+            }
+            unsafe{DefSubclassProc(window,message,wp,lp)}
+        }
+        let changes=Cell::new(0u32);let data=(&changes as*const Cell<u32>)as usize;
+        let probe=0x5a53_5245;
+        unsafe{SetWindowSubclass(host.hwnd,Some(count_layout),probe,data).ok()?;
+            SetWindowSubclass(actual,Some(count_layout),probe,data).ok()?;}
+        for _ in 0..16{unsafe{host.resize(rect);}}
+        unsafe{RemoveWindowSubclass(host.hwnd,Some(count_layout),probe);
+            RemoveWindowSubclass(actual,Some(count_layout),probe);}
+        assert_eq!(changes.get(),0,"unchanged layout forced a native tree repaint");
         let metrics=|hwnd|[TVM_GETITEMHEIGHT,TVM_GETINDENT].map(|message|unsafe{SendMessageW(hwnd,message,None,None)}.0);
-        assert_eq!(metrics(actual),metrics(baseline),"application replaced native row height/indent");
-        assert_eq!(unsafe{host.tree.cast::<INameSpaceTreeControl2>()?.GetControlStyle2(NSTCS2_DISPLAYPADDING)?},
-            unsafe{native.cast::<INameSpaceTreeControl2>()?.GetControlStyle2(NSTCS2_DISPLAYPADDING)?},"application replaced native root padding");
+        let actual_metrics=metrics(actual);
+        assert_eq!(actual_metrics[1],metrics(baseline)[1],"application replaced Shell indentation");
+        if crate::theme::os_build()<22000 {
+            assert_eq!(actual_metrics[0],metrics(baseline)[0],"legacy Shell height was changed");
+        } else {
+            assert!(actual_metrics[0]>=scale(24,unsafe{GetDpiForWindow(actual)})as isize,"Windows 11 reverted to bare TreeView density");
+        }
+        let padding=unsafe{host.tree.cast::<INameSpaceTreeControl2>()?.GetControlStyle2(NSTCS2_DISPLAYPADDING)?};
+        if crate::theme::os_build()>=22000 {assert_eq!(padding,NSTCS2_DISPLAYPADDING,"Shell root separation was not enabled");}
+        else {assert_eq!(padding,unsafe{native.cast::<INameSpaceTreeControl2>()?.GetControlStyle2(NSTCS2_DISPLAYPADDING)?},"legacy Shell root padding was changed");}
         for dark in [false,true,false] {
             crate::theme::theme_control(raw,dark);crate::theme::theme_control(baseline,dark);
             host.apply_theme(dark,0xffffff,0);unsafe{host.resize(rect);}
             for hwnd in [baseline,actual] {unsafe{SendMessageW(hwnd,WM_THEMECHANGED,None,None);}}
-            assert_eq!(metrics(actual),metrics(baseline),"theme/resize replaced native metrics");
+            assert_eq!(metrics(actual),actual_metrics,"theme/resize lost navigation density or indentation");
         }
         eprintln!("native tree dpi={} height/indent={:?}",unsafe{GetDpiForWindow(actual)},metrics(actual));
         drop(host);drop(native);Ok(())

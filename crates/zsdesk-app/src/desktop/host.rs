@@ -62,6 +62,8 @@ pub const TIMER_DESKTOP: usize = 2;
 pub const TIMER_FOLDER: usize = 3;
 pub const TIMER_PEEK: usize = 4;
 pub const TIMER_ICONS: usize = 5;
+/// Fence timer (6 is the interaction-cancel retry in `desktop::fence_proc`).
+pub const TIMER_AUTOSCROLL: usize = 7;
 pub const FENCE_CLASS: &str = "ZSDesk.Native.Fence";
 pub(super) const TRAY_ID:u32=1;
 
@@ -270,11 +272,18 @@ impl DesktopHost {
         !self.shutting_down && self.loader.accepts_notification(token)
     }
 
-    pub fn update_palette(&mut self) {
-        let dark = match self.config.settings.theme {
+    /// Fence, tab and tray menus follow the fence theme.
+    pub fn menu_dark(&self) -> bool {
+        match self.config.settings.theme {
             FenceTheme::Dark => true, FenceTheme::Light => false, FenceTheme::System => zsdesk_windows::theme::system_dark_mode(),
-        };
+        }
+    }
+
+    pub fn update_palette(&mut self) {
+        let dark = self.menu_dark();
+        zsdesk_windows::flyout::refresh_system();
         self.palette = FencePalette::new(if dark { Mode::Dark } else { Mode::Light }, self.config.settings.opacity);
+        if let Some(accent) = zsdesk_windows::theme::system_accent(dark) { self.palette = self.palette.with_accent(accent); }
     }
 
     pub fn schedule_save(&self) { unsafe { SetTimer(Some(self.hwnd), TIMER_SAVE, 400, None); } }
@@ -609,10 +618,10 @@ impl DesktopHost {
         let sf = |v: f32| v * dpi as f32 / 96.0;
         let style = TextStyle::ui(sf(13.0)).weight(600);
         ids.iter().filter_map(|t| self.config.fence(*t)).map(|f| {
-            let label = if f.locked && f.tab_active { format!("{} \u{1F512}", f.title) } else { f.title.clone() };
-            let (text, _) = self.gfx.measure(&label, &style, sf(400.0));
-            let width = (text.ceil() + sf(20.0)) as i32;
-            TabMeta { id: f.id, label, width: width.clamp(scale(44, dpi), scale(140, dpi)) }
+            let locked = f.locked && f.tab_active;
+            let (text, _) = self.gfx.measure(&f.title, &style, sf(400.0));
+            let width = (text.ceil() + sf(20.0) + if locked { sf(16.0) } else { 0.0 }) as i32;
+            TabMeta { id: f.id, label: f.title.clone(), width: width.clamp(scale(44, dpi), scale(140, dpi)), locked }
         }).collect()
     }
 
@@ -1335,22 +1344,14 @@ impl DesktopHost {
                 }
                 return After::Nothing;
             }
-            Some(Interaction::Rubber { start, base, .. }) => {
-                let g = win.geometry(&fence);
-                let hits = g.in_rect(start, point);
-                let mut selection = base.clone();
-                for i in hits { selection.insert(win.entries[i].key.clone()); }
-                win.selection = selection;
-                win.interaction = Some(Interaction::Rubber { start, current: point, base });
-                // Auto-scroll while the band touches the edges.
-                if point.y > g.content.bottom() { win.scroll = (win.scroll + scale(12, win.dpi)).min(g.max_scroll); }
-                if point.y < g.content.y { win.scroll = (win.scroll - scale(12, win.dpi)).max(0); }
-                self.render(id);
+            Some(Interaction::Rubber { .. }) => {
+                self.update_rubber(id, point);
                 return After::Nothing;
             }
             Some(Interaction::Thumb { cursor_y, scroll }) => {
                 let g = win.geometry(&fence);
-                let track = (g.content.height - g.thumb.height).max(1);
+                // Same track as Geometry::new: the thumb follows the pointer 1:1.
+                let track = (g.content.height - scale(8, win.dpi) - g.thumb.height).max(1);
                 win.scroll = (scroll + ((point.y - cursor_y) as i64 * g.max_scroll as i64 / track as i64) as i32).clamp(0, g.max_scroll);
                 self.render(id);
                 return After::Nothing;
@@ -1366,6 +1367,46 @@ impl DesktopHost {
         let hit = g.hit(point.x, point.y, win.dpi, fence.locked, win.collapsed(&fence));
         if hit != win.hover { win.hover = hit; self.render(id); }
         After::Nothing
+    }
+
+    /// Extends the rubber band to `point` (client coordinates). The band's
+    /// anchor is kept in content coordinates, so scrolling while selecting
+    /// keeps the items it already covers. Beyond the top or bottom edge the
+    /// content scrolls, and keeps scrolling on a timer while the pointer rests.
+    fn update_rubber(&mut self, id: u64, point: POINT) {
+        let Some(index) = self.win_index(id) else { return };
+        let Some(fence) = self.config.fence(id).cloned() else { return };
+        let win = &mut self.fences[index];
+        let Some(Interaction::Rubber { start, base, .. }) = win.interaction.clone() else { return };
+        let g = win.geometry(&fence);
+        let step = scale(12, win.dpi);
+        let scroll = if point.y > g.content.bottom() { (win.scroll + step).min(g.max_scroll) }
+            else if point.y < g.content.y { (win.scroll - step).max(0) } else { win.scroll };
+        let scrolling = scroll != win.scroll;
+        win.scroll = scroll;
+        let g = if scrolling { win.geometry(&fence) } else { g };
+        let anchor = POINT { x: start.x, y: start.y - win.scroll };
+        let mut selection = base.clone();
+        for i in g.in_rect(anchor, point) { selection.insert(win.entries[i].key.clone()); }
+        win.selection = selection;
+        win.interaction = Some(Interaction::Rubber { start, current: point, base });
+        if scrolling { unsafe { SetTimer(Some(win.hwnd), TIMER_AUTOSCROLL, 40, None); } }
+        else { let _ = unsafe { KillTimer(Some(win.hwnd), TIMER_AUTOSCROLL) }; }
+        self.render(id);
+    }
+
+    /// Timer tick: keeps a rubber-band selection scrolling at the content edge.
+    pub fn rubber_autoscroll(&mut self, id: u64) {
+        let Some(index) = self.win_index(id) else { return };
+        let hwnd = self.fences[index].hwnd;
+        if !matches!(self.fences[index].interaction, Some(Interaction::Rubber { .. })) {
+            let _ = unsafe { KillTimer(Some(hwnd), TIMER_AUTOSCROLL) };
+            return;
+        }
+        let mut cursor = POINT::default();
+        let _ = unsafe { GetCursorPos(&mut cursor) };
+        let _ = unsafe { windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut cursor) };
+        self.update_rubber(id, cursor);
     }
 
     /// Rolls a collapsed fence down (`open`) or back up to its title bar.
@@ -1401,7 +1442,8 @@ impl DesktopHost {
         // Keep it open while one of its menus is showing.
         let mut gui = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
         let thread = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
-        let menu_open = unsafe { GetGUIThreadInfo(thread, &mut gui) }.is_ok() && (gui.flags.0 & (GUI_INMENUMODE.0 | GUI_POPUPMENUMODE.0)) != 0;
+        let menu_open = zsdesk_windows::flyout::is_open()
+            || unsafe { GetGUIThreadInfo(thread, &mut gui) }.is_ok() && (gui.flags.0 & (GUI_INMENUMODE.0 | GUI_POPUPMENUMODE.0)) != 0;
         if !inside && !menu_open { self.peek(id, false); }
     }
 
@@ -1474,7 +1516,8 @@ impl DesktopHost {
             FenceHit::Empty => {
                 let base = if ctrl { win.selection.clone() } else { HashSet::new() };
                 win.selection = base.clone();
-                win.interaction = Some(Interaction::Rubber { start: point, current: point, base });
+                let start = POINT { x: point.x, y: point.y + win.scroll };
+                win.interaction = Some(Interaction::Rubber { start, current: point, base });
                 unsafe { windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(win.hwnd); }
             }
             FenceHit::None => {}
@@ -1487,6 +1530,7 @@ impl DesktopHost {
         let Some(index) = self.win_index(id) else { return After::Nothing };
         let win = &mut self.fences[index];
         let interaction = win.interaction.take();
+        let _ = unsafe { KillTimer(Some(win.hwnd), TIMER_AUTOSCROLL) };
         let collapse_desktop_selection=win.standalone&&matches!(&interaction,Some(Interaction::Press{..}))
             &&unsafe{GetKeyState(VK_CONTROL.0 as i32)}>=0&&unsafe{GetKeyState(VK_SHIFT.0 as i32)}>=0;
         if unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() } == win.hwnd {
@@ -1537,6 +1581,7 @@ impl DesktopHost {
     /// any merge preview it was showing.
     pub fn capture_lost(&mut self, id: u64) {
         let Some(index) = self.win_index(id) else { return };
+        let _ = unsafe { KillTimer(Some(self.fences[index].hwnd), TIMER_AUTOSCROLL) };
         if self.fences[index].interaction.take().is_none() { return; }
         if self.merge_target.is_some() { self.set_merge_target(id, None); }
         self.render(id);
@@ -1609,7 +1654,11 @@ impl DesktopHost {
             return;
         }
         let step = if fence.view == FenceView::List { scale(26 * 3, win.dpi) } else { g.cells.first().map_or(80, |c| c.cell.height + scale(2, win.dpi)) };
-        win.scroll = (win.scroll - delta * step / 120).clamp(0, g.max_scroll);
+        // Precision touchpads send small deltas; keep the sign so they still move.
+        let moved = delta * step / 120;
+        let moved = if moved == 0 && delta != 0 { delta.signum() } else { moved };
+        win.scroll = (win.scroll - moved).clamp(0, g.max_scroll);
+        if matches!(win.interaction, Some(Interaction::Rubber { .. })) { self.update_rubber(id, client); return; }
         self.render(id);
     }
 

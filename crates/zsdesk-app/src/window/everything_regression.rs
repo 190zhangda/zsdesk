@@ -95,6 +95,7 @@ fn create_runner(output: &Path, folder: &Path) -> Result<OwnedRunner> {
     unsafe { InitCommonControlsEx(&INITCOMMONCONTROLSEX { dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
         dwICC: ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_LISTVIEW_CLASSES }) }.ok()?;
     let mut session = storage::default_session();
+    session.ui.search_backend=zsdesk_core::model::explorer::SearchBackendPreference::Everything;
     session.tabs = vec![ExplorerTab::new(1, ShellLocation::Path(folder.to_owned()))];
     session.active_tab = 0;
     session.next_id = 2;

@@ -57,7 +57,7 @@ pub enum FenceHit { None, Title, More, Back, Edge(Edges), Item(usize), Empty, Sc
 
 /// One tab of the fence's group as measured at the last render.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TabMeta { pub id: u64, pub label: String, pub width: i32 }
+pub struct TabMeta { pub id: u64, pub label: String, pub width: i32, pub locked: bool }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionChange { All, Clear, Invert }
@@ -77,6 +77,8 @@ pub enum Interaction {
     Move { cursor: POINT, rect: RECT },
     Resize { edges: Edges, cursor: POINT, rect: RECT },
     Press { index: usize, cursor: POINT },
+    /// Rubber-band selection; `start` is in content coordinates (client y +
+    /// scroll at the press), `current` in client coordinates.
     Rubber { start: POINT, current: POINT, base: HashSet<String> },
     Thumb { cursor_y: i32, scroll: i32 },
     /// Pressed on a tab: a click switches to it, a drag reorders or tears it off.
@@ -103,6 +105,9 @@ pub struct Geometry {
     /// Visible tab chips: (index into the fence's tabs, rectangle).
     pub tabs: Vec<(usize, Rect)>,
     pub add: Rect,
+    /// The "+" keeps its place in the layout but is only drawn and clickable
+    /// while the pointer is on the title bar.
+    pub add_hidden: bool,
     pub tab_list: Rect,
     pub hidden_tabs: usize,
 }
@@ -237,7 +242,7 @@ impl Geometry {
             if !self.back.is_empty() && self.back.contains(x, y) { return FenceHit::Back; }
             if let Some((i, _)) = self.tabs.iter().find(|(_, r)| r.contains(x, y)) { return FenceHit::Tab(*i); }
             if !self.tab_list.is_empty() && self.tab_list.contains(x, y) { return FenceHit::TabList; }
-            if !self.add.is_empty() && self.add.contains(x, y) { return FenceHit::AddTab; }
+            if !self.add_hidden && !self.add.is_empty() && self.add.contains(x, y) { return FenceHit::AddTab; }
             return FenceHit::Title;
         }
         if !self.thumb.is_empty() && x >= self.thumb.x - scale(4, dpi) && self.content.contains(x, y) { return FenceHit::Scrollbar; }
@@ -337,7 +342,15 @@ impl FenceWin {
             Geometry::new(r.right - r.left, r.bottom - r.top, self.dpi, fence, self.entries.len(), self.scroll, fence.browse.is_some())
         };
         g.layout_tabs(&self.tabs, self.active_index(), self.dpi);
+        g.add_hidden = !self.title_hovered() || (self.peek && !self.tabbed());
         g
+    }
+
+    /// Pointer on the title bar or one of its buttons. A fence rolled down by
+    /// hovering shows no "+" until it is a tab group: adding tabs stays in the
+    /// fence menu and the strip is not cluttered on every roll-down.
+    fn title_hovered(&self) -> bool {
+        matches!(self.hover, FenceHit::Title | FenceHit::Tab(_) | FenceHit::AddTab | FenceHit::TabList | FenceHit::More | FenceHit::Back)
     }
 
     /// Collapsed as displayed right now (a peeking fence behaves as expanded).
@@ -414,7 +427,15 @@ impl FenceWin {
                     let x = chip.x + sf(10.0);
                     if !(active && renaming_title) {
                         let style = TextStyle::ui(sf(13.0)).weight(if active { 600 } else { 400 });
-                        cv.text(&tab.label, RectF::new(x, chip.y, (chip.right() - sf(10.0) - x).max(0.0), chip.h), &style, color);
+                        let lock = if tab.locked { sf(16.0) } else { 0.0 };
+                        let right = chip.right() - sf(10.0) - lock;
+                        cv.text(&tab.label, RectF::new(x, chip.y, (right - x).max(0.0), chip.h), &style, color);
+                        if tab.locked { cv.glyph(glyph::LOCK, RectF::new(right + sf(2.0), chip.y, sf(14.0), chip.h), sf(10.0), color); }
+                    }
+                    if active && !dropping {
+                        // Windows 11 selector-bar indicator under the selected tab.
+                        let bar = sf(16.0).min(chip.w - sf(12.0)).max(0.0);
+                        cv.round(RectF::new(chip.x + (chip.w - bar) / 2.0, chip.bottom() - sf(3.0), bar, sf(3.0)), sf(1.5), col(palette.accent));
                     }
                 }
                 if !g.tab_list.is_empty() {
@@ -427,11 +448,18 @@ impl FenceWin {
             } else if !renaming_title {
                 let title_style = TextStyle::ui(sf(13.0)).weight(600).align(Align::Center);
                 let side = if hovered { sf(66.0) } else { sf(36.0) };
-                let mut text = fence.title.clone();
-                if fence.locked { text = format!("{text} \u{1F512}"); }
-                cv.text(&text, RectF::new(side, 0.0, (w as f32 - side * 2.0).max(0.0), title.h), &title_style, col(palette.text));
+                let lock = if fence.locked { sf(16.0) } else { 0.0 };
+                let room = (w as f32 - side * 2.0 - lock).max(0.0);
+                let area = RectF::new(side + lock / 2.0, 0.0, room, title.h);
+                cv.text(&fence.title, area, &title_style, col(palette.text));
+                if fence.locked {
+                    // Fluent lock glyph after the centred title (not a color emoji).
+                    let (text_w, _) = cv.gfx().measure(&fence.title, &title_style, room);
+                    let x = area.x + (room + text_w.min(room)) / 2.0 + sf(4.0);
+                    cv.glyph(glyph::LOCK, RectF::new(x, 0.0, sf(12.0), title.h), sf(10.0), col(palette.text_secondary));
+                }
             }
-            if (hovered || self.tabbed()) && !g.add.is_empty() && self.merge_hover.is_none() {
+            if !g.add_hidden && !g.add.is_empty() && self.merge_hover.is_none() {
                 let add = rf(g.add);
                 if self.hover == FenceHit::AddTab { cv.round(add, sf(6.0), col(palette.hover)); }
                 cv.glyph(glyph::ADD, add, sf(11.0), col(palette.text_secondary));
@@ -509,6 +537,7 @@ impl FenceWin {
                     cv.text(&entry.name, label, &label_style, col(palette.text));
                 }
                 if let Some(Interaction::Rubber { start, current, .. }) = &self.interaction {
+                    let start = POINT { x: start.x, y: start.y - self.scroll };
                     let band = RectF::new(start.x.min(current.x) as f32, start.y.min(current.y) as f32,
                         (start.x - current.x).abs() as f32, (start.y - current.y).abs() as f32);
                     cv.fill(band, col(palette.selected));
@@ -615,7 +644,7 @@ mod tests {
     }
 
     fn tabs(widths: &[i32]) -> Vec<TabMeta> {
-        widths.iter().enumerate().map(|(i, w)| TabMeta { id: i as u64 + 1, label: format!("t{i}"), width: *w }).collect()
+        widths.iter().enumerate().map(|(i, w)| TabMeta { id: i as u64 + 1, label: format!("t{i}"), width: *w, locked: false }).collect()
     }
 
     #[test]
@@ -638,6 +667,8 @@ mod tests {
         let (_, second) = g.tabs[1];
         assert_eq!(g.hit(second.x + 3, second.y + 3, 96, false, false), FenceHit::Tab(1));
         assert_eq!(g.hit(g.add.right() + 4, 20, 96, false, false), FenceHit::Title, "space after the tabs moves the fence");
+        g.add_hidden = true;
+        assert_eq!(g.hit(g.add.x + 2, g.add.y + 2, 96, false, false), FenceHit::Title, "a hidden + is not clickable");
     }
 
     #[test]

@@ -71,6 +71,41 @@ fn discard_message(message:u32,lp:LPARAM) {
 }
 
 impl WindowState {
+    pub(super) fn shell_entries(&self)->Vec<crate::shell_window_registry::Entry>{
+        let mut entries=Vec::with_capacity(2);
+        if self.browser.is_some(){if let Some(tab)=self.session.tabs.get(self.session.active_tab){
+            if let Some(entry)=shell_registration::ready_entry(self.browser_source,tab,self.navigation_epoch,self.shown_tab,
+                self.pending.is_some()||self.queued.is_some()){entries.push(entry);}
+        }}
+        if self.session.ui.dual_pane && self.other_pane.browser.is_some(){
+            if let Some(tab)=self.session.secondary_pane.tabs.get(self.session.secondary_pane.active_tab){
+                if let Some(entry)=shell_registration::ready_entry(self.other_pane.browser_source,tab,self.other_pane.navigation_epoch,
+                    self.other_pane.shown_tab,self.other_pane.pending.is_some()||self.other_pane.queued.is_some()){entries.push(entry);}
+            }
+        }
+        entries.sort_by_key(|entry|entry.identity.source);entries
+    }
+
+    pub(super) fn activate_shell_source(&mut self,source:usize)->bool{
+        if source==self.browser_source{return true;}
+        if source!=self.other_pane.browser_source||self.other_pane.browser.is_none()||!self.session.ui.dual_pane{return false;}
+        let previous_epoch=self.navigation_epoch;
+        let requested_epoch=self.other_pane.navigation_epoch;
+        pane_input::discard(self.hwnd);
+        self.activate_pane(!self.active_pane_right);
+        self.navigation_epoch=requested_epoch;
+        self.other_pane.navigation_epoch=previous_epoch;
+        self.browser_source==source
+    }
+
+    pub(super) fn activate_existing_folder_pane(&mut self,location:&ShellLocation){
+        if self.session.tabs.iter().any(|tab|shell_registration::same_location(tab.current(),location)){return;}
+        if self.session.ui.dual_pane&&self.other_pane.browser.is_some()
+            &&self.session.secondary_pane.tabs.iter().any(|tab|shell_registration::same_location(tab.current(),location)){
+            self.activate_pane(!self.active_pane_right);
+        }
+    }
+
     pub(super) fn create_browser(&mut self)->windows::core::Result<ExplorerBrowserHost> {
         self.folder_sizes.cancel();
         self.browser_source=NEXT_BROWSER_SOURCE.fetch_add(1,Ordering::Relaxed).max(1);
@@ -80,6 +115,7 @@ impl WindowState {
             if cfg!(test) { ExplorerBrowserHost::create_transient_with_source(self.hwnd,win_rect(self.layout.browser),self.modern,panes,self.browser_source) }
             else { ExplorerBrowserHost::create_with_source(self.hwnd,win_rect(self.layout.browser),self.modern,panes,self.browser_source) }
         }?;
+        if !cfg!(test) { browser.set_view_state_name(&view_memory::property_bag_name(&self.config_path))?; }
         browser.set_context_menu_options(crate::context_preferences::native(&self.session.ui.context_menu));
         browser.set_content_background(self.dark,colorref(self.palette.content));
         Ok(browser)
@@ -278,13 +314,24 @@ impl WindowState {
     }
 
     pub(super) fn poll_folder_sizes(&mut self) {
+        self.sync_search_preferences();
         let location=self.current_location().clone();
-        let enabled=self.session.ui.everything_folder_sizes;
+        let enabled=self.session.ui.everything_folder_sizes&&!self.session.ui.search_backend.is_builtin();
         let message=self.folder_sizes.poll(self.browser.as_ref(),&location,enabled,self.pending.is_some(),&self.config_path);
         let other_location=self.session.secondary_pane.tabs.get(self.session.secondary_pane.active_tab).map(|tab|tab.current().clone());
         let other_message=other_location.and_then(|location|self.other_pane.folder_sizes.poll(self.other_pane.browser.as_ref(),&location,
             enabled && self.session.ui.dual_pane,self.other_pane.pending.is_some(),&self.config_path));
         if let Some(message)=message.or(other_message) {self.show_message(message);}
+    }
+
+    pub(super) fn cancel_all_search_backends(&mut self){
+        self.cancel_fast_search();self.fast_search=None;self.folder_sizes.cancel();
+        for controls in self.search_panel.tabs.values_mut(){controls.busy=false;}
+        if let Some(search)=&self.other_pane.fast_search{search.cancel();}
+        self.other_pane.fast_search=None;self.other_pane.fast_generation=0;self.other_pane.fast_submitted=None;
+        self.other_pane.fast_events.clear();self.other_pane.fast_restore=None;self.other_pane.folder_sizes.cancel();
+        self.other_pane.fast_clearing=None;self.other_pane.fast_reset_pending=false;self.other_pane.search_progress=None;
+        for controls in self.other_pane.search_panel.tabs.values_mut(){controls.busy=false;}
     }
 
     pub(super) fn layout_dual_pane(&mut self) {

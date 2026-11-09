@@ -25,11 +25,12 @@ impl WindowState {
         self.session.ui.navigation_auto_expand.unwrap_or_else(NamespaceTreeHost::system_auto_expand)
     }
     pub(super) unsafe fn open_requested(&mut self,request:crate::instance::OpenRequest){
+        self.activate_existing_folder_pane(&request.location);
         if self.pending.is_some(){
             if self.open_requests.len()<32{self.open_requests.push_back(request);}
             return;
         }
-        let index=self.session.tabs.iter().position(|t|t.current()==&request.location);
+        let index=self.session.tabs.iter().position(|t|shell_registration::same_location(t.current(),&request.location));
         if index==Some(self.session.active_tab){
             if !request.selections.is_empty(){if let Some(browser)=&self.browser{let _=browser.select_children(&request.selections);}return;}
             if let (Some(browser),Some(name))=(&self.browser,request.selection){let _=browser.select_child(&name);}
@@ -132,6 +133,7 @@ impl WindowState {
             from_tree=request.from_tree;
             request.tab.replace_current(location);
             if let Some(index)=self.session.tabs.iter().position(|t|t.id==request.tab.id) {
+                request.tab.locked=self.session.tabs[index].locked;
                 self.shown_tab=Some(request.tab.id);
                 self.session.tabs[index]=request.tab;
                 if self.queued.is_none() {
@@ -198,6 +200,7 @@ impl WindowState {
     }
     pub(super) unsafe fn close_tab(&mut self,index:usize) {
         if index>=self.session.tabs.len() {return;}
+        if self.session.tabs[index].locked{self.show_message("此标签页已锁定，请先在右键菜单中解锁".into());return;}
         if self.session.tabs.len()==1 && self.session.ui.close_window_on_last_tab {
             if self.close_last_pane_tab() {return;}
             post(self.hwnd,WM_CLOSE,0,0);return;
@@ -325,10 +328,15 @@ impl WindowState {
     }
 }
 pub(super) fn parse_address(text:&str)->Option<ShellLocation> {
-    let text=text.trim().trim_matches('"');
+    parse_address_with(text,|name|std::env::var(name).ok())
+}
+/// `lookup` resolves `%NAME%` references; tests pass a fixed table.
+fn parse_address_with(text:&str,lookup:impl Fn(&str)->Option<String>)->Option<ShellLocation> {
+    let expanded=expand_environment(text.trim().trim_matches('"'),lookup);
+    let text=expanded.trim().trim_matches('"');
     if text.is_empty(){return None;}
     if text=="此电脑" || text.eq_ignore_ascii_case("this pc") || text.eq_ignore_ascii_case("shell:MyComputerFolder") {return Some(ShellLocation::ThisPc);}
-    if text.starts_with("shell:") || text.starts_with("::{") {return Some(ShellLocation::Shell{parsing_name:text.into(),title:"Shell".into()});}
+    if has_prefix(text,"shell:") || text.starts_with("::{") {return Some(ShellLocation::Shell{parsing_name:text.into(),title:"Shell".into()});}
     let lower=text.to_ascii_lowercase();
     // FTP sites open in the Windows Shell FTP folder.
     if lower.starts_with("ftp://") {
@@ -339,6 +347,33 @@ pub(super) fn parse_address(text:&str)->Option<ShellLocation> {
     if let Some(unc)=sftp_to_unc(text) {return Some(ShellLocation::Path(unc));}
     // Shell resolves availability; there is no synchronous filesystem probe on the UI thread.
     Some(ShellLocation::Path(PathBuf::from(text)))
+}
+
+fn has_prefix(text:&str,prefix:&str)->bool {
+    text.get(..prefix.len()).is_some_and(|head|head.eq_ignore_ascii_case(prefix))
+}
+
+/// Expands `%NAME%` like the Explorer address bar, so `%AppData%\Microsoft`
+/// and `%TEMP%` open their folders. Undefined names and a lone `%` stay
+/// literal: folder names may legitimately contain percent signs.
+pub(super) fn expand_environment(text:&str,lookup:impl Fn(&str)->Option<String>)->std::borrow::Cow<'_,str> {
+    if !text.contains('%') {return std::borrow::Cow::Borrowed(text);}
+    let mut result=String::with_capacity(text.len());
+    let mut rest=text;
+    while let Some(start)=rest.find('%') {
+        result.push_str(&rest[..start]);
+        let after=&rest[start+1..];
+        let Some(end)=after.find('%') else {result.push_str(&rest[start..]);return result.into();};
+        let name=&after[..end];
+        match (!name.is_empty() && !name.contains(['=','\0','\\','/'])).then(||lookup(name)).flatten() {
+            Some(value)=>{result.push_str(&value);rest=&after[end+1..];}
+            // Keep the unmatched `%NAME` and rescan from the closing `%`, which
+            // may begin the next reference, as ExpandEnvironmentStrings does.
+            None=>{result.push('%');result.push_str(name);rest=&after[end..];}
+        }
+    }
+    result.push_str(rest);
+    result.into()
 }
 
 /// `smb://host/share/dir` → `\\host\share\dir`.
@@ -385,6 +420,23 @@ pub(super) fn window_text(hwnd:HWND)->String {
         assert_eq!(parse_address("\"D:\\not-yet-mounted\\folder\""),Some(ShellLocation::Path(PathBuf::from("D:\\not-yet-mounted\\folder"))));
         assert!(matches!(parse_address("shell:RecycleBinFolder"),Some(ShellLocation::Shell{..})));
         assert_eq!(parse_address(" "),None);
+        assert!(matches!(parse_address("Shell:Fonts"),Some(ShellLocation::Shell{parsing_name,..}) if parsing_name=="Shell:Fonts"));
+    }
+    #[test] fn address_expands_environment_variables_like_explorer() {
+        let lookup=|name:&str|match name.to_ascii_lowercase().as_str() {
+            "appdata"=>Some(r"C:\Users\me\AppData\Roaming".to_string()),
+            "temp"=>Some(r"C:\Users\me\AppData\Local\Temp".to_string()),
+            "programfiles(x86)"=>Some(r"C:\Program Files (x86)".to_string()),
+            _=>None,
+        };
+        assert_eq!(parse_address_with("%appdata%",lookup),Some(ShellLocation::Path(PathBuf::from(r"C:\Users\me\AppData\Roaming"))));
+        assert_eq!(parse_address_with(" \"%TEMP%\\zs\" ",lookup),Some(ShellLocation::Path(PathBuf::from(r"C:\Users\me\AppData\Local\Temp\zs"))));
+        assert_eq!(parse_address_with("%ProgramFiles(x86)%\\Common Files",lookup),
+            Some(ShellLocation::Path(PathBuf::from(r"C:\Program Files (x86)\Common Files"))));
+        assert_eq!(expand_environment(r"D:\100%\%missing%\%temp%",lookup),r"D:\100%\%missing%\C:\Users\me\AppData\Local\Temp");
+        assert_eq!(expand_environment("50%",lookup),"50%");
+        assert_eq!(expand_environment("%%temp%",lookup),r"%C:\Users\me\AppData\Local\Temp");
+        assert!(matches!(expand_environment(r"C:\plain",lookup),std::borrow::Cow::Borrowed(_)));
     }
     #[test] fn remote_addresses_map_to_shell_and_unc() {
         assert!(matches!(parse_address("ftp://user@ftp.example.com/pub"),Some(ShellLocation::Shell{title,..}) if title=="ftp.example.com"));

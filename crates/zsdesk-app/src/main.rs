@@ -12,7 +12,9 @@ mod storage;
 mod window;
 mod instance;
 mod reveal;
+mod shell_window_registry;
 mod context_preferences;
+mod flyout_menu;
 mod routing_control;
 mod fast_search;
 mod quick_search;
@@ -37,6 +39,7 @@ impl Drop for ApplicationLifetime {
 }
 
 fn main() {
+    if let Some(result)=explorer_forwarder::run_guard_if_requested(){if let Err(error)=result{eprintln!("{error:#}");std::process::exit(1);}return;}
     if let Some(result)=context_menu_process::run_worker_if_requested(){if let Err(error)=result{eprintln!("{error:#}");std::process::exit(1);}return;}
     if let Some(result)=window::preview_process::run_if_requested(){
         if let Err(error)=result{eprintln!("{error:#}");std::process::exit(1);}return;

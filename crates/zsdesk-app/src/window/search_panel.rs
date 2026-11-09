@@ -99,11 +99,12 @@ impl WindowState {
             menus::item("重新搜索","search-refresh"),
             menus::item("关闭搜索\tEsc","search-close"),
             menus::MenuItemSpec::Separator,
-            menus::item("Everything 索引设置…","search-settings"),
+            if self.session.ui.search_backend.is_builtin(){menus::item("重建自带索引","search-native-rebuild")}else{menus::item("Everything 索引设置…","search-settings")},
         ])
     }
 
     pub(super) unsafe fn apply_search_option(&mut self,id:&str)->bool {
+        if id=="search-native-rebuild"{self.rebuild_search_index();return true;}
         let hit=match id {
             "search-scope"=>SearchPanelHit::Scope,"search-order"=>SearchPanelHit::Sort,
             "search-page-previous"=>SearchPanelHit::Previous,"search-page-next"=>SearchPanelHit::Next,
@@ -126,7 +127,8 @@ impl WindowState {
         let layout = &self.layout.search_panel;
         if !self.search_panel.open || layout.card.is_empty() { return; }
         let controls = self.search_controls();
-        let fence = FencePalette::new(if self.dark { Mode::Dark } else { Mode::Light }, 100);
+        let mut fence = FencePalette::new(if self.dark { Mode::Dark } else { Mode::Light }, 100);
+        if let Some(accent) = zsdesk_windows::theme::system_accent(self.dark) { fence = fence.with_accent(accent); }
         let text = color(fence.text);
         let secondary = color(fence.text_secondary);
         let accent = color(fence.accent);
@@ -193,7 +195,7 @@ impl WindowState {
         } else if is_query {
             "没有匹配项目 · 尝试其他关键词或搜索范围".to_owned()
         } else {
-            "输入文件名、路径或 Everything 搜索语法".to_owned()
+            if self.session.ui.search_backend.is_builtin(){"自带搜索：输入文件名、路径或类型筛选".to_owned()}else{"Everything 搜索：输入文件名、路径或搜索语法".to_owned()}
         };
         let status_color = if controls.error.is_some() {
             if self.dark { Color::rgba8(255, 180, 171, 255) } else { Color::rgba8(165, 38, 44, 255) }

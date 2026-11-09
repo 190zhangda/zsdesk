@@ -57,7 +57,7 @@ unsafe extern "system" fn probe(window:HWND,msg:u32,wp:WPARAM,lp:LPARAM,_id:usiz
     if msg==WM_TIMER&&wp.0==PROBE{
         let _=unsafe{KillTimer(Some(window),PROBE)};
         if MORE.with(Cell::get){let _=unsafe{PostMessageW(Some(window),WM_CHAR,WPARAM(b'm' as usize),LPARAM(1))};}
-        else{let _=unsafe{EndMenu()};}return LRESULT(0);
+        else{zsdesk_windows::flyout::cancel();let _=unsafe{EndMenu()};}return LRESULT(0);
     }
     if msg==WM_NCDESTROY{let _=unsafe{windows::Win32::UI::Shell::RemoveWindowSubclass(window,Some(probe),PROBE)};}
     unsafe{windows::Win32::UI::Shell::DefSubclassProc(window,msg,wp,lp)}

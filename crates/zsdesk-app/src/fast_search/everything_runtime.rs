@@ -257,7 +257,7 @@ pub(super) fn ensure_running(configured:Option<&Path>,cancel:&impl Fn()->bool,al
     if fs::symlink_metadata(marker(&root)).is_ok(){let _=fs::remove_file(marker(&root));}
     let executable=bundle()?;
     if !allow_setup&&!can_index()&&!explicit_folders(&root.join("Everything.ini")){
-        bail!("未发现兼容的 Everything 1.4 索引服务；请在“界面设置 → Everything 搜索 → 启用快速索引服务”中启用 ZSdesk 专用服务。版本不明或 1.5 的服务不会复用，也不会改用全盘文件夹扫描");
+        bail!("未发现兼容的 Everything 1.4 索引服务；请在“≡ → 搜索 → 启用快速索引服务…”中启用 ZSdesk 专用服务。版本不明或 1.5 的服务不会复用，也不会改用全盘文件夹扫描");
     }
     write_config(&root)?;
     let instance=instance_name();let mut launch=command(&executable);
@@ -301,7 +301,7 @@ pub(super) fn wait_ready(connection:&Connection,cancel:&impl Fn()->bool,pending:
     // Check once per query before accepting an already-loaded empty database.
     // Resource/version checks must not repeat in the 50 ms readiness loop.
     if connection.managed&&ipc(connection.hwnd,403,0).unwrap_or(0)==0&&service_pipe().is_none()
-        &&!root().is_ok_and(|root|explicit_folders(&root.join("Everything.ini"))){bail!("未发现兼容的 Everything 1.4 索引服务，请在“界面设置 → Everything 搜索 → 启用快速索引服务”中启用 ZSdesk 专用服务；版本不明或 1.5 的服务不会复用");}
+        &&!root().is_ok_and(|root|explicit_folders(&root.join("Everything.ini"))){bail!("未发现兼容的 Everything 1.4 索引服务，请在“≡ → 搜索 → 启用快速索引服务…”中启用 ZSdesk 专用服务；版本不明或 1.5 的服务不会复用");}
     wait_for_ready(||Ok(ipc(connection.hwnd,401,0)?!=0),cancel,pending,Duration::from_secs(120))
 }
 fn wait_for_ready(mut loaded:impl FnMut()->Result<bool>,cancel:&impl Fn()->bool,pending:&mut dyn FnMut(),budget:Duration)->Result<()>{
@@ -336,6 +336,7 @@ pub(super) fn shutdown_managed_if_unused()->Result<()>{
     if other_hosts(){return Ok(());}
     let Some(connection)=managed_connection(&root).filter(|connection|connection.managed)else{return Ok(());};
     let expected=identity(connection.hwnd).context("Everything 进程已结束")?;
+    if visible_client(expected.pid){return Ok(());}
     ensure!(digest(&expected.executable)?==expected_hash()?,"Everything 程序内容已变化，保留该进程");
     let process=Handle(unsafe{OpenProcess(PROCESS_SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,false,expected.pid)}?);
     ensure!(identity(connection.hwnd).as_ref()==Some(&expected),"Everything 进程身份发生变化");
@@ -344,6 +345,17 @@ pub(super) fn shutdown_managed_if_unused()->Result<()>{
         if let Ok(bytes)=fs::read(marker(&root)){if serde_json::from_slice::<OwnedHost>(&bytes).is_ok_and(|record|record.identity==expected){let _=fs::remove_file(marker(&root));}}
     }
     Ok(())
+}
+fn visible_client(process:u32)->bool{
+    struct Find{process:u32,visible:bool}let mut find=Find{process,visible:false};
+    unsafe extern "system" fn each(hwnd:HWND,param:LPARAM)->windows::core::BOOL{
+        let find=unsafe{&mut*(param.0 as*mut Find)};let mut process=0;unsafe{GetWindowThreadProcessId(hwnd,Some(&mut process));}
+        if process==find.process&&unsafe{IsWindowVisible(hwnd)}.as_bool(){
+            let mut name=[0u16;96];let n=unsafe{GetClassNameW(hwnd,&mut name)}.max(0)as usize;
+            let name=String::from_utf16_lossy(&name[..n]);if name=="EVERYTHING"||name=="#32770"{find.visible=true;return false.into();}
+        }true.into()
+    }
+    let _=unsafe{EnumWindows(Some(each),LPARAM((&mut find as*mut Find)as isize))};find.visible
 }
 fn other_hosts()->bool{
     let mut previous=None;

@@ -85,11 +85,15 @@ fn micros(duration:Duration)->u64{duration.as_micros().min(u64::MAX as u128)as u
 struct IdleWorker {
     child:Option<Child>,job:Option<usize>,workspace:PathBuf,session:String,token:String,events:Option<EventSet>,
     count:u32,created:u64,last_used:Instant,desktop:usize,thread:u32,
+    /// A command already ran in this process. Its dialogs, clipboard data or
+    /// file operations own the process lifetime: it exits by itself and is
+    /// never terminated on retirement.
+    committed:bool,
 }
 impl Drop for IdleWorker {fn drop(&mut self){
     let Some(child)=self.child.take()else{return;};
     if let Some(events)=&self.events{EventSet::signal(events.cancel);EventSet::signal(events.request);}
-    retire_child(child,self.job.take(),self.workspace.clone(),self.created,false);
+    retire_child(child,self.job.take(),self.workspace.clone(),self.created,self.committed);
 }}
 struct RetiredChild{child:Child,job:Option<usize>,workspace:PathBuf,identity:u64,committed:bool,deadline:Instant,kill_requested:bool}
 impl Drop for RetiredChild{fn drop(&mut self){if let Some(job)=self.job.take(){let _=unsafe{CloseHandle(HANDLE(job as*mut _))};}}}
@@ -296,6 +300,8 @@ struct MenuOpened{token:String,pid:u32,at:u64,worker_started:u64,observation:Str
 pub struct Client{
     child:Option<Child>,job:Option<usize>,workspace:PathBuf,token:String,session:String,events:Option<EventSet>,
     child_created:u64,ordinal:u32,thread:u32,desktop:usize,started:Instant,started_counter:u64,
+    /// The reused process already executed a command for an earlier request.
+    inherited_commit:bool,
     last_validation:u64,committed:bool,complete:bool,status_dirty:bool,last_status:Option<Status>,timing:MenuTimings,
     mode:Mode,item_count:usize,owner_class:String,diagnostic_written:bool,
 }
@@ -319,12 +325,12 @@ impl Client{
             &&idle.child.as_ref().is_some_and(|child|created(child.id())==Some(idle.created))
             &&read_small::<Status>(&idle.workspace.join("status.json"),65536).is_ok_and(|status|
                 status.phase=="idle"&&status.reusable&&status.token==idle.token&&idle.child.as_ref().is_some_and(|child|status.pid==child.id())));
-        let (mut child,mut job,workspace,session,events,ordinal,child_created,reused)=if let Some(mut idle)=reusable{
-            (idle.child.take(),idle.job.take(),idle.workspace.clone(),idle.session.clone(),idle.events.take().unwrap(),idle.count+1,idle.created,true)
+        let (mut child,mut job,workspace,session,events,ordinal,child_created,reused,inherited_commit)=if let Some(mut idle)=reusable{
+            (idle.child.take(),idle.job.take(),idle.workspace.clone(),idle.session.clone(),idle.events.take().unwrap(),idle.count+1,idle.created,true,idle.committed)
         }else{
             let workspace=root.join(format!("menu-{token}"));fs::create_dir(&workspace)?;
             let events=match EventSet::create(&token){Ok(value)=>value,Err(error)=>{cleanup(&workspace);return Err(error);}};
-            (None,None,workspace,token.clone(),events,1,0,false)
+            (None,None,workspace,token.clone(),events,1,0,false,false)
         };
         events.reset();
         let item_count=pidls.len();
@@ -335,7 +341,7 @@ impl Client{
             #[cfg(test)]probe:origin.probe,};
         let write_started=Instant::now();
         if let Err(error)=validate(&request).and_then(|_|write(&workspace.join("request.json"),&request)){
-            if let Some(child)=child.take(){EventSet::signal(events.cancel);EventSet::signal(events.request);retire_child(child,job.take(),workspace.clone(),child_created,false);}else{cleanup(&workspace);}return Err(error);
+            if let Some(child)=child.take(){EventSet::signal(events.cancel);EventSet::signal(events.request);retire_child(child,job.take(),workspace.clone(),child_created,inherited_commit);}else{cleanup(&workspace);}return Err(error);
         }
         let mut timing=MenuTimings{reused_process:reused,request_write_microseconds:micros(write_started.elapsed()),..Default::default()};
         let identity=if !reused{
@@ -364,7 +370,7 @@ impl Client{
         // COM activation starts only after assignment to the bounded Job.
         EventSet::signal(events.request);
         if let Some(child)=&child{let _=unsafe{AllowSetForegroundWindow(child.id())};}
-        Ok(Self{child,job,workspace,token,session,events:Some(events),child_created:identity,ordinal,thread,desktop,started,started_counter,
+        Ok(Self{child,job,workspace,token,session,events:Some(events),child_created:identity,ordinal,thread,desktop,started,started_counter,inherited_commit,
             last_validation:0,committed:false,complete:false,status_dirty:true,last_status:None,timing,mode,item_count,owner_class,diagnostic_written:false})
     }
     pub fn pid(&self)->Option<u32>{self.child.as_ref().map(Child::id)}
@@ -449,20 +455,36 @@ impl Client{
     pub fn cancel(&mut self){if let Some(events)=&self.events{EventSet::signal(events.cancel);EventSet::signal(events.request);}}
 }
 impl Drop for Client{fn drop(&mut self){
-    let reusable=self.complete&&!self.committed&&self.ordinal<MAX_SESSION_REQUESTS
+    // A worker that executed a command may serve the next menu: the worker
+    // advertises "idle" only without visible windows or clipboard ownership,
+    // and a committed process is never terminated, so keeping it warm avoids
+    // a cold process and cold extension loads on the very next right-click.
+    let committed=self.committed||self.inherited_commit;
+    let reusable=self.complete&&self.ordinal<MAX_SESSION_REQUESTS
         &&self.last_status.as_ref().is_some_and(|status|status.phase=="idle"&&status.reusable&&status.error.is_none())
         &&self.child.as_mut().is_some_and(|child|child.try_wait().ok().flatten().is_none()&&created(child.id())==Some(self.child_created));
     if reusable{
         let idle=IdleWorker{child:self.child.take(),job:self.job.take(),workspace:self.workspace.clone(),session:self.session.clone(),token:self.token.clone(),
-            events:self.events.take(),count:self.ordinal,created:self.child_created,last_used:Instant::now(),desktop:self.desktop,thread:self.thread};
+            events:self.events.take(),count:self.ordinal,created:self.child_created,last_used:Instant::now(),desktop:self.desktop,thread:self.thread,committed};
         let retired={let mut pool=IDLE.lock().unwrap_or_else(|error|error.into_inner());let old=pool.iter().position(|worker|worker.thread==self.thread).map(|index|pool.swap_remove(index));
             let evicted=if pool.len()>=MAX_IDLE_WORKERS{Some(pool.remove(0))}else{None};pool.push(idle);(old,evicted)};drop(retired);start_reaper();return;
     }
     self.cancel();
-    if let Some(child)=self.child.take(){retire_child(child,self.job.take(),self.workspace.clone(),self.child_created,self.committed);}
+    if let Some(child)=self.child.take(){retire_child(child,self.job.take(),self.workspace.clone(),self.child_created,committed);}
 }}
 
 enum AsyncEvent {Validate{before:bool,answer:std::sync::mpsc::SyncSender<bool>},Finished(Result<MenuOutcome>,Option<ShellViewState>)}
+/// Posted to an [`AsyncClient`] owner whenever a validation barrier or the
+/// result is waiting, so the owner answers at once instead of on its next
+/// polling tick (each barrier otherwise added up to one timer period).
+pub fn progress_message()->u32{
+    static MESSAGE:std::sync::OnceLock<u32>=std::sync::OnceLock::new();
+    *MESSAGE.get_or_init(||unsafe{RegisterWindowMessageW(w!("ZSDesk.ContextMenuProgress"))})
+}
+fn notify_owner(owner:isize){
+    let message=progress_message();
+    if message!=0{let _=unsafe{PostMessageW(Some(HWND(owner as*mut _)),message,WPARAM(0),LPARAM(0))};}
+}
 /// Preparation, IPC and diagnostic I/O run off the window STA. Only the exact
 /// selection validation barrier is delivered back to that STA.
 pub struct AsyncClient {
@@ -490,13 +512,14 @@ impl AsyncClient {
             let _active=active;
             if stop.load(Ordering::Acquire){return;}
             let client=Client::spawn_at(HWND(owner as *mut _),POINT{x:coordinates.0,y:coordinates.1},pidls,folder,options,intercept,mode,extended,origin);
-            let mut client=match client{Ok(client)=>client,Err(error)=>{let _=sender.try_send(AsyncEvent::Finished(Err(error),None));return;}};
+            let mut client=match client{Ok(client)=>client,Err(error)=>{let _=sender.try_send(AsyncEvent::Finished(Err(error),None));notify_owner(owner);return;}};
             process.store(client.pid().unwrap_or(0),Ordering::Release);
             loop {
                 if stop.load(Ordering::Acquire){client.cancel();break;}
                 let result=client.poll(&mut|before|{
                     let (answer,receive)=mpsc::sync_channel(1);
                     if sender.try_send(AsyncEvent::Validate{before,answer}).is_err(){return false;}
+                    notify_owner(owner);
                     let deadline=Instant::now()+Duration::from_secs(2);
                     loop {
                         if stop.load(Ordering::Acquire)||Instant::now()>=deadline{return false;}
@@ -507,7 +530,7 @@ impl AsyncClient {
                         }
                     }
                 });
-                if let Some(result)=result {let layout=client.last_status.as_ref().and_then(|status|status.layout.clone());let _=sender.try_send(AsyncEvent::Finished(result,layout));break;}
+                if let Some(result)=result {let layout=client.last_status.as_ref().and_then(|status|status.layout.clone());let _=sender.try_send(AsyncEvent::Finished(result,layout));notify_owner(owner);break;}
                 client.wait_for_progress(20);
             }
         }).context("无法启动菜单通信线程")?;
@@ -704,7 +727,12 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             Err(_)=>break false,
         }
     };
-    let reusable=state.status.error.is_none()&&!state.status.before_invoke&&state.request.ordinal<MAX_SESSION_REQUESTS
+    if state.status.before_invoke{
+        // Property sheets and similar command UI appear asynchronously; let
+        // them become visible before deciding whether this process is idle.
+        pump(150);
+    }
+    let reusable=state.status.error.is_none()&&state.request.ordinal<MAX_SESSION_REQUESTS
         &&persisted&&!owns_clipboard()&&!process_visible_windows(std::process::id(),window)&&!EventSet::signaled(events.cancel);
     if reusable{
         // Release all selection/menu objects and their real owner before
@@ -739,14 +767,21 @@ fn run_worker(path:&Path)->Result<()>{
     let com_started=Instant::now();unsafe{SetErrorMode(0x0001|0x0002);OleInitialize(None)?;}
     let mut com_us=micros(com_started.elapsed());
     struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
+    // An idle process may still host UI or clipboard data of a command it ran
+    // for an earlier request (it is reusable while none is visible yet). Never
+    // end those with the process.
+    let linger=||{
+        while process_visible_windows(std::process::id(),HWND::default()){pump(50);}
+        while owns_clipboard(){pump(50);}
+    };
     loop{
         let ordinal=request.ordinal;let token=request.token.clone();
         if !run_request(path,request, &events,com_us,fault_report_available)?{return Ok(());}com_us=0;
         let deadline=Instant::now()+IDLE_TIMEOUT;
         loop{
-            if EventSet::signaled(events.cancel)||Instant::now()>=deadline||created(parent.0)!=Some(parent.1){return Ok(());}
+            if EventSet::signaled(events.cancel)||Instant::now()>=deadline||created(parent.0)!=Some(parent.1){linger();return Ok(());}
             match wait_signal(&[events.request,events.cancel],1000){
-                Some(0)=>break,Some(1)=>return Ok(()),_=>pump(0),
+                Some(0)=>break,Some(1)=>{linger();return Ok(());},_=>pump(0),
             }
         }
         request=read_small(path,MAX_REQUEST)?;validate(&request)?;

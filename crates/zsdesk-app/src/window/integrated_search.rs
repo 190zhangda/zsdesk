@@ -16,6 +16,7 @@ pub(super) struct SubmittedSearch{
     offset:u32,
     sort:SearchSort,
     executable:Option<PathBuf>,
+    backend:crate::fast_search::SearchOptions,
 }
 
 /// Group user syntax so OR expressions cannot escape a chosen folder/category.
@@ -61,6 +62,8 @@ impl WindowState{
     }
 
     pub(super) fn launch_search_settings(&mut self,service:bool){
+        self.sync_search_preferences();
+        if self.session.ui.search_backend.is_builtin(){self.show_message("当前使用自带搜索，可在搜索设置中调整索引选项".into());return;}
         self.poll_search_settings();
         if self.search_settings_job.is_some(){self.show_message("正在打开搜索设置…".into());return;}
         let profile=self.config_path.clone();let(sender,receiver)=std::sync::mpsc::sync_channel(1);
@@ -167,7 +170,7 @@ impl WindowState{
     pub(super) fn submitted_search(&self,raw:&str)->SubmittedSearch{
         let controls=self.search_controls();
         SubmittedSearch{tab:self.session.active_tab().id,expression:expression(raw,&controls),offset:controls.offset,
-            sort:controls.sort,executable:self.session.ui.everything_executable.clone()}
+            sort:controls.sort,executable:self.session.ui.everything_executable.clone(),backend:crate::fast_search::SearchOptions::from_ui(&self.session.ui)}
     }
     unsafe fn leave_integrated_results(&mut self,target:ShellLocation){
         if self.pending.is_some(){

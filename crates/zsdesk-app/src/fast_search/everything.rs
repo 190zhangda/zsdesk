@@ -35,9 +35,9 @@ pub struct SearchPage{pub items:Vec<SearchItem>,pub total:u64,pub offset:u32}
 
 pub fn running()->Option<HWND>{runtime::running()}
 pub fn executable(configured:Option<&Path>)->Option<PathBuf>{runtime::executable(configured)}
-pub fn open_settings(profile:&Path)->Result<()>{runtime::open_settings(profile)}
+pub fn open_settings(profile:&Path)->Result<()>{let _activity=super::everything_activity();super::require_everything(profile)?;runtime::open_settings(profile)}
 /// Must be invoked only by the explicit “启用全盘索引” user action.
-pub fn enable_service(profile:&Path)->Result<()>{runtime::enable_service(profile)}
+pub fn enable_service(profile:&Path)->Result<()>{let _activity=super::everything_activity();super::require_everything(profile)?;runtime::enable_service(profile)}
 pub fn shutdown_managed_if_unused()->Result<()>{runtime::shutdown_managed_if_unused()}
 
 pub fn choose_executable(owner:HWND)->Result<Option<PathBuf>>{
@@ -142,6 +142,7 @@ fn query_connection(options:&QueryOptions,cookie:u32,server:&runtime::Connection
     }
 }
 pub fn query_page(profile:&Path,options:&QueryOptions,cookie:u32,cancel:impl Fn()->bool)->Result<SearchPage>{
+    let _activity=super::everything_activity();super::require_everything(profile)?;
     query_with(options,cookie,runtime::configured(profile).as_deref(),cancel)
 }
 
@@ -149,6 +150,7 @@ pub fn query_page(profile:&Path,options:&QueryOptions,cookie:u32,cancel:impl Fn(
 /// This never requests a filesystem scan, enables an index, or treats a missing
 /// index entry as a zero-byte folder. Call only from a cancellable worker.
 pub(crate) fn query_folder_sizes(profile:&Path,paths:&[PathBuf],cookie:u32,cancel:impl Fn()->bool)->Result<Vec<(PathBuf,Option<u64>)>> {
+    let _activity=super::everything_activity();super::require_everything(profile)?;
     ensure!(paths.len()<=64,"一次最多查询 64 个可见文件夹");
     if paths.is_empty(){return Ok(Vec::new());}
     if cancel(){bail!("文件夹大小查询已取消");}
@@ -199,17 +201,15 @@ fn folder_size_literal(path:&Path)->Option<String>{
     Some(literal.to_owned())
 }
 /// Compatibility entry used by the existing main-window and native IPC probes.
-pub(super) fn query(text:&str,cookie:u32,configured:Option<&Path>,cancel:impl Fn()->bool)->Result<(Vec<PathBuf>,u64,bool)>{
+#[cfg(test)]pub(super) fn query(text:&str,cookie:u32,configured:Option<&Path>,cancel:impl Fn()->bool)->Result<(Vec<PathBuf>,u64,bool)>{
     let page=query_with(&QueryOptions{text:text.into(),limit:PAGE_LIMIT,..Default::default()},cookie,configured,cancel)?;
     let truncated=u64::from(page.offset)+(page.items.len()as u64)<page.total;
     Ok((page.items.into_iter().map(|item|item.path).collect(),page.total,truncated))
 }
-pub(super) fn run(shared:Arc<Shared>,sender:SyncSender<SearchEvent>,configured:Option<PathBuf>){
-    shared.maintenance_role.store(2,Ordering::Release);
-    while !shared.stop.load(Ordering::Acquire){
-        let request={let mut control=shared.control.lock().unwrap_or_else(|e|e.into_inner());while control.request.is_none()&&!shared.stop.load(Ordering::Acquire){control.action=ScanAction::None;control=shared.wake.wait(control).unwrap_or_else(|e|e.into_inner());}control.request.take()};
-        let Some(request)=request else{continue;};
-        let options=QueryOptions{text:request.query,offset:request.offset,limit:request.limit,sort:request.sort};
+pub(super) fn execute(shared:&Shared,sender:&SyncSender<SearchEvent>,request:&Request,profile:&Path,configured:Option<PathBuf>){
+        let _activity=super::everything_activity();
+        if let Err(error)=super::require_everything(profile){emit(shared,sender,failure(request.generation,BackendKind::Everything,error.to_string()));return;}
+        let options=QueryOptions{text:request.query.clone(),offset:request.offset,limit:request.limit,sort:request.sort};
         let mut pending=||{
             if shared.current(request.generation){
                 let event=SearchEvent{generation:request.generation,paths:Vec::new(),scanned:0,indexed:0,denied:0,skipped_reparse:0,scanning:true,
@@ -220,8 +220,8 @@ pub(super) fn run(shared:Arc<Shared>,sender:SyncSender<SearchEvent>,configured:O
         // The Shell results view consumes paths only. Asking an external
         // Everything instance for unindexed size/date fields can force disk
         // metadata reads even though these values would be discarded here.
-        let outcome=if let Some(error)=request.invalid{Err(anyhow::anyhow!(error))}else{query_with_progress(&options,request.generation as u32,configured.as_deref(),||!shared.current(request.generation),REQUEST_FULL_PATH,&mut pending)};
-        if !shared.current(request.generation){continue;}
+        let outcome=if let Some(error)=&request.invalid{Err(anyhow::anyhow!(error.clone()))}else{query_with_progress(&options,request.generation as u32,configured.as_deref(),||!shared.current(request.generation)||shared.cancelled(),REQUEST_FULL_PATH,&mut pending)};
+        if !shared.current(request.generation){return;}
         let (paths,total,truncated,error)=match outcome{
             Ok(page)=>{let truncated=u64::from(page.offset)+(page.items.len()as u64)<page.total;(page.items.into_iter().map(|item|item.path).collect::<Vec<_>>(),page.total,truncated,None)},
             Err(error)=>(Vec::new(),0,false,Some(format!("{error:#}"))),
@@ -233,11 +233,11 @@ pub(super) fn run(shared:Arc<Shared>,sender:SyncSender<SearchEvent>,configured:O
                 finished:index+1==batches,truncated,error:error.clone(),reset:false,backend:BackendKind::Everything,phase:IndexPhase::Ready,volumes:Vec::new(),read_only:true};
             loop{if !shared.current(request.generation){break;}match sender.try_send(event){Ok(())=>{shared.notify();break;},Err(TrySendError::Full(value))=>{event=value;thread::sleep(Duration::from_millis(10));},Err(TrySendError::Disconnected(_))=>return,}}
         }
-    }
 }
 
 #[cfg(test)]mod tests{
     use super::*;
+    use std::os::windows::fs::MetadataExt;
     #[test]fn folder_size_lookup_escapes_paths_and_requests_only_indexed_size(){
         assert_eq!(folder_size_pattern(Path::new(r"C:\资料\a[1]+.x")),Some(r"^C:\\资料\\a\[1\]\+\.x$".into()));
         assert_eq!(folder_size_pattern(Path::new(r"\\?\C:\a\b")),folder_size_pattern(Path::new(r"C:\a\b")));
@@ -296,7 +296,8 @@ pub(super) fn run(shared:Arc<Shared>,sender:SyncSender<SearchEvent>,configured:O
         let expected=std::env::var("ZSDESK_EVERYTHING_FOLDER_TEST_BYTES")?.parse::<u64>()?;
         let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("native output")?);
         let missing=path.join("__zsdesk_folder_size_missing__");ensure!(!missing.exists(),"missing fixture exists");
-        let values=query_folder_sizes(&output.join("folder-size-test-profile.json"),&[path.clone(),missing.clone()],0x5a535a31,||false)?;
+        let profile=output.join("folder-size-test-profile.json");let mut session=crate::storage::default_session();session.ui.search_backend=BackendPreference::Everything;crate::storage::save(&profile,&session)?;
+        let values=query_folder_sizes(&profile,&[path.clone(),missing.clone()],0x5a535a31,||false)?;
         ensure!(values==vec![(path,Some(expected)),(missing,None)],"indexed folder size/unknown mismatch: {values:?}");
         Ok(())
     }

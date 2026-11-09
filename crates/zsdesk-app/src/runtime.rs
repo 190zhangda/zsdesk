@@ -101,6 +101,7 @@ fn run_window_pool(id:u64,destination:isize,commands:mpsc::Receiver<PoolCommand>
             Ok(PoolCommand::Run(job))=>{
                 trace(&format!("window-job-start {} pool={id}",job.id));
                 let result=std::panic::catch_unwind(||crate::app::run_arguments(job.args,true));
+                zsdesk_windows::flyout::release_thread_resources();
                 trace(&format!("window-job-return {} pool={id}",job.id));
                 let panicked=result.is_err();
                 let error=match result{Ok(Ok(()))=>None,Ok(Err(error))=>Some(format!("{error:#}")),Err(_)=>Some("文件窗口线程异常退出".into())};

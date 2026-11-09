@@ -47,7 +47,7 @@ impl WindowState {
         let current = self.current_location().clone();
         let address_icon = self.icon_for(&current);
         let bookmark_icons: Vec<Option<ID2D1Bitmap>> = (0..self.layout.bookmarks.len())
-            .map(|i| { let t = self.session.bookmarks[i].target.clone(); self.icon_for(&t) }).collect();
+            .map(|i| {let index=self.bookmark_index(i)?;if self.session.bookmarks[index].is_folder{return None;}let t=self.session.bookmarks[index].target.clone();self.icon_for(&t)}).collect();
         let (Some(gfx), Some(surface)) = (self.gfx.as_ref(), self.surface.as_ref()) else { return };
         let result = gfx.draw(surface, |cv| {
             self.paint_strip(cv, &tab_icons);
@@ -115,7 +115,8 @@ impl WindowState {
             }
             let icon_size = self.sf(ICON_DIP as f32);
             let icon_rect = RectF::new(r.x + self.sf(12.0), r.y + (r.h - icon_size) / 2.0, icon_size, icon_size);
-            if let Some(Some(bitmap)) = icons.get(n) { cv.image(bitmap, pixel_aligned_icon(icon_rect), 1.0); }
+            if self.session.tabs[slot.index].locked&&!slot.show_close{cv.glyph("\u{E72E}",icon_rect,self.sf(14.0),text);}
+            else if let Some(Some(bitmap)) = icons.get(n) { cv.image(bitmap, pixel_aligned_icon(icon_rect), 1.0); }
             else { cv.glyph(if matches!(self.session.tabs[slot.index].current(),ShellLocation::Search{..}){glyph::SEARCH}else{glyph::FOLDER}, icon_rect, self.sf(14.0), text); }
             let title_right = if slot.show_close { slot.close.x as f32 - self.sf(2.0) } else { r.right() - self.sf(10.0) };
             let title = self.session.tabs[slot.index].current().title();
@@ -124,7 +125,7 @@ impl WindowState {
             if slot.show_close {
                 let close = rf(slot.close);
                 if self.hover == Hit::TabClose(slot.index) { cv.round(close, self.sf(4.0), c(p.hover)); }
-                cv.glyph(glyph::CLOSE_SMALL, close, self.sf(10.0), text);
+                cv.glyph(if self.session.tabs[slot.index].locked{"\u{E72E}"}else{glyph::CLOSE_SMALL}, close, self.sf(10.0), text);
             }
             if self.layout.vertical_tabs { cv.pop_clip(); }
         }
@@ -303,23 +304,30 @@ impl WindowState {
             cv.text("将文件夹拖到这里，或按 Ctrl+D 收藏当前文件夹", RectF::new(r.x + self.sf(14.0), r.y, r.w - self.sf(28.0), r.h), &self.ui_style(), c(p.text_secondary));
         }
         for (i, rect) in l.bookmarks.iter().enumerate() {
-            if self.rename_index == Some(i) {
+            let Some(index)=self.bookmark_index(i)else{continue;};
+            if self.rename_index == Some(index) {
                 let r = rf(LayoutRect::new(rect.x, rect.y, rect.width.max(self.s(140)), rect.height));
                 self.text_box(cv, r, true, false);
                 continue;
             }
             self.button_fill(cv, *rect, Hit::Bookmark(i), self.sf(4.0));
+            if let Some(drag)=self.bookmark_drag.filter(|drag|drag.moved){if self.hover==Hit::Bookmark(i){
+                if self.session.bookmarks[index].is_folder&&drag.point.x>=rect.x+rect.width/4&&drag.point.x<rect.right()-rect.width/4{
+                    cv.stroke_round(rf(*rect),self.sf(4.0),c(p.accent),self.sf(2.0));
+                }else{let x=if drag.point.x<rect.x+rect.width/2{rect.x}else{rect.right()}as f32;cv.line(x,rect.y as f32,x,rect.bottom()as f32,c(p.accent),self.sf(2.0));}
+            }}
             let r = rf(*rect);
             let icon = self.sf(ICON_DIP as f32);
             let icon_rect = RectF::new(r.x + self.sf(8.0), r.y + (r.h - icon) / 2.0, icon, icon);
             match icons.get(i) { Some(Some(b)) => cv.image(b, pixel_aligned_icon(icon_rect), 1.0), _ => cv.glyph(glyph::FOLDER, icon_rect, self.sf(14.0), c(p.text)) }
             let x = icon_rect.right() + self.sf(6.0);
-            cv.text(&self.session.bookmarks[i].display_name, RectF::new(x, r.y, r.right() - x - self.sf(6.0), r.h), &self.ui_style(), c(p.text));
+            cv.text(&self.bookmark_label(index), RectF::new(x, r.y, r.right() - x - self.sf(6.0), r.h), &self.ui_style(), c(p.text));
         }
         if !l.bookmark_overflow.is_empty() {
             self.button_fill(cv, l.bookmark_overflow, Hit::BookmarkOverflow, self.sf(4.0));
             cv.glyph("\u{E76C}", rf(l.bookmark_overflow), self.sf(10.0), c(p.text));
         }
+        if let Some(index)=self.rename_index{if !self.bookmark_order.iter().take(l.bookmarks.len()).any(|i|*i==index){self.text_box(cv,rf(self.bookmark_rect(index)),true,false);}}
     }
 
     fn paint_content(&self, cv: &Canvas) {
@@ -339,8 +347,17 @@ impl WindowState {
                 cv.line(header.x as f32,header.bottom()as f32-1.0,header.right()as f32,header.bottom()as f32-1.0,
                     c(if active{p.accent}else{p.divider}),if active{2.0}else{1.0});
             }
-            let split=l.pane_splitter;
-            cv.fill(rf(split),c(if self.hover==Hit::PaneSplitter || self.pane_splitter_drag.is_some(){p.hover}else{p.layer}));
+            // A hairline divider like Windows 11 split views; the full gap stays
+            // the drag target and shows a grip while hovered or dragged.
+            let split=rf(l.pane_splitter);
+            cv.fill(split,c(p.content));
+            let middle=(split.x+split.w/2.0).floor()+0.5;
+            if self.hover==Hit::PaneSplitter || self.pane_splitter_drag.is_some() {
+                let grip=self.sf(3.0);
+                cv.round(RectF::new(middle-grip/2.0,split.y,grip,split.h),grip/2.0,c(p.text_secondary).with_alpha(0.55));
+            } else {
+                cv.line(middle,split.y,middle,split.bottom(),c(p.divider),1.0);
+            }
         }
         if !l.splitter.is_empty() && (self.hover == Hit::Splitter || self.splitter_drag.is_some()) {
             let x = l.splitter.x as f32 + l.splitter.width as f32 / 2.0;
@@ -358,7 +375,8 @@ impl WindowState {
             let panes = [CommandId::PreviewPane, CommandId::DetailsPane];
             let left = l.commands.iter().filter(|(id, _)| !panes.contains(id)).map(|(_, r)| r.right()).max().unwrap_or(0) as f32 + self.sf(16.0);
             let right = l.commands.iter().filter(|(id, _)| panes.contains(id)).map(|(_, r)| r.x).min().map_or(row.right() - self.sf(12.0), |x| x as f32 - self.sf(12.0));
-            cv.text(&self.status, RectF::new(left, row.y, (right - left).max(0.0), row.h), &self.ui_style().align(Align::End), c(p.danger));
+            cv.text(&self.status, RectF::new(left, row.y, (right - left).max(0.0), row.h), &self.ui_style().align(Align::End),
+                c(if status_is_error(&self.status) { p.danger } else { p.text_secondary }));
             return;
         }
         let r = rf(l.status);
@@ -375,10 +393,11 @@ impl WindowState {
         if !self.status.is_empty() || self.search_progress.is_some() {
             let x = left + w + self.sf(24.0);
             let text=if self.status.is_empty(){self.search_progress.as_deref().unwrap_or("")}else{&self.status};
-            cv.text(text, RectF::new(x, r.y, (l.status_dual_pane.x as f32 - x - self.sf(8.0)).max(0.0), r.h), &style, c(if self.status.is_empty(){p.text_secondary}else{p.danger}));
+            cv.text(text, RectF::new(x, r.y, (l.status_dual_pane.x as f32 - x - self.sf(8.0)).max(0.0), r.h), &style,
+                c(if status_is_error(&self.status) {p.danger} else {p.text_secondary}));
         }
         let (mode, _) = self.view_mode;
-        for (rect, hit, g, on) in [(l.status_dual_pane,Hit::StatusDualPane,"\u{E8A9}",self.session.ui.dual_pane),
+        for (rect, hit, g, on) in [(l.status_dual_pane,Hit::StatusDualPane,glyph::DUAL_PANE,self.session.ui.dual_pane),
             (l.status_details, Hit::StatusDetails, glyph::DETAILS_VIEW, mode == 4), (l.status_tiles, Hit::StatusTiles, glyph::TILES_VIEW, mode == 1)] {
             if on { cv.round(rf(rect), self.sf(4.0), c(p.pressed)); cv.round(RectF::new(rect.x as f32 + self.sf(9.0), rect.bottom() as f32 - self.sf(3.0), rect.width as f32 - self.sf(18.0), self.sf(2.0)), self.sf(1.0), c(p.accent)); }
             self.button_fill(cv, rect, hit, self.sf(4.0));
@@ -404,11 +423,12 @@ impl WindowState {
     }
 
     pub(super) fn measure_bookmarks(&mut self) {
+        self.bookmark_order=self.session.visible_bookmarks();
         let Some(gfx) = self.gfx.as_ref() else { return };
         let style = self.ui_style();
         let extra = self.s(8) + self.s(ICON_DIP) + self.s(6) + self.s(10);
-        self.bookmark_widths = self.session.bookmarks.iter()
-            .map(|b| (gfx.measure(&b.display_name, &style, 600.0).0 as i32 + extra).min(self.s(220))).collect();
+        self.bookmark_widths = self.bookmark_order.iter().map(|&index|
+            (gfx.measure(&self.bookmark_label(index), &style, 600.0).0 as i32 + extra).min(self.s(220))).collect();
     }
 }
 
@@ -493,5 +513,22 @@ mod icon_geometry_tests {
             }
             if width >= 70 { assert!(slots.iter().any(|slot| slot.part == CrumbPart::Crumb(2))); }
         }}}
+    }
+}
+
+/// Status text that reports a failure is drawn in the critical color; progress
+/// and confirmations ("已复制 3 个路径") stay neutral.
+fn status_is_error(text: &str) -> bool {
+    ["失败", "无法", "错误", "未找到", "不支持", "未保存", "未更新", "未启动", "异常", "超时", "需要修复"].iter().any(|word| text.contains(word))
+}
+
+#[cfg(test)]
+mod status_tests {
+    #[test]
+    fn confirmations_are_not_painted_as_errors() {
+        assert!(!super::status_is_error("已复制 3 个路径"));
+        assert!(!super::status_is_error("下次登录 Windows 时将启动桌面格子"));
+        assert!(super::status_is_error("操作失败：拒绝访问"));
+        assert!(super::status_is_error("无法预览：文件被占用"));
     }
 }

@@ -121,9 +121,21 @@ pub struct ExplorerBrowserHost {
     results_location: Rc<RefCell<Option<ShellLocation>>>,
     search_materializing_until: Cell<Option<std::time::Instant>>,
     search_metrics:Cell<SearchMaterializationMetrics>,
+    bounds:Cell<RECT>,
 }
 
 impl ExplorerBrowserHost {
+    /// Names the application's per-folder Shell view preferences. Set this
+    /// before the first navigation, and keep the name stable across launches.
+    /// Transient hosts retain EBO_NOPERSISTVIEWSTATE and never write the bag.
+    pub fn set_view_state_name(&self, name: &str) -> Result<()> {
+        if name.is_empty() || name.contains('\0') {
+            return Err(Error::from_hresult(HRESULT(0x80070057u32 as i32)));
+        }
+        let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        unsafe { self.browser.SetPropertyBag(windows::core::PCWSTR(name.as_ptr())) }
+    }
+
     /// Creates a host that does not persist Shell-managed folder view settings.
     ///
     /// # Safety
@@ -223,6 +235,7 @@ impl ExplorerBrowserHost {
             results_location,
             search_materializing_until: Cell::new(None),
             search_metrics:Cell::new(SearchMaterializationMetrics::default()),
+            bounds:Cell::new(rect),
         };
         Ok(host)
     }
@@ -513,7 +526,11 @@ impl ExplorerBrowserHost {
     ///
     /// Must be called on the STA/UI thread that created this host.
     pub unsafe fn resize(&self, rect: RECT) {
-        let _ = unsafe { self.browser.SetRect(None, rect) };
+        // IExplorerBrowser may invalidate its child view even for the same
+        // rectangle. Preserve native scrolling when chrome layout is unchanged.
+        if self.bounds.get()!=rect && unsafe { self.browser.SetRect(None, rect) }.is_ok() {
+            self.bounds.set(rect);
+        }
     }
 
     /// Disconnects callbacks and destroys the hosted Shell view.

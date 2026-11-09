@@ -78,7 +78,7 @@ use windows::{
 use zsdesk_ui::menus::{MenuItemSpec, MenuSpec, UiCommand};
 use zsdesk_windows::{desktop::{self, DesktopHit}, gfx::Gfx, ole::DropHandler, shell::{menu::{forward_menu_message, HistoryAction, MenuInterceptions, MenuOutcome, ShellMenu, APP_FIRST}, notify::read_change}};
 
-use host::{After, DesktopHost, TIMER_DESKTOP, TIMER_FOLDER, TIMER_PEEK, TIMER_SAVE, TIMER_ICONS, WM_DESKTOP_CHANGED, WM_DESKTOP_DBLCLICK, WM_FOLDER_CHANGED,
+use host::{After, DesktopHost, TIMER_AUTOSCROLL, TIMER_DESKTOP, TIMER_FOLDER, TIMER_PEEK, TIMER_SAVE, TIMER_ICONS, WM_DESKTOP_CHANGED, WM_DESKTOP_DBLCLICK, WM_FOLDER_CHANGED,
     WM_ICON_READY, WM_RENAME_DONE, WM_TRAY};
 
 const HOST_CLASS: &str = "ZSDesk.Native.DesktopHost";
@@ -228,6 +228,7 @@ fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopComm
     HOST_HWND.with(|h| h.set(hwnd.0 as isize));
     let (family, _) = zsdesk_windows::gfx::system_ui_font(None);
     let gfx = Gfx::new(&family).context("Direct2D 初始化失败")?;
+    zsdesk_windows::flyout::prepare();
     let config = host::load_config(&config_path);
     let hook = config.settings.double_click_toggle;
     HOST.with(|h| *h.borrow_mut() = Some(DesktopHost::new(hwnd, config_path, explorer_config, config, gfx)));
@@ -512,6 +513,7 @@ unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             return LRESULT(0);
         }
         WM_TIMER if wp.0 == TIMER_PEEK => { with_host(|h| h.peek_check(id)); return LRESULT(0); }
+        WM_TIMER if wp.0 == TIMER_AUTOSCROLL => { with_host(|h| h.rubber_autoscroll(id)); return LRESULT(0); }
         WM_TIMER if wp.0 == TIMER_FOLDER => {
             let _ = unsafe { KillTimer(Some(hwnd), TIMER_FOLDER) };
             if with_host(|h| h.refresh_folder(id)).is_none() { unsafe { SetTimer(Some(hwnd), TIMER_FOLDER, 500, None); } }
@@ -916,7 +918,9 @@ fn insert_item(hmenu: HMENU, position: &mut u32, item: &MenuItemSpec, ids: &mut 
             let mut inner = 0u32;
             for child in &menu.items { insert_item(sub, &mut inner, child, ids); }
             let flags = MF_BYPOSITION | MF_POPUP | if *enabled { MF_ENABLED } else { MF_GRAYED };
-            unsafe { let _ = InsertMenuW(hmenu, *position, flags, sub.0 as usize, PCWSTR(wide(label).as_ptr())); }
+            if unsafe { InsertMenuW(hmenu, *position, flags, sub.0 as usize, PCWSTR(wide(label).as_ptr())) }.is_err() {
+                let _ = unsafe { DestroyMenu(sub) };
+            }
             *position += 1;
         }
         MenuItemSpec::Separator => {
@@ -927,13 +931,10 @@ fn insert_item(hmenu: HMENU, position: &mut u32, item: &MenuItemSpec, ids: &mut 
     }
 }
 
-/// Plain popup for a ZSUI menu spec.
+/// Fence, tab and tray menus as Windows 11 style flyouts at `point`.
 fn popup(owner: HWND, spec: &MenuSpec, point: POINT) -> Option<String> {
-    let menu = unsafe { CreatePopupMenu() }.ok()?;
-    let ids = { let mut ids = Vec::new(); let mut p = 0; for item in &spec.items { insert_item(menu, &mut p, item, &mut ids); } ids };
-    let chosen = unsafe { TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, None, owner, None) }.0 as u32;
-    let _ = unsafe { DestroyMenu(menu) };
-    chosen.checked_sub(APP_FIRST).and_then(|i| ids.get(i as usize)).cloned()
+    let dark = with_host(|host| host.menu_dark()).unwrap_or_else(zsdesk_windows::theme::system_dark_mode);
+    crate::flyout_menu::show(owner, spec, crate::flyout_menu::MenuAnchor::Point { x: point.x, y: point.y }, dark)
 }
 
 // ---- drag and drop target ---------------------------------------------------------

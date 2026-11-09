@@ -48,7 +48,7 @@ pub(super) fn cleanup(workspace:&Path){
 
 pub(super) struct PreviewProcess {
     child:RefCell<Option<Child>>,job:Option<usize>,workspace:PathBuf,request:Request,
-    hwnd:Cell<HWND>,started:Instant,ready:Cell<bool>,reported_exit:bool,selection:Option<ViewIdentity>,
+    hwnd:Cell<HWND>,started:Instant,ready:Cell<bool>,selection:Option<ViewIdentity>,
 }
 impl PreviewProcess {
     pub(super) fn open_with_options(owner:HWND,path:&Path,provider:PreviewProviderPreference,dark:bool,hover:bool)->Result<Self>{
@@ -82,7 +82,7 @@ impl PreviewProcess {
             .and_then(|_|AssignProcessToJobObject(job,HANDLE(child.as_raw_handle())))};
         if let Err(error)=attached{let _=child.kill();let _=child.wait();let _=unsafe{CloseHandle(job)};cleanup(&workspace);return Err(error.into());}
         unsafe{SetTimer(Some(owner),TIMER,100,None);}
-        Ok(Self{child:RefCell::new(Some(child)),job:Some(job.0 as usize),workspace,request,hwnd:Cell::new(HWND::default()),started:Instant::now(),ready:Cell::new(false),reported_exit:false,selection:None})
+        Ok(Self{child:RefCell::new(Some(child)),job:Some(job.0 as usize),workspace,request,hwnd:Cell::new(HWND::default()),started:Instant::now(),ready:Cell::new(false),selection:None})
     }
     pub(super) fn is_open(&self)->bool{
         self.child.borrow_mut().as_mut().is_some_and(|child|child.try_wait().ok().flatten().is_none())
@@ -104,6 +104,7 @@ impl PreviewProcess {
     }
     pub(super) fn set_dark(&mut self,dark:bool)->Result<()>{
         if self.request.dark==dark{return Ok(());}
+        if self.child.borrow().is_none(){self.request.dark=dark;return Ok(());}
         let previous=self.request.dark;self.request.dark=dark;
         if let Err(error)=write_json(&self.workspace.join("request.json"),&self.request){self.request.dark=previous;return Err(error);}Ok(())
     }
@@ -117,13 +118,16 @@ impl PreviewProcess {
     pub(super) fn poll(&mut self)->Option<String>{
         let exited=self.child.borrow_mut().as_mut().and_then(|child|child.try_wait().ok().flatten());
         if let Some(exit)=exited {
-            if !self.reported_exit && !exit.success(){
-                self.reported_exit=true;
+            // The visible worker can close itself. Reap its handles and files
+            // now; a completed pane keeps only its request as a retry barrier.
+            self.release_exited();
+            if !exit.success(){
                 super::diagnostics::record("preview","worker-exit",exit.code());
                 return Some(format!("预览宿主异常退出（{exit}），文件管理窗口可继续使用。"));
             }
             return None;
         }
+        if self.child.borrow().is_none(){return None;}
         if let Ok(bytes)=fs::read(self.workspace.join("status.json")){
             if bytes.len()<65536{if let Ok(status)=serde_json::from_slice::<Status>(&bytes){
                 if self.child.borrow().as_ref().is_some_and(|child|child.id()==status.pid){
@@ -138,6 +142,15 @@ impl PreviewProcess {
             self.close();return Some("预览加载超时，已关闭预览宿主；文件管理窗口可继续使用。".into());
         }
         None
+    }
+    fn release_exited(&mut self){
+        self.child.get_mut().take();
+        self.hwnd.set(HWND::default());self.ready.set(false);
+        if let Some(job)=self.job.take(){let _=unsafe{CloseHandle(HANDLE(job as*mut _))};}
+        cleanup(&self.workspace);
+    }
+    fn replace_pane(&self,provider:PreviewProviderPreference,path:&Path)->bool{
+        self.request.provider!=provider||(!self.is_open()&&self.request.path!=path)
     }
     pub(super) fn close(&mut self){
         let Some(mut child)=self.child.borrow_mut().take() else{return;};
@@ -156,6 +169,18 @@ impl PreviewProcess {
     }
 }
 impl Drop for PreviewProcess{fn drop(&mut self){self.close();}}
+
+pub(super) fn poll_previews(quick:&mut Option<PreviewProcess>,pane:&mut Option<PreviewProcess>)->Vec<String>{
+    let mut errors=Vec::new();
+    for preview in [quick.as_mut(),pane.as_mut()].into_iter().flatten(){
+        if let Some(error)=preview.poll(){errors.push(error);}
+    }
+    if quick.as_ref().is_some_and(|preview|preview.child.borrow().is_none()){*quick=None;}
+    errors
+}
+pub(super) fn needs_timer(quick:&Option<PreviewProcess>,pane:&Option<PreviewProcess>)->bool{
+    [quick.as_ref(),pane.as_ref()].into_iter().flatten().any(|preview|preview.child.borrow().is_some())
+}
 
 pub(crate) fn run_if_requested()->Option<Result<()>>{
     if let Some(result)=super::wps_preview::run_worker_if_requested(){return Some(result);}
@@ -238,7 +263,7 @@ pub(super) fn sync_pane(owner:HWND,slot:&super::Slot,pane:&mut Option<PreviewPro
         else{snapshot.as_ref().and_then(|snapshot|snapshot.selected_path(slot)).unwrap_or_default()};
     // A COM callback may have switched tabs, moved a pane or closed the window.
     if snapshot.as_ref().is_some_and(|snapshot|!snapshot.current(slot,true))||pane_context(slot)!=context{return;}
-    if pane.as_ref().is_some_and(|pane|pane.request.provider!=provider||(!pane.is_open()&&pane.request.path!=path)){*pane=None;}
+    if pane.as_ref().is_some_and(|pane|pane.replace_pane(provider,&path)){*pane=None;}
     if pane.is_none(){
         match PreviewProcess::open_impl(owner,&path,provider,dark,false,Some(bounds)){
             Ok(process)=>*pane=Some(process),
@@ -248,5 +273,79 @@ pub(super) fn sync_pane(owner:HWND,slot:&super::Slot,pane:&mut Option<PreviewPro
     if let Some(pane)=pane.as_mut(){
         if pane.update(&path).is_ok(){pane.selection=identity;}
         let _=pane.set_dark(dark);pane.layout(bounds);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use anyhow::ensure;
+
+    #[link(name="kernel32")]
+    unsafe extern "system" {
+        fn GetHandleInformation(handle:*mut core::ffi::c_void,flags:*mut u32)->i32;
+    }
+
+    fn exited_preview(code:u32,embedded:bool)->Result<PreviewProcess>{
+        // These ignored tests create only a hidden exit-code helper, never a
+        // preview window or a document handler on the interactive desktop.
+        let root=PathBuf::from(std::env::var_os("ZSDESK_PREVIEW_ROOT").context("isolated preview root required")?);
+        ensure!(root.is_absolute(),"preview root must be absolute");
+        let diagnostics=PathBuf::from(std::env::var_os("ZSDESK_DIAGNOSTICS_ROOT").context("isolated diagnostic root required")?);
+        ensure!(diagnostics.is_absolute(),"diagnostic root must be absolute");
+        fs::create_dir_all(&root)?;
+        let workspace=root.join(format!("preview-exit-test-{}-{}",std::process::id(),SERIAL.fetch_add(1,Ordering::Relaxed)));
+        fs::create_dir(&workspace)?;
+        let request=Request{parent:std::process::id(),owner:0,path:root.join("selected-document.txt"),
+            provider:PreviewProviderPreference::System,dark:false,hover:false,generation:1,close:false,
+            embedded:embedded.then_some([0,0,200,200])};
+        write_json(&workspace.join("request.json"),&request)?;
+        let system=PathBuf::from(std::env::var_os("SystemRoot").context("Windows system directory missing")?).join("System32").join("cmd.exe");
+        let mut child=Command::new(system).args(["/d","/c",&format!("exit /b {code}")])
+            .creation_flags(CREATE_NO_WINDOW.0).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+        child.wait()?;
+        let job=unsafe{CreateJobObjectW(None,PCWSTR::null())}?;
+        Ok(PreviewProcess{child:RefCell::new(Some(child)),job:Some(job.0 as usize),workspace,request,
+            hwnd:Cell::new(HWND::default()),started:Instant::now(),ready:Cell::new(true),selection:None})
+    }
+
+    #[test]
+    #[ignore="owned hidden helper; requires isolated preview and diagnostic roots"]
+    fn native_preview_normal_exit_releases_handles_files_and_timer()->Result<()>{
+        let preview=exited_preview(0,false)?;
+        let workspace=preview.workspace.clone();
+        let process_handle=preview.child.borrow().as_ref().unwrap().as_raw_handle();
+        let job_handle=preview.job.unwrap()as*mut core::ffi::c_void;
+        let mut quick=Some(preview);let mut pane=None;
+        assert!(needs_timer(&quick,&pane),"an unreaped worker still needs supervision");
+        assert!(poll_previews(&mut quick,&mut pane).is_empty());
+        assert!(quick.is_none());assert!(!needs_timer(&quick,&pane));
+        assert!(!workspace.exists(),"normal worker exit left protocol files");
+        let mut flags=0;
+        assert_eq!(unsafe{GetHandleInformation(process_handle,&mut flags)},0,"child handle stayed open");
+        assert_eq!(unsafe{GetHandleInformation(job_handle,&mut flags)},0,"job handle stayed open");
+        assert!(poll_previews(&mut quick,&mut pane).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore="owned hidden helper; requires isolated preview and diagnostic roots"]
+    fn native_preview_failed_pane_reaps_once_without_restart_loop()->Result<()>{
+        let preview=exited_preview(7,true)?;let workspace=preview.workspace.clone();let path=preview.request.path.clone();
+        let mut quick=None;let mut pane=Some(preview);
+        let errors=poll_previews(&mut quick,&mut pane);
+        assert_eq!(errors.len(),1,"the worker failure must remain visible");
+        assert!(errors[0].contains("预览宿主异常退出"));
+        let completed=pane.as_mut().expect("pane retry barrier must survive worker exit");
+        assert!(completed.child.borrow().is_none()&&completed.job.is_none());
+        assert!(!workspace.exists());assert!(!completed.ready.get());assert!(completed.hwnd.get().0.is_null());
+        assert!(!completed.replace_pane(PreviewProviderPreference::System,&path),"same selection would restart the failed worker");
+        assert!(completed.replace_pane(PreviewProviderPreference::System,&path.with_extension("pdf")));
+        assert!(completed.replace_pane(PreviewProviderPreference::Wps,&path));
+        completed.set_dark(true)?;
+        assert!(!workspace.exists(),"a theme update recreated completed protocol files");
+        assert!(!needs_timer(&quick,&pane));
+        assert!(poll_previews(&mut quick,&mut pane).is_empty(),"worker error was repeated");
+        Ok(())
     }
 }

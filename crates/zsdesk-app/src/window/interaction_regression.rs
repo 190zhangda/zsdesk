@@ -317,3 +317,74 @@ fn native_full_window_resize_zoom_and_shortcuts()->Result<()>{
     let report=serde_json::json!({"state":if result.is_ok()&&closed&&isolated{"passed"}else{"failed"},"checks":result.as_ref().map_err(|e|format!("{e:#}")),"desktop_closed":closed,"foreground_unchanged":unchanged,"foreground_pid":foreground_pid,"test_pid":std::process::id(),"test_did_not_activate":isolated});
     fs::write(output.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");result?;ensure!(closed&&isolated,"desktop cleanup/focus failed");Ok(())
 }
+
+fn locked_tabs_and_bookmark_drag(output:&std::path::Path)->Result<serde_json::Value>{
+    use zsdesk_core::model::explorer::Bookmark;
+    unsafe{OleInitialize(None)?;}let _apartment=Apartment;
+    unsafe{InitCommonControlsEx(&INITCOMMONCONTROLSEX{dwSize:size_of::<INITCOMMONCONTROLSEX>()as u32,dwICC:ICC_STANDARD_CLASSES|ICC_BAR_CLASSES})}.ok()?;
+    let class=wide("ZSDesk.Native.InteractionRegression");let instance=HINSTANCE(unsafe{GetModuleHandleW(None)?}.0);
+    unsafe{RegisterClassW(&WNDCLASSW{hInstance:instance,lpfnWndProc:Some(window_proc),lpszClassName:pcwstr(&class),..Default::default()});}
+    let runner=palette_window(output,"locked-bookmarks")?;
+    {
+        let mut slot=runner.slot.borrow_mut();let state=slot.as_mut().unwrap();
+        state.session.tabs=(1..=3).map(|id|ExplorerTab::new(id,ShellLocation::Path(output.into()))).collect();state.session.tabs[0].locked=true;
+        let mut hidden=ExplorerTab::new(10,ShellLocation::ThisPc);hidden.locked=true;state.session.secondary_pane.tabs.push(hidden);
+        state.session.bookmarks=vec![Bookmark::folder(20,"分类".into(),None),Bookmark::link(21,"甲".into(),ShellLocation::ThisPc,None),Bookmark::link(22,"乙".into(),ShellLocation::Path(output.into()),None)];
+        state.session.next_id=23;
+    }
+    unsafe{SetWindowPos(runner.hwnd,None,0,0,900,600,SWP_NOACTIVATE|SWP_NOZORDER)?;runner.slot.borrow_mut().as_mut().unwrap().create(runner.hwnd)?;}
+    let end=Instant::now()+Duration::from_secs(12);
+    loop{pump(20);if runner.slot.borrow().as_ref().is_some_and(|s|s.pending.is_none()&&s.queued.is_none()){break;}ensure!(Instant::now()<end,"lock fixture navigation timed out");}
+    let acc=Accelerators(unsafe{CreateAcceleratorTableW(&accelerator_table())?});key(runner.hwnd,acc.0,VK_W,true,false)?;
+    {
+        let mut slot=runner.slot.borrow_mut();let state=slot.as_mut().unwrap();
+        let tab=state.layout.tabs.iter().find(|tab|tab.index==0).context("locked tab rect")?.rect;
+        state.middle_click(POINT{x:tab.x+tab.width/2,y:tab.y+tab.height/2});state.double_click(POINT{x:tab.x+tab.width/2,y:tab.y+tab.height/2});
+        ensure!(state.session.tabs.len()==3&&state.session.tabs[0].locked,"shortcut/middle/double click closed a locked tab");
+        unsafe{state.close_group(1,false);}ensure!(state.session.tabs.iter().map(|tab|tab.id).collect::<Vec<_>>()==vec![1,2],"close others removed a locked tab");
+        unsafe{state.close_group(0,true);}ensure!(state.session.tabs.len()==1&&state.session.tabs[0].locked,"close right removed a locked tab");
+    }
+    for (message,wp) in [(WM_CLOSE,0usize),(WM_SYSCOMMAND,SC_CLOSE as usize)]{unsafe{SendMessageW(runner.hwnd,message,Some(WPARAM(wp)),None);}ensure!(unsafe{IsWindow(Some(runner.hwnd))}.as_bool(),"window close bypassed a tab lock");}
+    {runner.slot.borrow_mut().as_mut().unwrap().session.tabs[0].locked=false;}
+    unsafe{SendMessageW(runner.hwnd,WM_CLOSE,None,None);}ensure!(unsafe{IsWindow(Some(runner.hwnd))}.as_bool(),"hidden pane lock was ignored");
+    ensure!(unsafe{SendMessageW(runner.hwnd,WM_QUERYENDSESSION,None,None)}.0==1,"tab lock blocked OS session shutdown");
+    let rect=|id:u64|->Result<LayoutRect>{let slot=runner.slot.borrow();let state=slot.as_ref().unwrap();let index=state.session.bookmarks.iter().position(|b|b.id==id).context("bookmark id")?;Ok(state.bookmark_rect(index))};
+    let drag=|from:LayoutRect,to:POINT|{
+        let pack=|p:POINT|LPARAM(((p.x as u16 as u32)|((p.y as u16 as u32)<<16))as isize);
+        let start=POINT{x:from.x+from.width/2,y:from.y+from.height/2};unsafe{
+            SendMessageW(runner.hwnd,WM_LBUTTONDOWN,Some(WPARAM(1)),Some(pack(start)));
+            SendMessageW(runner.hwnd,WM_MOUSEMOVE,Some(WPARAM(1)),Some(pack(to)));
+            SendMessageW(runner.hwnd,WM_LBUTTONUP,None,Some(pack(to)));
+        }pump(30);
+    };
+    let folder=rect(20)?;drag(rect(21)?,POINT{x:folder.x+folder.width/2,y:folder.y+folder.height/2});
+    ensure!(runner.slot.borrow().as_ref().unwrap().session.bookmarks.iter().find(|b|b.id==21).unwrap().parent_id==Some(20),"drag into category failed");
+    let root={let slot=runner.slot.borrow();let row=slot.as_ref().unwrap().layout.bookmarks_row;POINT{x:row.right()-10,y:row.y+row.height/2}};
+    drag(rect(21)?,root);
+    ensure!(runner.slot.borrow().as_ref().unwrap().session.bookmarks.iter().find(|b|b.id==21).unwrap().parent_id.is_none(),"drag out to root failed");
+    let folder=rect(20)?;drag(rect(22)?,POINT{x:folder.x+1,y:folder.y+folder.height/2});
+    ensure!(runner.slot.borrow().as_ref().unwrap().session.bookmarks[0].id==22,"sibling drag ordering failed");
+    {
+        let mut slot=runner.slot.borrow_mut();let state=slot.as_mut().unwrap();state.save();
+        let saved=storage::load(&state.config_path)?;ensure!(saved.bookmarks==state.session.bookmarks,"category order did not persist");ensure!(saved.secondary_pane.tabs[0].locked,"hidden lock did not persist");
+        state.session.secondary_pane.tabs[0].locked=false;state.session.tabs[0].locked=true;
+    }
+    unsafe{SendMessageW(runner.hwnd,WM_ENDSESSION,Some(WPARAM(1)),None);SendMessageW(runner.hwnd,WM_CLOSE,None,None);}
+    ensure!(!unsafe{IsWindow(Some(runner.hwnd))}.as_bool(),"OS session completion was blocked by a lock");
+    Ok(serde_json::json!({"locked_shortcuts_middle_double":true,"locked_close_groups":true,"locked_window_and_system_close":true,"hidden_pane_lock":true,
+        "os_session_shutdown_allowed":true,"bookmark_drag_into_category":true,"bookmark_drag_to_root":true,"bookmark_sibling_order":true,"persisted_categories_and_locks":true}))
+}
+
+#[test]
+#[ignore="Locked-tab close paths and category drag on a private unswitched desktop; isolated output required"]
+fn native_locked_tabs_and_bookmark_category_drag()->Result<()>{
+    let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("set isolated output")?).join("locked-bookmarks");
+    ensure!(output.is_absolute(),"absolute output required");fs::create_dir_all(&output)?;
+    let name=wide(&format!("ZSDesk.LockedBookmarks.{}",std::process::id()));
+    let desktop=unsafe{CreateDesktopW(name.as_ptr(),ptr::null(),ptr::null(),0,0x000f00ff,ptr::null())};ensure!(!desktop.is_null(),"private desktop creation failed");
+    let handle=desktop as usize;let destination=output.clone();
+    let result=thread::spawn(move||->Result<serde_json::Value>{ensure!(unsafe{SetThreadDesktop(handle as*mut c_void)}!=0,"private desktop attachment failed");locked_tabs_and_bookmark_drag(&destination)}).join().map_err(|_|anyhow::anyhow!("native lock test panicked")).and_then(|r|r);
+    let closed=unsafe{CloseDesktop(desktop)}!=0;let mut pid=0;unsafe{GetWindowThreadProcessId(GetForegroundWindow(),Some(&mut pid));}
+    let isolated=pid!=std::process::id();let report=serde_json::json!({"state":if result.is_ok()&&closed&&isolated{"passed"}else{"failed"},"checks":result.as_ref().map_err(|e|format!("{e:#}")),"desktop_closed":closed,"test_did_not_activate":isolated});
+    fs::write(output.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");result?;ensure!(closed&&isolated,"private desktop cleanup/focus failed");Ok(())
+}

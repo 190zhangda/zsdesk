@@ -102,6 +102,14 @@ impl Palette {
         palette
     }
 
+    /// Uses the user's accent color (already shaded for this mode) for fills,
+    /// focus and selection, with readable text on top of it.
+    pub fn with_accent(mut self, [r, g, b]: [u8; 3]) -> Self {
+        self.accent = Color::rgb(r, g, b);
+        self.accent_text = if luminance(r, g, b) > 0.45 { Color::rgb(0, 0, 0) } else { Color::rgb(0xFF, 0xFF, 0xFF) };
+        self
+    }
+
     /// Resolves a ZSUI semantic role.
     pub const fn role(&self, role: ColorRole) -> Color {
         match role {
@@ -139,7 +147,20 @@ pub struct FencePalette {
     pub accent: Color,
 }
 
+/// Relative luminance (sRGB approximation) in 0..=1.
+fn luminance(r: u8, g: u8, b: u8) -> f32 {
+    (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0
+}
+
 impl FencePalette {
+    /// Selection and drop highlights follow the user's accent color.
+    pub fn with_accent(mut self, [r, g, b]: [u8; 3]) -> Self {
+        self.accent = Color::rgb(r, g, b);
+        self.selected = Color::rgba(r, g, b, self.selected.a);
+        self.selected_border = Color::rgba(r, g, b, self.selected_border.a);
+        self
+    }
+
     /// `opacity` is the background opacity in percent (10–100).
     pub fn new(mode: Mode, opacity: u8) -> Self {
         if let Some(native)=high_contrast_palette(mode){
@@ -217,6 +238,8 @@ pub mod glyph {
     pub const STAR_FILLED: &str = "\u{E735}";
     pub const DETAILS_VIEW: &str = "\u{E8FD}";
     pub const TILES_VIEW: &str = "\u{E8B9}";
+    /// Two pages side by side (distinct from the View command's grid).
+    pub const DUAL_PANE: &str = "\u{E89A}";
     pub const PROPERTIES: &str = "\u{E946}";
     pub const PREVIEW: &str = "\u{E8FF}";
     pub const OVERFLOW: &str = "\u{E76C}\u{E76C}";
@@ -237,6 +260,17 @@ mod tests {
             assert_eq!(p.input.a, 255, "native EDIT backgrounds must be opaque");
             assert_eq!(p.input_focused.a, 255);
         }
+    }
+    #[test]
+    fn custom_accent_keeps_readable_text_and_selection_alpha() {
+        let light = Palette::light().with_accent([0x00, 0x67, 0xC0]);
+        assert_eq!(light.accent_text, Color::rgb(0xFF, 0xFF, 0xFF));
+        let dark = Palette::dark().with_accent([0x4C, 0xC2, 0xFF]);
+        assert_eq!(dark.accent_text, Color::rgb(0, 0, 0));
+        let fence = FencePalette::configured(Mode::Light, 80);
+        let tinted = fence.with_accent([0xE7, 0x48, 0x56]);
+        assert_eq!((tinted.selected.r, tinted.selected.a), (0xE7, fence.selected.a));
+        assert_eq!(tinted.selected_border.a, fence.selected_border.a);
     }
     #[test]
     fn fence_opacity_is_clamped() {

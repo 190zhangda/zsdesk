@@ -165,7 +165,7 @@ fn invoke_history_command(action: HistoryAction, command: Option<HistoryCommand>
 }
 
 #[derive(Clone)]
-struct ActiveContext { menu: IContextMenu, filter: bool }
+struct ActiveContext { menu: IContextMenu, filter: bool, root: isize }
 thread_local! {
     static ACTIVE: RefCell<Option<ActiveContext>> = const { RefCell::new(None) };
     static OPTIONS: RefCell<ContextMenuOptions> = RefCell::new(ContextMenuOptions::default());
@@ -190,7 +190,64 @@ pub struct ContextMenuOptions {
 impl Default for ContextMenuOptions {
     fn default() -> Self { Self { modern: true, hidden_verbs: Vec::new(), show_seven_zip: true, show_wps: false } }
 }
+/// SHA-256 of the only `Windows.UI.FileExplorer.dll` build whose private
+/// presenter ABI `native/shell_menu.cpp` supports (`kExpectedMenuSha256`).
+const SUPPORTED_PRESENTER_SHA256: &str = "4ce847cbbe84bedab2799bc7de9aa1d85684e66b95e2c59daf4ecee759aef0b1";
+/// `kPresenterClass` registration; its in-process server is the module above.
+const PRESENTER_SERVER_KEY: &str = "CLSID\\{86CA1AA0-34AA-4E8B-A509-50C905BAE2A2}\\InprocServer32";
+
+/// Whether the Windows 11 presenter can host this application's menus.
+///
+/// `Some(false)` means it certainly cannot: Windows 10 has no such presenter,
+/// and any other build of the module fails the native digest check after the
+/// worker has already created a hidden Shell view, loaded the XAML runtime and
+/// hashed the module, on every cold menu process. Callers use the classic
+/// presentation directly in that case. `None` (registration unreadable) keeps
+/// the native verification as the authority.
+pub fn modern_presenter_supported() -> Option<bool> {
+    static SUPPORTED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        if !cfg!(all(target_arch = "x86_64", target_env = "msvc")) { return Some(false); }
+        let build = crate::theme::os_build();
+        if build != 0 && build < 22000 { return Some(false); }
+        let path = presenter_server_path()?;
+        let digest = file_sha256(&path)?;
+        Some(digest.eq_ignore_ascii_case(SUPPORTED_PRESENTER_SHA256))
+    })
+}
+
+fn presenter_server_path() -> Option<std::path::PathBuf> {
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CLASSES_ROOT, RRF_RT_REG_SZ};
+    let key: Vec<u16> = PRESENTER_SERVER_KEY.encode_utf16().chain(Some(0)).collect();
+    let mut buffer = vec![0u16; 1024];
+    let mut size = (buffer.len() * 2) as u32;
+    // Without RRF_NOEXPAND a REG_EXPAND_SZ (%SystemRoot%\...) is expanded and
+    // then satisfies the REG_SZ restriction.
+    unsafe { RegGetValueW(HKEY_CLASSES_ROOT, PCWSTR(key.as_ptr()), PCWSTR::null(), RRF_RT_REG_SZ,
+        None, Some(buffer.as_mut_ptr().cast()), Some(&mut size)) }.ok().ok()?;
+    let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    let path = std::path::PathBuf::from(String::from_utf16_lossy(&buffer[..end]).trim().trim_matches('"'));
+    path.is_absolute().then_some(path)
+}
+
+fn file_sha256(path: &std::path::Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 { break; }
+        hasher.update(&buffer[..read]);
+    }
+    Some(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 pub fn set_context_menu_options(mut options: ContextMenuOptions) {
+    // An unsupported presenter only adds failed setup work before the same
+    // classic menu would be shown; request the classic menu directly.
+    options.modern = options.modern && modern_presenter_supported() != Some(false);
     options.hidden_verbs.retain(|v| !v.is_empty() && v.len() <= 128 && !v.contains('\0'));
     for verb in &mut options.hidden_verbs { verb.make_ascii_lowercase(); }
     options.hidden_verbs.sort(); options.hidden_verbs.dedup();
@@ -281,7 +338,9 @@ fn command_feature(verb: &str) -> u32 {
 
 struct ActiveMenuScope(Option<ActiveContext>);
 impl ActiveMenuScope {
-    fn enter(menu: &IContextMenu, filter: bool) -> Self { Self(ACTIVE.with(|active| active.replace(Some(ActiveContext { menu: menu.clone(), filter })))) }
+    fn enter(menu: &IContextMenu, filter: bool, root: HMENU) -> Self {
+        Self(ACTIVE.with(|active| active.replace(Some(ActiveContext { menu: menu.clone(), filter, root: root.0 as isize }))))
+    }
 }
 impl Drop for ActiveMenuScope {
     fn drop(&mut self) { ACTIVE.with(|active| *active.borrow_mut() = self.0.take()); }
@@ -299,7 +358,12 @@ pub fn forward_menu_message(msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT>
     } else if let Ok(menu2) = menu.cast::<IContextMenu2>() {
         if unsafe { menu2.HandleMenuMsg(msg, wp, lp) }.is_ok() { handled = Some(LRESULT(0)); }
     }
-    if msg == WM_INITMENUPOPUP && active.filter {
+    // Only the top level carries the commands these preferences name. Lazily
+    // filled submenus ("打开方式", "发送到", "新建", extension cascades) are
+    // left exactly as their handler built them: filtering them removed "WPS
+    // Office" from "打开方式" and called every handler's GetCommandString on
+    // each submenu opening.
+    if msg == WM_INITMENUPOPUP && active.filter && wp.0 as isize == active.root {
         filter_native_menu(HMENU(wp.0 as *mut _), &menu, &context_menu_options());
     }
     handled
@@ -414,7 +478,7 @@ impl ShellMenu {
                 let identifiers: Vec<*const ITEMIDLIST> = pidls.iter().map(|pidl| pidl.as_ptr().cast()).collect();
                 let mut outcome = NativeMenuResult::default();
                 let mut observer = BeforeShell { callback: &mut *before };
-                let active = ActiveMenuScope::enter(&self.menu, true);
+                let active = ActiveMenuScope::enter(&self.menu, true, self.hmenu);
                 let result = unsafe { zs_menu_track_standalone(owner, self.menu.as_raw(), self.hmenu,
                     count, identifiers.as_ptr(), folder.map_or(std::ptr::null_mut(), Interface::as_raw),
                     i32::from(background), browser.map_or(std::ptr::null_mut(),Interface::as_raw), &mut point, applications.as_ptr(), applications.len() as u32, intercept.bits(),
@@ -451,7 +515,7 @@ impl ShellMenu {
         // expansion from a Windows 11 menu or its compatible fallback.
         let filter = context;
         if filter { self.filter(menu, &options); }
-        let _active = ActiveMenuScope::enter(&self.menu, filter);
+        let _active = ActiveMenuScope::enter(&self.menu, filter, menu);
         let flags = TRACK_POPUP_MENU_FLAGS(TPM_RETURNCMD.0 | TPM_RIGHTBUTTON.0 | TPM_LEFTALIGN.0 | TPM_TOPALIGN.0);
         let chosen = unsafe { TrackPopupMenuEx(menu, flags.0, point.x, point.y, owner, None) }.0 as u32;
         (chosen != 0).then_some(chosen)
@@ -544,6 +608,9 @@ fn canonical_verb(context: &IContextMenu, id: u32) -> Option<String> {
     Some(String::from_utf16_lossy(&buffer[..end]))
 }
 
+/// Hides the preference-controlled entries of a context menu's top level.
+/// A hidden cascade ("7-Zip", "新建") disappears with all of its children;
+/// submenus that stay visible are never edited.
 fn filter_native_menu(menu: HMENU, context: &IContextMenu, options: &ContextMenuOptions) {
     let count = unsafe { GetMenuItemCount(Some(menu)) }.max(0);
     for index in (0..count).rev() {
@@ -557,9 +624,6 @@ fn filter_native_menu(menu: HMENU, context: &IContextMenu, options: &ContextMenu
         let verb = if options.hidden_verbs.is_empty() { None } else { canonical_verb(context, id) };
         if should_hide(verb.as_deref(), &label, options) {
             let _ = unsafe { DeleteMenu(menu, index as u32, MF_BYPOSITION) };
-        } else {
-            let child = unsafe { GetSubMenu(menu, index) };
-            if !child.is_invalid() { filter_native_menu(child, context, options); }
         }
     }
     trim_separators(menu);
@@ -664,6 +728,18 @@ fn show_original_view_menu_at(owner: HWND, view: &IShellView, mut point: POINT) 
         if let Err(error) = menu.invoke(owner, id, Some(point), shift, control) { report_failure(owner, error.code()); }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod presenter_tests {
+    #[test]
+    fn supported_presenter_matches_the_native_verification() {
+        let native = include_str!("../../native/shell_menu.cpp");
+        assert!(native.contains(&format!("kExpectedMenuSha256[]=\"{}\"", super::SUPPORTED_PRESENTER_SHA256)),
+            "Rust and native presenter digests must name the same module build");
+        assert!(native.contains("kPresenterClass = {0x86ca1aa0,0x34aa,0x4e8b,{0xa5,0x09,0x50,0xc9,0x05,0xba,0xe2,0xa2}}"));
+        assert!(super::PRESENTER_SERVER_KEY.contains("{86CA1AA0-34AA-4E8B-A509-50C905BAE2A2}"));
+    }
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use zsdesk_core::model::explorer::ExplorerSession;
+use zsdesk_core::model::explorer::{Bookmark,ExplorerSession,SearchPreferences};
 
 // A process may host several window threads. Serialize their read/merge/write
 // transactions, not only the final rename, and never share a temporary file.
@@ -71,11 +71,70 @@ fn save_unlocked(path: &Path, session: &ExplorerSession) -> Result<()> {
     Ok(())
 }
 
+/// A navigation/session save must not restore a stale window's search backend.
+/// Explicit search preference edits remain last-writer-wins under the same lock.
+pub fn save_window_with_search(path:&Path,session:&ExplorerSession,secondary:bool,baseline:&zsdesk_core::model::explorer::SearchPreferences)
+    ->Result<zsdesk_core::model::explorer::SearchPreferences>{
+    save_window_preferences(path,session,secondary,baseline,None).map(|saved|saved.0)
+}
+
+/// Navigation from another window must not undo a saved bookmark category or
+/// order. Explicit bookmark edits remain last-writer-wins under the same lock.
+pub fn save_window_with_shared_preferences(path:&Path,session:&ExplorerSession,secondary:bool,
+    baseline_search:&SearchPreferences,baseline_bookmarks:&[Bookmark])->Result<(SearchPreferences,Vec<Bookmark>)>{
+    save_window_preferences(path,session,secondary,baseline_search,Some(baseline_bookmarks))
+}
+
+fn save_window_preferences(path:&Path,session:&ExplorerSession,secondary:bool,
+    baseline:&SearchPreferences,baseline_bookmarks:Option<&[Bookmark]>)->Result<(SearchPreferences,Vec<Bookmark>)>{
+    let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
+    let saved=load(path).ok();let mut next=session.clone();
+    if next.ui.search_preferences()==*baseline{if let Some(saved)=&saved{next.ui.apply_search_preferences(&saved.ui.search_preferences());}}
+    if baseline_bookmarks.is_some_and(|baseline|next.bookmarks==baseline){
+        if let Some(saved)=&saved{next.bookmarks=saved.bookmarks.clone();}
+    }
+    let bookmark_next=next.bookmarks.iter().map(|bookmark|bookmark.id).max().unwrap_or(0).saturating_add(1);
+    next.next_id=next.next_id.max(bookmark_next).max(saved.as_ref().map_or(0,|saved|saved.next_id));
+    let preferences=next.ui.search_preferences();let bookmarks=next.bookmarks.clone();
+    if secondary{let mut primary=saved.context("主窗口会话尚未保存")?;primary.ui=next.ui;primary.bookmarks=next.bookmarks;primary.next_id=primary.next_id.max(next.next_id);save_unlocked(path,&primary)?;}
+    else{save_unlocked(path,&next)?;}Ok((preferences,bookmarks))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{sync::{Arc,Barrier},thread};
     use zsdesk_core::model::explorer::{ExplorerTab,ShellLocation};
+    #[test]
+    fn stale_window_navigation_preserves_bookmark_groups_order_and_id_allocator(){
+        let root=std::env::temp_dir().join(format!("zsdesk-bookmark-save-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
+        fs::create_dir(&root).unwrap();let path=root.join("explorer-session.json");
+        let mut original=default_session();original.bookmarks=vec![Bookmark::link(40,"原收藏".into(),ShellLocation::ThisPc,None)];original.next_id=41;
+        save(&path,&original).unwrap();let baseline=original.ui.search_preferences();
+        let mut edited=original.clone();edited.bookmarks.insert(0,Bookmark::folder(41,"工程".into(),None));edited.bookmarks[1].parent_id=Some(41);edited.next_id=42;
+        save_window_with_shared_preferences(&path,&edited,true,&baseline,&original.bookmarks).unwrap();
+        let (_,merged)=save_window_with_shared_preferences(&path,&original,false,&baseline,&original.bookmarks).unwrap();
+        assert_eq!(merged,edited.bookmarks);assert_eq!(load(&path).unwrap().bookmarks,edited.bookmarks);
+        assert!(load(&path).unwrap().next_id>=42);
+        let mut deliberate=original.clone();deliberate.bookmarks=merged.clone();deliberate.bookmarks[0].display_name="项目".into();
+        let tabs=load(&path).unwrap().tabs;
+        save_window_with_shared_preferences(&path,&deliberate,true,&baseline,&merged).unwrap();
+        let restored=load(&path).unwrap();assert_eq!(restored.bookmarks[0].display_name,"项目");assert_eq!(restored.tabs,tabs);
+        fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn stale_navigation_save_cannot_reenable_an_unselected_backend(){
+        use zsdesk_core::model::explorer::SearchBackendPreference;
+        let root=std::env::temp_dir().join(format!("zsdesk-search-preference-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
+        fs::create_dir(&root).unwrap();let path=root.join("explorer-session.json");let mut original=default_session();original.ui.search_backend=SearchBackendPreference::Everything;
+        save(&path,&original).unwrap();let baseline=original.ui.search_preferences();let mut chosen=original.clone();chosen.ui.search_backend=SearchBackendPreference::NativeNtfs;
+        save_window_with_search(&path,&chosen,false,&baseline).unwrap();
+        let restored=save_window_with_search(&path,&original,true,&baseline).unwrap();assert_eq!(restored.backend,SearchBackendPreference::NativeNtfs);
+        assert_eq!(load(&path).unwrap().ui.search_backend,SearchBackendPreference::NativeNtfs);
+        let mut explicit=original;explicit.ui.search_backend=SearchBackendPreference::Everything;
+        save_window_with_search(&path,&explicit,true,&restored).unwrap();assert_eq!(load(&path).unwrap().ui.search_backend,SearchBackendPreference::Everything);
+        fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn concurrent_secondary_saves_preserve_primary_tabs_and_leave_no_pending_files() {

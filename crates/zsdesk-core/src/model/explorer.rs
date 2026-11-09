@@ -64,6 +64,8 @@ fn shell_display_title(parsing_name: &str, title: &str) -> String {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExplorerTab {
     pub id: u64,
+    #[serde(default)]
+    pub locked: bool,
     history: Vec<ShellLocation>,
     history_index: usize,
     #[serde(default)]
@@ -74,6 +76,7 @@ impl ExplorerTab {
     pub fn new(id: u64, location: ShellLocation) -> Self {
         Self {
             id,
+            locked: false,
             history: vec![location],
             history_index: 0,
             view: None,
@@ -170,6 +173,22 @@ pub struct Bookmark {
     pub id: u64,
     pub display_name: String,
     pub target: ShellLocation,
+    /// Virtual organization only: this never creates a filesystem directory.
+    #[serde(default)]
+    pub is_folder: bool,
+    #[serde(default)]
+    pub parent_id: Option<u64>,
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+impl Bookmark {
+    pub fn link(id:u64,display_name:String,target:ShellLocation,parent_id:Option<u64>)->Self {
+        Self{id,display_name,target,is_folder:false,parent_id,collapsed:false}
+    }
+    pub fn folder(id:u64,display_name:String,parent_id:Option<u64>)->Self {
+        Self{id,display_name,target:ShellLocation::ThisPc,is_folder:true,parent_id,collapsed:false}
+    }
 }
 
 /// Restored window rectangle in screen pixels.
@@ -257,7 +276,10 @@ impl Default for ContextMenuPreferences {
 /// Legacy variants remain readable so existing profiles migrate without data loss.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum SearchBackendPreference { Auto, NativeNtfs, DirectoryScan, #[default] Everything }
+pub enum SearchBackendPreference { Auto, #[default] NativeNtfs, DirectoryScan, Everything }
+impl SearchBackendPreference {
+    pub fn is_builtin(self)->bool {self!=Self::Everything}
+}
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -314,6 +336,10 @@ pub struct ExplorerUi {
     pub context_menu: ContextMenuPreferences,
     pub search_all_files: bool,
     pub search_backend: SearchBackendPreference,
+    pub search_include_development: bool,
+    pub search_index_metadata: bool,
+    pub search_pinyin_initials: bool,
+    pub search_idle_seconds: u32,
     pub everything_executable: Option<PathBuf>,
     pub space_preview: bool,
     pub hover_preview: bool,
@@ -327,6 +353,20 @@ pub struct ExplorerUi {
     pub window: Option<WindowPlacement>,
 }
 
+#[derive(Clone,Debug,PartialEq,Eq)]
+pub struct SearchPreferences {
+    pub backend:SearchBackendPreference,pub include_development:bool,pub index_metadata:bool,pub pinyin_initials:bool,
+    pub idle_seconds:u32,pub everything_executable:Option<PathBuf>,pub folder_sizes:bool,
+}
+impl ExplorerUi{
+    pub fn search_preferences(&self)->SearchPreferences{SearchPreferences{backend:self.search_backend,include_development:self.search_include_development,
+        index_metadata:self.search_index_metadata,pinyin_initials:self.search_pinyin_initials,idle_seconds:self.search_idle_seconds,
+        everything_executable:self.everything_executable.clone(),folder_sizes:self.everything_folder_sizes}}
+    pub fn apply_search_preferences(&mut self,prefs:&SearchPreferences){self.search_backend=prefs.backend;self.search_include_development=prefs.include_development;
+        self.search_index_metadata=prefs.index_metadata;self.search_pinyin_initials=prefs.pinyin_initials;self.search_idle_seconds=prefs.idle_seconds;
+        self.everything_executable=prefs.everything_executable.clone();self.everything_folder_sizes=prefs.folder_sizes;}
+}
+
 impl Default for ExplorerUi {
     fn default() -> Self {
         Self { tab_placement:TabPlacement::Top, dual_pane:false, pane_ratio:500,
@@ -334,7 +374,8 @@ impl Default for ExplorerUi {
             close_window_on_last_tab:true,show_tab_count:true,
             show_tree: true, tree_width: 220, show_bookmarks: true, show_preview: false, show_details: false,
             command_bar: CommandBarPreferences::default(), context_menu: ContextMenuPreferences::default(),
-            search_all_files: true, search_backend: SearchBackendPreference::Everything, space_preview: true,
+            search_all_files: true, search_backend: SearchBackendPreference::NativeNtfs, space_preview: true,
+            search_include_development:false,search_index_metadata:false,search_pinyin_initials:false,search_idle_seconds:300,
             everything_executable:None,
             hover_preview: false, preview_provider: PreviewProviderPreference::System,
             forward_unhandled_windows: true,
@@ -378,7 +419,8 @@ impl Default for ExplorerSession {
 
 impl ExplorerSession {
     pub fn normalize(&mut self) {
-        self.ui.search_backend=SearchBackendPreference::Everything;
+        if self.ui.search_backend.is_builtin(){self.ui.search_backend=SearchBackendPreference::NativeNtfs;}
+        self.ui.search_idle_seconds=self.ui.search_idle_seconds.clamp(30,3600);
         if self.tabs.is_empty() {
             let id = self.take_id();
             self.tabs.push(ExplorerTab::new(id, ShellLocation::ThisPc));
@@ -394,6 +436,75 @@ impl ExplorerSession {
         let largest = self.tabs.iter().chain(self.secondary_pane.tabs.iter()).map(|t|t.id)
             .chain(self.bookmarks.iter().map(|b|b.id)).max().unwrap_or(0);
         self.next_id = self.next_id.max(largest.saturating_add(1));
+        self.normalize_bookmarks();
+    }
+
+    pub fn has_locked_tabs(&self)->bool {
+        self.tabs.iter().chain(&self.secondary_pane.tabs).any(|tab|tab.locked)
+    }
+    pub fn closable_tab_group(&self,index:usize,right_only:bool)->Vec<u64>{
+        if index>=self.tabs.len(){return Vec::new();}
+        self.tabs.iter().enumerate().filter(|(position,tab)|!tab.locked&&*position!=index&&(!right_only||*position>index)).map(|(_,tab)|tab.id).collect()
+    }
+
+    /// A malformed or deleted parent is promoted to the root, never discarded.
+    pub fn normalize_bookmarks(&mut self) {
+        self.next_id=self.next_id.max(self.bookmarks.iter().map(|b|b.id).max().unwrap_or(0).saturating_add(1));
+        let mut seen=std::collections::HashSet::new();
+        for index in 0..self.bookmarks.len() {
+            if !seen.insert(self.bookmarks[index].id) {
+                let id=self.take_id();self.bookmarks[index].id=id;seen.insert(id);
+            }
+        }
+        for index in 0..self.bookmarks.len() {
+            let id=self.bookmarks[index].id;let mut parent=self.bookmarks[index].parent_id;
+            let mut ancestors=std::collections::HashSet::from([id]);let mut valid=true;
+            while let Some(next)=parent {
+                if !ancestors.insert(next){valid=false;break;}
+                let Some(folder)=self.bookmarks.iter().find(|item|item.id==next&&item.is_folder)else{valid=false;break;};
+                parent=folder.parent_id;
+            }
+            if !valid {self.bookmarks[index].parent_id=None;}
+        }
+    }
+
+    /// Visible source indices in sibling order; children follow expanded folders.
+    pub fn visible_bookmarks(&self)->Vec<usize> {
+        let mut result=Vec::new();let mut visited=std::collections::HashSet::new();
+        let mut stack:Vec<usize>=self.bookmarks.iter().enumerate().filter(|(_,b)|b.parent_id.is_none()).map(|(i,_)|i).rev().collect();
+        while let Some(index)=stack.pop(){
+            let item=&self.bookmarks[index];if !visited.insert(item.id){continue;}result.push(index);
+            if item.is_folder&&!item.collapsed{stack.extend(self.bookmarks.iter().enumerate().filter(|(_,b)|b.parent_id==Some(item.id)).map(|(i,_)|i).rev());}
+        }
+        result
+    }
+
+    pub fn bookmark_depth(&self,index:usize)->usize {
+        let Some(item)=self.bookmarks.get(index)else{return 0;};let mut parent=item.parent_id;let mut depth=0;
+        while let Some(id)=parent {if depth>=self.bookmarks.len(){break;}depth+=1;parent=self.bookmarks.iter().find(|b|b.id==id).and_then(|b|b.parent_id);}
+        depth
+    }
+
+    /// Move one node, preserving its subtree and rejecting cycles/invalid targets.
+    pub fn move_bookmark_to(&mut self,id:u64,parent_id:Option<u64>,before:Option<u64>)->bool {
+        let Some(from)=self.bookmarks.iter().position(|b|b.id==id)else{return false;};
+        let mut ancestor=parent_id;let mut visited=std::collections::HashSet::new();
+        while let Some(parent)=ancestor {
+            if parent==id||!visited.insert(parent){return false;}
+            let Some(folder)=self.bookmarks.iter().find(|b|b.id==parent&&b.is_folder)else{return false;};ancestor=folder.parent_id;
+        }
+        if before==Some(id){return false;}
+        if let Some(before)=before {if !self.bookmarks.iter().any(|b|b.id==before&&b.parent_id==parent_id){return false;}}
+        let mut item=self.bookmarks.remove(from);item.parent_id=parent_id;
+        let at=before.and_then(|before|self.bookmarks.iter().position(|b|b.id==before)).unwrap_or(self.bookmarks.len());
+        self.bookmarks.insert(at,item);true
+    }
+
+    pub fn remove_bookmark(&mut self,id:u64)->bool {
+        let Some(index)=self.bookmarks.iter().position(|b|b.id==id)else{return false;};
+        let parent=self.bookmarks[index].parent_id;self.bookmarks.remove(index);
+        for child in &mut self.bookmarks {if child.parent_id==Some(id){child.parent_id=parent;}}
+        true
     }
 
     pub fn active_tab(&self) -> &ExplorerTab {
@@ -508,7 +619,7 @@ mod tests {
         assert_eq!(ui.tree_width, 271);
         assert!(!ui.space_preview && !ui.hover_preview && ui.navigation_auto_expand.is_none());
         assert_eq!(ui.appearance, AppearancePreferences::default());
-        assert_eq!(ui.search_backend, SearchBackendPreference::Everything);
+        assert_eq!(ui.search_backend, SearchBackendPreference::NativeNtfs);
         assert!(!ui.dual_pane && !ui.everything_folder_sizes);
         assert!(ui.close_window_on_last_tab && ui.show_tab_count);
         assert!(ui.navigation_show_recycle_bin && ui.navigation_show_network);
@@ -524,5 +635,58 @@ mod tests {
         assert_eq!(snapshot.selected, vec![vec![4,0,1,2,0,0]]);
         assert!(snapshot.columns.is_empty() && snapshot.sort_columns.is_empty() && snapshot.grouping.is_none());
         assert_eq!(snapshot.column_dpi, 0);
+    }
+
+    #[test]
+    fn locked_tabs_survive_restart_and_protect_groups_and_hidden_pane(){
+        let mut session=ExplorerSession::default();
+        session.tabs=(1..=4).map(|id|ExplorerTab::new(id,ShellLocation::ThisPc)).collect();
+        session.tabs[1].locked=true;session.tabs[3].locked=true;
+        assert_eq!(session.closable_tab_group(0,false),vec![3]);
+        assert_eq!(session.closable_tab_group(1,true),vec![3]);
+        assert!(session.closable_tab_group(10,false).is_empty());
+        let restored:ExplorerSession=serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        assert!(restored.tabs[1].locked&&restored.tabs[3].locked&&restored.has_locked_tabs());
+        session.tabs.iter_mut().for_each(|tab|tab.locked=false);
+        let mut hidden=ExplorerTab::new(9,ShellLocation::ThisPc);hidden.locked=true;session.secondary_pane.tabs.push(hidden);
+        assert!(!session.ui.dual_pane&&session.has_locked_tabs());
+        session.secondary_pane.tabs[0].locked=false;assert!(!session.has_locked_tabs());
+        let old:ExplorerTab=serde_json::from_str(r#"{"id":1,"history":["ThisPc"],"history_index":0}"#).unwrap();assert!(!old.locked);
+    }
+
+    #[test]
+    fn bookmark_categories_migrate_flat_entries_and_move_subtrees_without_losing_targets(){
+        let mut session=ExplorerSession::default();
+        let legacy:Bookmark=serde_json::from_str(r#"{"id":10,"display_name":"资料","target":{"Path":"E:\\资料"}}"#).unwrap();
+        assert!(!legacy.is_folder&&legacy.parent_id.is_none());
+        session.bookmarks=vec![legacy.clone(),Bookmark::folder(11,"工程".into(),None),Bookmark::folder(12,"图纸".into(),Some(11)),
+            Bookmark::link(13,"施工图".into(),ShellLocation::Path(PathBuf::from(r"E:\图纸.pdf")),Some(12)),Bookmark::folder(14,"归档".into(),None)];
+        session.normalize();
+        assert_eq!(session.visible_bookmarks().iter().map(|i|session.bookmarks[*i].id).collect::<Vec<_>>(),vec![10,11,12,13,14]);
+        assert!(session.move_bookmark_to(11,None,Some(10)));
+        assert_eq!(session.visible_bookmarks().iter().map(|i|session.bookmarks[*i].id).collect::<Vec<_>>(),vec![11,12,13,10,14]);
+        assert!(!session.move_bookmark_to(11,Some(12),None),"a category cannot move into its descendant");
+        assert!(!session.move_bookmark_to(13,Some(10),None),"a link is not a category");
+        assert!(session.move_bookmark_to(10,Some(14),None));
+        assert_eq!(session.bookmarks.iter().find(|b|b.id==10).unwrap().target,legacy.target);
+        session.bookmarks.iter_mut().find(|b|b.id==11).unwrap().collapsed=true;
+        assert_eq!(session.visible_bookmarks().iter().map(|i|session.bookmarks[*i].id).collect::<Vec<_>>(),vec![11,14,10]);
+        let restored:ExplorerSession=serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();assert_eq!(restored,session);
+        assert!(session.move_bookmark_to(10,None,Some(11)));
+        assert!(session.remove_bookmark(12));
+        assert_eq!(session.bookmarks.iter().find(|b|b.id==13).unwrap().parent_id,Some(11));
+        assert_eq!(session.bookmarks.iter().find(|b|b.id==13).unwrap().target.as_path(),Some(Path::new(r"E:\图纸.pdf")));
+    }
+
+    #[test]
+    fn bookmark_normalization_preserves_orphans_and_breaks_cycles(){
+        let mut session=ExplorerSession::default();session.bookmarks=vec![Bookmark::folder(10,"甲".into(),Some(11)),
+            Bookmark::folder(11,"乙".into(),Some(10)),Bookmark::link(12,"孤立".into(),ShellLocation::ThisPc,Some(999)),
+            Bookmark::link(12,"重复编号".into(),ShellLocation::ThisPc,None)];
+        session.normalize();assert_eq!(session.bookmarks.len(),4);
+        assert_eq!(session.bookmarks.iter().map(|b|b.id).collect::<std::collections::HashSet<_>>().len(),4);
+        assert_eq!(session.visible_bookmarks().len(),4);
+        assert!(session.bookmarks.iter().find(|b|b.display_name=="孤立").unwrap().parent_id.is_none());
+        assert!(session.next_id>session.bookmarks.iter().map(|b|b.id).max().unwrap());
     }
 }

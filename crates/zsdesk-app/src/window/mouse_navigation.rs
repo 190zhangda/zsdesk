@@ -14,7 +14,7 @@ fn owned(owner: HWND, target: HWND) -> bool {
 }
 
 fn editing_or_modal(target: HWND) -> bool {
-    if text_input_window(target) || text_input_window(unsafe { GetFocus() }) { return true; }
+    if text_input_window(target) || text_input_window(unsafe { GetFocus() }) || zsdesk_windows::flyout::is_open() { return true; }
     let mut info = GUITHREADINFO { cbSize: size_of::<GUITHREADINFO>() as u32, ..Default::default() };
     unsafe { GetGUIThreadInfo(0, &mut info) }.is_ok()
         && info.flags.0 & (GUI_INMENUMODE.0 | GUI_INMOVESIZE.0 | GUI_POPUPMENUMODE.0 | GUI_SYSTEMMENUMODE.0) != 0

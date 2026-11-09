@@ -102,7 +102,7 @@ unsafe extern "system" fn management_probe(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM
     if msg==WM_MENUCHAR{
         if let Some(index)=MANAGEMENT_INDEX.with(Cell::get){return LRESULT((index|(MNC_EXECUTE<<16))as isize);}
     }
-    if msg==WM_TIMER&&wp.0==MANAGEMENT_WATCHDOG{let _=unsafe{EndMenu()};return LRESULT(0);}
+    if msg==WM_TIMER&&wp.0==MANAGEMENT_WATCHDOG{zsdesk_windows::flyout::cancel();let _=unsafe{EndMenu()};return LRESULT(0);}
     unsafe{windows::Win32::UI::Shell::DefSubclassProc(hwnd,msg,wp,lp)}
 }
 fn management(host:&OwnedHost)->Result<serde_json::Value>{

@@ -156,6 +156,7 @@ try {
         }
         Copy-Item -LiteralPath (Join-Path $root 'packaging\licenses') -Destination (Join-Path $stage 'licenses') -Recurse
         Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $stage 'LICENSE.txt')
+        Copy-Item -LiteralPath (Join-Path $root 'THIRD-PARTY-NOTICES.txt') -Destination (Join-Path $stage 'THIRD-PARTY-NOTICES.txt')
         if (-not $definition.DesktopOnly) {
         $engineStage=Join-Path $stage 'engines\everything'
         [IO.Directory]::CreateDirectory($engineStage) | Out-Null
@@ -171,9 +172,9 @@ try {
             '运行 ZSDesk.exe 打开文件管理器；--classic-menu 使用原版菜单。',
             'Ctrl+F 在主窗口搜索文件；Alt+P 切换预览窗格；空格打开快速预览。',
             'Ctrl+Shift+A 反向选择；地址栏支持 pwsh、powershell、nu 和 nushell。',
-            '≡ → 后台搜索与快捷键：设置登录常驻及唤起主窗口搜索的全局快捷键。',
-            '≡ → 界面设置：命令栏显示项目、搜索范围和预览选项。',
-            '≡ → 右键菜单设置：选择菜单样式和显示功能。',
+            '≡ → 系统集成 → 开机启动与全局快捷键：设置登录常驻及唤起主窗口搜索的全局快捷键。',
+            '≡ → 布局、标签页、预览与操作、搜索：界面与搜索选项。',
+            '≡ → 右键菜单：选择菜单样式和显示的命令。',
             '≡ → 系统集成：文件夹默认打开方式。')
         if ($definition.DesktopOnly) {$readme=@("ZSDesk $version 桌面盒子独立版 — Windows x64",'','运行 ZSDesk.exe 启动桌面格子。','支持文件夹映射、格子标签页、拖放整理、预览、主题与独立登录启动。','配置目录：%APPDATA%\ZSDesk-DesktopBox；与文件管理版和主题版分别保存。','外部文件夹使用系统资源管理器打开。','此版本不包含文件管理主窗口、全盘搜索和文件夹接管。')}
         if ($RoutingDir -and -not $definition.DesktopOnly) { $readme += '≡ → 系统集成 → 文件位置转发：选择应用并接入文件定位。' }
@@ -182,9 +183,12 @@ try {
         if($definition.Themed){$readme+=@('','主题版支持亚克力、Mica 和纯色深浅主题；配置独立存放在 AppData\Roaming\ZSDesk-Theme。')}
         elseif(-not $definition.DesktopOnly){$readme+=@('','配置默认保存在用户 AppData\Roaming\ZSDesk。')}
         if(-not $definition.DesktopOnly){
-        $readme += @('',('文件名搜索由随附的 Everything '+$enginePin.version+' 提供，也可复用已运行的 Everything。'),
-            '首次启用快速全盘索引需要 Everything 服务或管理员授权；未授权时会显示配置提示。',
-            '索引保存在本机用户数据目录；程序不再建立自有磁盘索引。',
+        $readme += @('','≡ → 搜索：选择自带搜索或 Everything 搜索；新配置默认使用自带搜索，已有配置保留原来的选择。',
+            '自带搜索使用共享的内存索引和本地快照；普通权限下遍历目录，管理员权限下使用只读 MFT 枚举。',
+            '可用的 USN 日志用于增量更新；默认空闲 5 分钟保存快照并释放内存，再次搜索时恢复并补齐变更。',
+            '开发和缓存目录内容默认不收录，可在搜索设置中开启；文件大小、修改时间索引和拼音首字母匹配默认关闭。',
+            ('随附的 Everything '+$enginePin.version+' 是可选搜索后端，也可复用已运行的 Everything；只有选中此后端才会按需连接或启动。'),
+            'Everything 快速全盘索引需要兼容服务或管理员权限；未配置可用索引时会显示设置提示。',
             'Everything 版权与完整许可位于 engines\everything\License.txt。')
         }
         $readme+=@('portable.flag 使用程序旁 data 目录；--profile-dir 指定独立配置。','安装包与便携包不包含用户路径、桌面布局、搜索索引或系统接管记录。','源码与许可证：https://github.com/qiu7824/zsdesk')
@@ -196,8 +200,10 @@ try {
             $files[$relative]=[ordered]@{bytes=$file.Length;sha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
         }
         $searchEngine=if($definition.DesktopOnly){$null}else{[ordered]@{product='Everything';version=$enginePin.version;manifest='engines/everything/manifest.json';manifest_sha256=(Get-FileHash -LiteralPath $enginePinPath).Hash.ToLowerInvariant()}}
+        $defaultSearchBackend=if($definition.DesktopOnly){$null}else{'native_ntfs'}
+        $searchBackends=@();if(-not $definition.DesktopOnly){$searchBackends=@('native_ntfs','everything')}
         $manifest=[ordered]@{product='ZSDesk';version=$version;edition=$edition;edition_name=$definition.Name;platform='windows-x64';features=$definition.Features;desktop_only=[bool]$definition.DesktopOnly;
-            search_engine=$searchEngine;files=$files}
+            search_engine=$searchEngine;search_default_backend=$defaultSearchBackend;search_backends=@($searchBackends);files=$files}
         Write-Json (Join-Path $stage 'manifest.json') $manifest
         Assert-Payload $stage $manifest
         $zip=Join-Path $WorkDir "$name.zip"

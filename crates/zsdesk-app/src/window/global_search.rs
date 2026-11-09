@@ -133,12 +133,12 @@ impl WindowState{
         self.browser=Some(browser);self.theme_children();Ok(())
     }
     pub(super) fn start_fast_search(&mut self,query:&str){
+        self.sync_search_preferences();
         let submitted=self.submitted_search(query);
         if self.fast_generation!=0&&self.search_controls().busy&&self.fast_submitted.as_ref()==Some(&submitted){return;}
-        let backend=crate::fast_search::BackendPreference::Everything;
+        let options=crate::fast_search::SearchOptions::from_ui(&self.session.ui);
         if self.fast_search.is_none(){
-            match crate::fast_search::FastSearch::new_with_options(self.config_path.with_file_name("search-index.sqlite"),self.hwnd,WM_FAST_SEARCH,
-                crate::fast_search::SearchOptions{backend}){
+            match crate::fast_search::FastSearch::for_profile(&self.config_path,self.hwnd,WM_FAST_SEARCH,options){
                 Ok(engine)=>self.fast_search=Some(engine),Err(error)=>{self.show_message(format!("无法启动搜索：{error}"));return;}
             }
         }
@@ -154,7 +154,7 @@ impl WindowState{
     }
     pub(super) fn search_backend_changed(&mut self){
         let query=match self.current_location(){ShellLocation::Search{query,..}=>Some(query.clone()),_=>None};
-        self.cancel_fast_search();self.fast_search=None;
+        self.cancel_all_search_backends();
         self.save();
         if let Err(error)=crate::quick_search::control::signal(&self.config_path,"reload"){
             self.show_message(format!("后台搜索设置重载失败：{error}"));
@@ -162,7 +162,32 @@ impl WindowState{
         if let Some(query)=query{self.start_fast_search(&query);}
     }
     pub(super) fn rebuild_search_index(&mut self){
-        self.launch_search_settings(false);
+        self.sync_search_preferences();
+        if !self.session.ui.search_backend.is_builtin(){self.launch_search_settings(false);return;}
+        let query=match self.current_location(){ShellLocation::Search{query,..}=>Some(query.clone()),_=>None};
+        self.cancel_all_search_backends();
+        match crate::fast_search::FastSearch::for_profile(&self.config_path,self.hwnd,WM_FAST_SEARCH,crate::fast_search::SearchOptions::from_ui(&self.session.ui)){
+            Ok(engine)=>{engine.rebuild();self.fast_search=Some(engine);self.show_message("正在后台重建自带索引，搜索时可查看进度".into());},
+            Err(error)=>self.show_message(format!("无法重建索引：{error}")),
+        }
+        if let Some(query)=query{self.start_fast_search(&query);}
+    }
+    pub(super) fn sync_search_preferences(&mut self){
+        if self.session.ui.search_preferences()!=self.search_saved_preferences{return;}
+        if let Ok(saved)=crate::storage::load(&self.config_path){let preferences=saved.ui.search_preferences();
+            if preferences!=self.search_saved_preferences{self.cancel_all_search_backends();self.session.ui.apply_search_preferences(&preferences);self.search_saved_preferences=preferences;}
+        }
+    }
+    pub(super) fn persist_search_preferences(&mut self)->bool{
+        match crate::storage::save_window_with_search(&self.config_path,&self.canonical_session(),self.secondary_window,&self.search_saved_preferences){
+            Ok(preferences)=>{
+                let mut previous=self.search_saved_preferences.clone();previous.folder_sizes=preferences.folder_sizes;
+                if preferences!=previous{self.cancel_all_search_backends();crate::fast_search::settings_changed(&self.config_path);}
+                else if preferences.folder_sizes!=self.search_saved_preferences.folder_sizes{self.cancel_folder_sizes();}
+                self.session.ui.apply_search_preferences(&preferences);self.search_saved_preferences=preferences;true
+            },
+            Err(error)=>{self.session.ui.apply_search_preferences(&self.search_saved_preferences);self.show_message(format!("搜索设置未保存：{error}"));false},
+        }
     }
     fn pending_selection_valid(&mut self)->bool{
         let mut defer=false;
@@ -293,7 +318,13 @@ impl WindowState{
         }
     }
     pub(super) fn poll_fast_search(&mut self){
-        if self.fast_generation==0 || !matches!(self.current_location(),ShellLocation::Search{..}){return;}
+        if self.fast_generation==0 || !matches!(self.current_location(),ShellLocation::Search{..}){
+            let events=self.fast_search.as_ref().map(|engine|engine.poll()).unwrap_or_default();
+            if let Some(event)=events.last(){
+                if event.finished{self.show_message(event.error.as_ref().map_or_else(||"自带索引已就绪".to_owned(),|error|format!("索引未完成：{error}")));}
+                else if event.scanning{self.show_message(format!("正在建立自带索引，已处理 {} 项",event.scanned));}
+            }return;
+        }
         if self.fast_events.is_empty(){if let Some(engine)=&self.fast_search{self.fast_events.extend(engine.poll());}}
         let Some(mut event)=self.fast_events.pop_front()else{self.restore_fast_selection();return;};
         if event.generation==self.fast_generation{
@@ -352,6 +383,10 @@ fn progress_text(event:&crate::fast_search::SearchEvent,found:usize)->String{
         if event.scanning&&!event.finished&&event.error.is_none(){return "Everything 正在准备文件名索引，完成后自动显示结果…".into();}
         return event.error.as_ref().map_or_else(||format!("共 {} 项 · 当前页 {found} 项 · Everything",event.indexed),|error|format!("搜索未完成：{error}"));
     }
+    if !event.scanning&&event.error.is_none(){
+        let mut text=format!("共 {} 项 · 当前页 {found} 项 · 自带搜索",event.indexed);
+        if let Some(warning)=event.volumes.iter().find_map(|v|v.warning.as_ref()){text.push_str(" · ");text.extend(warning.chars().take(72));}return text;
+    }
     let backend=match event.backend{BackendKind::NativeNtfs=>"NTFS 元数据",BackendKind::DirectoryScan=>"目录索引",BackendKind::Mixed=>"NTFS + 目录补全",BackendKind::Everything=>"Everything"};
     let mut text=if let Some(error)=&event.error{format!("搜索未完成：{error}")}
         else if event.truncated{format!("已显示前 {found} 条结果，请补充关键字")}
@@ -379,7 +414,7 @@ fn progress_text(event:&crate::fast_search::SearchEvent,found:usize)->String{
 fn phase_text(phase:crate::fast_search::IndexPhase)->&'static str{
     use crate::fast_search::IndexPhase;
     match phase{IndexPhase::Starting=>"准备中",IndexPhase::Snapshot=>"建立快照",IndexPhase::CatchingUp=>"同步 USN",
-        IndexPhase::Scanning=>"目录补全",IndexPhase::Ready=>"就绪",IndexPhase::Paused=>"已暂停"}
+        IndexPhase::Scanning=>"目录补全",IndexPhase::Attributes=>"读取匹配项属性",IndexPhase::Ready=>"就绪",IndexPhase::Paused=>"已暂停"}
 }
 
 #[cfg(test)]mod tests{

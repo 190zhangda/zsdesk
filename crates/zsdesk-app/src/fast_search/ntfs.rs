@@ -10,7 +10,7 @@ use windows::{core::PCWSTR, Win32::{
         FILE_FLAG_OVERLAPPED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, OPEN_EXISTING},
     System::{IO::{CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED},
-        Ioctl::{FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL,
+        Ioctl::{FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL,FSCTL_READ_UNPRIVILEGED_USN_JOURNAL,
             MFT_ENUM_DATA_V0, READ_USN_JOURNAL_DATA_V0},
         Threading::{CreateEventW, ResetEvent, WaitForSingleObject}},
 }};
@@ -48,6 +48,9 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 { u64::from_le_bytes(bytes[at..at + 8]
 
 /// Accept only the NTFS V2 layout; unknown versions never truncate file identities.
 pub fn parse_page(bytes: &[u8]) -> Result<Page> {
+    parse_records(bytes,false)
+}
+fn parse_records(bytes:&[u8],nameless:bool)->Result<Page> {
     ensure!(bytes.len() >= 8 && bytes.len() <= BUFFER_BYTES, "NTFS 返回缓冲区长度无效");
     let mut records = Vec::new();
     let mut offset = 8;
@@ -59,10 +62,11 @@ pub fn parse_page(bytes: &[u8]) -> Result<Page> {
         ensure!(u16_at(record, 4) == 2, "此 NTFS 记录版本不受支持，使用目录补全");
         let name_bytes = u16_at(record, 56) as usize;
         let name_offset = u16_at(record, 58) as usize;
-        ensure!(name_bytes > 0 && name_bytes <= 510 && name_bytes % 2 == 0 && name_offset >= 60
-            && name_offset % 2 == 0 && name_offset <= length && name_bytes <= length - name_offset,
+        ensure!((nameless&&name_bytes==0)||(name_bytes > 0 && name_bytes <= 510 && name_bytes % 2 == 0 && name_offset >= 60
+            && name_offset % 2 == 0 && name_offset <= length && name_bytes <= length - name_offset),
             "NTFS 名称边界无效");
-        let units: Vec<u16> = record[name_offset..name_offset + name_bytes].chunks_exact(2)
+        let name=if name_bytes==0{&[][..]}else{&record[name_offset..name_offset+name_bytes]};
+        let units: Vec<u16> = name.chunks_exact(2)
             .map(|v| u16::from_le_bytes([v[0], v[1]])).collect();
         ensure!(!units.iter().any(|n| matches!(*n, 0 | 47 | 92)), "NTFS 名称包含路径分隔符");
         let usn = u64_at(record, 24) as i64;
@@ -77,9 +81,16 @@ pub fn parse_page(bytes: &[u8]) -> Result<Page> {
 pub struct Volume {
     pub root: PathBuf, pub serial: u32, pub root_id: u64,
     handle: Handle, event: Handle, buffer: Vec<u8>,
+    unprivileged:bool,
 }
 impl Volume {
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_mode(root,false)
+    }
+    /// Opens a root directory handle, not a raw-volume handle. Windows permits
+    /// journal identity queries and redacted USN reads on this ordinary handle.
+    pub fn open_changes(root:&Path)->Result<Self>{Self::open_mode(root,true)}
+    fn open_mode(root:&Path,unprivileged:bool)->Result<Self>{
         let text: Vec<u16> = root.as_os_str().encode_wide().collect();
         ensure!(text.len() == 3 && text[1] == b':' as u16 && text[2] == b'\\' as u16
             && text[0] < 128 && (text[0] as u8).is_ascii_alphabetic(), "仅整卷本地盘符可使用 NTFS 元数据");
@@ -97,12 +108,13 @@ impl Volume {
         unsafe { GetFileInformationByHandle(root_handle.0, &mut info) }?;
         ensure!(info.dwVolumeSerialNumber == serial && info.dwFileAttributes & REPARSE == 0, "卷根目录标识已变化");
         let device: Vec<u16> = format!("\\\\.\\{}:", char::from_u32(text[0] as u32).unwrap()).encode_utf16().chain(Some(0)).collect();
-        let handle = Handle(unsafe { CreateFileW(PCWSTR(device.as_ptr()), GENERIC_READ.0, share, None,
-            OPEN_EXISTING, FILE_FLAG_OVERLAPPED, None) }.context("无法只读打开 NTFS 卷；未请求提升权限")?);
+        let handle = Handle(unsafe { CreateFileW(PCWSTR(if unprivileged{path.as_ptr()}else{device.as_ptr()}),
+            if unprivileged{FILE_READ_ATTRIBUTES.0}else{GENERIC_READ.0}, share, None,
+            OPEN_EXISTING, FILE_FLAG_OVERLAPPED|if unprivileged{FILE_FLAG_BACKUP_SEMANTICS}else{Default::default()}, None) }.context("无法只读打开 NTFS 卷；未请求提升权限")?);
         let event = Handle(unsafe { CreateEventW(None, true, false, None) }?);
         Ok(Self { root: root.to_path_buf(), serial,
             root_id: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-            handle, event, buffer: vec![0; BUFFER_BYTES] })
+            handle, event, buffer: vec![0; BUFFER_BYTES],unprivileged })
     }
 
     fn ioctl<T>(&mut self, code: u32, input: Option<&T>, stop: &AtomicBool) -> Result<usize> {
@@ -152,6 +164,7 @@ impl Volume {
     }
 
     pub fn enumerate(&mut self, cursor: u64, stop: &AtomicBool) -> Result<Option<Page>> {
+        ensure!(!self.unprivileged,"普通权限句柄不用于 MFT 首建");
         let input = MFT_ENUM_DATA_V0 { StartFileReferenceNumber: cursor, LowUsn: 0, HighUsn: i64::MAX };
         let length = match self.ioctl(FSCTL_ENUM_USN_DATA, Some(&input), stop) {
             Ok(length) => length,
@@ -166,12 +179,26 @@ impl Volume {
     pub fn changes(&mut self, cursor: i64, journal_id: u64, stop: &AtomicBool) -> Result<Page> {
         let input = READ_USN_JOURNAL_DATA_V0 { StartUsn: cursor, ReasonMask: u32::MAX, ReturnOnlyOnClose: 0,
             Timeout: 0, BytesToWaitFor: 0, UsnJournalID: journal_id };
-        let length = self.ioctl(FSCTL_READ_USN_JOURNAL, Some(&input), stop).context("USN 增量读取失败")?;
-        let page = parse_page(&self.buffer[..length])?;
+        let code=if self.unprivileged{FSCTL_READ_UNPRIVILEGED_USN_JOURNAL}else{FSCTL_READ_USN_JOURNAL};
+        let length = self.ioctl(code, Some(&input), stop).context("USN 增量读取失败")?;
+        let page = parse_records(&self.buffer[..length],self.unprivileged)?;
         ensure!(page.next <= i64::MAX as u64 && page.next as i64 >= cursor, "USN 游标无效");
         ensure!(page.records.iter().all(|r| r.usn >= cursor && r.usn < page.next as i64), "USN 记录超出提交范围");
         ensure!(page.records.windows(2).all(|pair| pair[0].usn <= pair[1].usn), "USN 记录次序无效");
         Ok(page)
+    }
+
+    pub fn path_for_id(&self,id:u64)->Result<Option<PathBuf>>{
+        use windows::Win32::Storage::FileSystem::{OpenFileById,FILE_ID_DESCRIPTOR,FILE_ID_DESCRIPTOR_0,FileIdType,GetFinalPathNameByHandleW,GETFINALPATHNAMEBYHANDLE_FLAGS};
+        let descriptor=FILE_ID_DESCRIPTOR{dwSize:size_of::<FILE_ID_DESCRIPTOR>()as u32,Type:FileIdType,Anonymous:FILE_ID_DESCRIPTOR_0{FileId:id as i64}};
+        let handle=match unsafe{OpenFileById(self.handle.0,&descriptor,FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,None,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT)}{
+            Ok(handle)=>Handle(handle),Err(error)if matches!(error.code().0 as u32,0x80070002|0x80070003|0x80070490)=>return Ok(None),Err(error)=>return Err(error.into()),
+        };
+        let mut text=vec![0u16;32768];let n=unsafe{GetFinalPathNameByHandleW(handle.0,&mut text,GETFINALPATHNAMEBYHANDLE_FLAGS(0))}as usize;
+        ensure!(n>0&&n<text.len(),"无法解析变更文件的当前路径");
+        let value=OsString::from_wide(&text[..n]);let value=PathBuf::from(value);
+        Ok(Some(super::path_key_native(&value)))
     }
 }
 
@@ -211,5 +238,11 @@ mod tests {
         let journal = Journal { id: 7, first: 50, next: 100, lowest_valid: 60 };
         assert!(journal.contains(7, 60)); assert!(journal.contains(7, 100));
         assert!(!journal.contains(8, 80)); assert!(!journal.contains(7, 59)); assert!(!journal.contains(7, 101));
+    }
+    #[test]
+    fn ordinary_usn_records_may_omit_names_but_mft_records_may_not(){
+        let mut bytes=record(&[b'x' as u16]);bytes[64..66].copy_from_slice(&0u16.to_le_bytes());bytes[66..68].copy_from_slice(&0u16.to_le_bytes());
+        assert!(parse_page(&bytes).is_err());let page=parse_records(&bytes,true).unwrap();assert!(page.records[0].name.is_empty());
+        bytes[12..14].copy_from_slice(&3u16.to_le_bytes());assert!(parse_records(&bytes,true).is_err());
     }
 }

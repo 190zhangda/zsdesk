@@ -197,11 +197,12 @@ pub(crate) fn run_arguments(args:Vec<OsString>,in_host:bool)->Result<()> {
     if opts.integration_enable{
         let exe=std::env::current_exe()?;
         zsdesk_windows::integration::apply(zsdesk_windows::integration::Integration::Default,&exe,&config.with_file_name("takeover-backup.json"))?;
-        println!("{}",serde_json::json!({"enabled":true,"win_e":zsdesk_windows::integration::win_e_enabled(&exe),"this_pc":zsdesk_windows::integration::this_pc_enabled(&exe)}));return Ok(());
+        println!("{}",serde_json::json!({"enabled":true,"win_e":zsdesk_windows::integration::win_e_enabled(&exe),"this_pc":zsdesk_windows::integration::this_pc_enabled(&exe),"folder_takeover":zsdesk_windows::integration::owns_folder_integration(&exe)}));return Ok(());
     }
     if opts.integration_refresh {
-        let changed=zsdesk_windows::integration::upgrade_default(&std::env::current_exe()?,&config.with_file_name("takeover-backup.json"))?;
-        println!("{}",serde_json::json!({"updated":changed,"win_e":zsdesk_windows::integration::win_e_enabled(&std::env::current_exe()?)}));
+        let exe=std::env::current_exe()?;
+        let changed=zsdesk_windows::integration::upgrade_default(&exe,&config.with_file_name("takeover-backup.json"))?;
+        println!("{}",serde_json::json!({"updated":changed,"win_e":zsdesk_windows::integration::win_e_enabled(&exe),"folder_takeover":zsdesk_windows::integration::owns_folder_integration(&exe)}));
         return Ok(());
     }
     if opts.routing_apply {
