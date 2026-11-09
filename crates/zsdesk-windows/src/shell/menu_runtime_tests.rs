@@ -101,6 +101,7 @@ mod view_menu {
         static FALLBACK_REQUESTS:Cell<u32>=const{Cell::new(0)};
         static FAILURES:Cell<u32>=const{Cell::new(0)};
         static FAILED_CODE:Cell<u32>=const{Cell::new(0)};
+        static DELEGATE_CALLS:Cell<u32>=const{Cell::new(0)};
     }
     unsafe extern "system" fn owner_proc(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRESULT{
         if msg==WM_SHELL_NAVIGATED||msg==WM_SHELL_FOLDER_INVOKED{
@@ -172,8 +173,24 @@ mod view_menu {
         ensure!(calls.get()==2,"failed provider queried more than once per request");
         ensure!(FAILURES.with(Cell::get)==2&&FAILED_CODE.with(Cell::get)==0x80004005,"error was not reported to the main owner");
         ensure!(FALLBACK_REQUESTS.with(Cell::get)==0,"failed filtered menu fell through to a second menu");
+        fn delegate(_window:HWND,_view:&IShellView,_position:LPARAM)->windows::core::Result<()>{
+            DELEGATE_CALLS.with(|calls|calls.set(calls.get()+1));rejected()
+        }
+        struct Delegated;impl Drop for Delegated{fn drop(&mut self){set_view_menu_delegate(None);}}
+        let _delegated=Delegated;set_view_menu_delegate(Some(delegate));
+        DELEGATE_CALLS.with(|calls|calls.set(0));FAILURES.with(|calls|calls.set(0));
+        for modern in [false,true]{
+            unsafe{attach_view_menu(&view,Rc::new(Cell::new(modern)));}
+            for position in [LPARAM(-1),point_parameter(POINT{x:45,y:65})]{
+                ensure!(unsafe{SendMessageW(owner.0,WM_CONTEXTMENU,Some(WPARAM(owner.0.0 as usize)),Some(position))}.0==0,
+                    "delegated menu style {modern} was not consumed");pump(20);
+            }
+        }
+        ensure!(DELEGATE_CALLS.with(Cell::get)==4,"modern or classic style bypassed the installed isolation delegate");
+        ensure!(calls.get()==2&&FALLBACK_REQUESTS.with(Cell::get)==0,"delegated failure activated a main-process extension or retried native fallback");
+        ensure!(FAILURES.with(Cell::get)==4,"delegated failures were not reported exactly once");
         drop(view);drop(owner);
-        Ok(serde_json::json!({"requests":2,"provider_calls":calls.get(),"reported_errors":2,"fallback_requests":0,"failure_injected_at":"IShellView::GetItemObject"}))
+        Ok(serde_json::json!({"requests":6,"provider_calls":calls.get(),"original_provider_errors":2,"delegate_errors":4,"delegated_styles":["classic","modern"],"fallback_requests":0,"failure_injected_at":"IShellView::GetItemObject and isolation delegate"}))
     }
     fn exercise_view(output:&std::path::Path)->Result<serde_json::Value>{
         unsafe{OleInitialize(None)?;}let _apartment=Apartment;

@@ -63,7 +63,7 @@ impl QuickPreview {
         let state = Rc::new(PreviewState { hwnd: Cell::new(HWND::default()), path: RefCell::new(PathBuf::new()),
             summary: RefCell::new(String::new()), notice: RefCell::new(String::new()), content: RefCell::new(Content::Empty),
             font: Cell::new(HFONT::default()), brush:Cell::new(unsafe { CreateSolidBrush(COLORREF(colors.background)) }),
-            colors:Cell::new(colors),requested_dark:Cell::new(dark),refreshing_theme:Cell::new(false),allow_system_handler, provider, hover,embedded:embedded.is_some() });
+            colors:Cell::new(colors),requested_dark:Cell::new(dark),refreshing_theme:Cell::new(false),laying_out:Cell::new(false),allow_system_handler, provider, hover,embedded:embedded.is_some() });
         let bounds = embedded.unwrap_or_else(||initial_bounds(owner));
         let hwnd = unsafe { CreateWindowExW(if embedded.is_some(){WINDOW_EX_STYLE::default()}else{WS_EX_TOOLWINDOW | if hover { WS_EX_NOACTIVATE } else { WINDOW_EX_STYLE::default() }}, CLASS_NAME, windows::core::w!("快速预览"),
             if embedded.is_some(){WS_CHILD|WS_CLIPCHILDREN}else{WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN},
@@ -73,7 +73,10 @@ impl QuickPreview {
         state.refresh_theme();
         let mut preview = Self { state };
         // Keeps arrow-key selection in Explorer available while the preview is open.
-        if show { let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) }; }
+        if show {
+            let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+            preview.state.paint_pending();
+        }
         if !path.as_os_str().is_empty(){preview.update(path)?;}
         Ok(preview)
     }
@@ -104,7 +107,10 @@ impl QuickPreview {
         self.state.release_content();
         if !self.is_open() { return Ok(()); }
         *self.state.path.borrow_mut() = path.to_path_buf();
-        self.state.notice.borrow_mut().clear();
+        *self.state.notice.borrow_mut()="正在加载预览…".into();
+        // Paint the themed empty surface before a decoder/COM handler pumps its
+        // own messages. The old content must not leave an unpainted white frame.
+        self.state.paint_pending();
         let title = format!("{} — 快速预览", path.file_name().unwrap_or(path.as_os_str()).to_string_lossy());
         let _ = unsafe { SetWindowTextW(self.state.hwnd.get(), PCWSTR(wide(&title).as_ptr())) };
         let metadata = match fs::metadata(path) {
@@ -136,35 +142,36 @@ impl QuickPreview {
                 Err(error)=>{handler_error=Some(format!("图片预览失败：{error:#}"));None}
             }
         } else {None};
-        let content = content.or_else(||if self.state.allow_system_handler && !is_image_path(path) && metadata.len() <= MAX_HANDLER_BYTES {
-            match system_preview_with_provider(hwnd, path, rect, self.state.provider) {
+        let content = content.or_else(||if self.state.allow_system_handler && !is_image_path(path) && metadata.len() <= MAX_HANDLER_BYTES
+            && self.is_open() && !image_request_cancelled(path) {
+            match system_preview_with_provider(hwnd, path, rect, self.state.provider,self.state.colors.get()) {
                 Ok(preview) => Some(Content::Handler(preview)),
                 Err(error) => { handler_error = Some(format!("{error:#}")); None }
             }
         } else { None });
         let content = content.or_else(|| {
-            if !super::wps_preview::supported(path)||metadata.len()>MAX_HANDLER_BYTES{return None;}
+            if !super::wps_preview::supported(path)||metadata.len()>MAX_HANDLER_BYTES||!self.is_open()||image_request_cancelled(path){return None;}
             let workspace=std::env::var_os("ZSDESK_PREVIEW_WORKSPACE").map(PathBuf::from)?;
             match super::wps_preview::render(path,&workspace).and_then(|rendered|{
-                let mut handler=system_preview(hwnd,&rendered.pdf,rect)?;handler.rendered=Some(rendered);Ok(handler)
+                let mut handler=system_preview_with_provider(hwnd,&rendered.pdf,rect,PreviewProviderPreference::System,self.state.colors.get())?;handler.rendered=Some(rendered);Ok(handler)
             }){
                 Ok(handler)=>Some(Content::Handler(handler)),
                 Err(error)=>{handler_error=Some(format!("WPS 文档预览失败：{error:#}"));None}
             }
         });
         let content = content.or_else(|| {
-            if self.state.hwnd.get() != hwnd || !unsafe { IsWindow(Some(hwnd)) }.as_bool() { return None; }
+            if self.state.hwnd.get() != hwnd || !unsafe { IsWindow(Some(hwnd)) }.as_bool()||image_request_cancelled(path) { return None; }
             if is_text_path(path) {
                 read_text(path).ok().and_then(|text| self.state.text_control(&text).ok()).map(Content::Text)
             } else { None }
         });
-        // Out-of-process COM calls may pump messages, including closing this window.
-        if self.state.hwnd.get() != hwnd || !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
-            drop(content);
-            return Ok(());
+        // A handler may dispatch WM_CLOSE or a newer request during Initialize /
+        // DoPreview. Do not attach its result to a closed or superseded surface.
+        if !self.is_open()||self.state.hwnd.get()!=hwnd||self.state.path.borrow().as_path()!=path||image_request_cancelled(path){
+            drop(content);return Ok(());
         }
         match content {
-            Some(content) => { *self.state.content.borrow_mut() = content; }
+            Some(content) => { self.state.notice.borrow_mut().clear();*self.state.content.borrow_mut() = content; }
             None => {
                 *self.state.notice.borrow_mut() = if metadata.len() > MAX_HANDLER_BYTES {
                     "文件较大，快速预览仅显示文件信息。".into()
@@ -229,7 +236,7 @@ impl Drop for QuickPreview { fn drop(&mut self) { self.close(); } }
 
 struct PreviewState {
     hwnd: Cell<HWND>, path: RefCell<PathBuf>, summary: RefCell<String>, notice: RefCell<String>,
-    content: RefCell<Content>, font: Cell<HFONT>, brush: Cell<HBRUSH>, colors:Cell<PreviewColors>,requested_dark:Cell<bool>,refreshing_theme:Cell<bool>,
+    content: RefCell<Content>, font: Cell<HFONT>, brush: Cell<HBRUSH>, colors:Cell<PreviewColors>,requested_dark:Cell<bool>,refreshing_theme:Cell<bool>,laying_out:Cell<bool>,
     allow_system_handler: bool,
     provider: PreviewProviderPreference,
     hover: bool,
@@ -299,6 +306,10 @@ impl PreviewState {
         let hwnd = self.hwnd.get();
         if !hwnd.0.is_null() { let _ = unsafe { InvalidateRect(Some(hwnd), None, false) }; }
     }
+    fn paint_pending(&self){
+        self.invalidate();
+        if !self.hwnd.get().0.is_null(){let _=unsafe{UpdateWindow(self.hwnd.get())};}
+    }
     fn refresh_theme(&self){
         if self.refreshing_theme.replace(true){return;}
         struct Refresh<'a>(&'a Cell<bool>);impl Drop for Refresh<'_>{fn drop(&mut self){self.0.set(false);}}let _refresh=Refresh(&self.refreshing_theme);
@@ -333,12 +344,17 @@ impl PreviewState {
         }
     }
     fn layout_content(&self) {
+        if self.hwnd.get().0.is_null()||self.laying_out.replace(true){return;}
+        struct Layout<'a>(&'a Cell<bool>);impl Drop for Layout<'_>{fn drop(&mut self){self.0.set(false);}}let _layout=Layout(&self.laying_out);
         let rect = self.content_rect();
         let _dpi = PreviewDpiScope::for_window(self.hwnd.get());
         let handler = self.handler();
         let text = match &*self.content.borrow() { Content::Text(text) => Some(text.0), _ => None };
         if let Some(handler) = handler { let _ = unsafe { handler.SetRect(&rect) }; }
-        if let Some(hwnd) = text { let _ = unsafe { MoveWindow(hwnd, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, true) }; }
+        if let Some(hwnd) = text {
+            let _ = unsafe { MoveWindow(hwnd, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, true) };
+            let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+        }
     }
     fn update_font(&self) {
         let mut metrics = NONCLIENTMETRICSW { cbSize: size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
@@ -347,9 +363,10 @@ impl PreviewState {
             let next = unsafe { CreateFontIndirectW(&metrics.lfMessageFont) };
             if !next.0.is_null() {
                 let previous = self.font.replace(next);
-                if let Content::Text(text) = &*self.content.borrow() {
-                    unsafe { SendMessageW(text.0, WM_SETFONT, Some(WPARAM(next.0 as usize)), Some(LPARAM(1))); }
-                }
+                let text=match &*self.content.borrow(){Content::Text(text)=>Some(text.0),_=>None};
+                // WM_SETFONT can synchronously dispatch color/destruction
+                // callbacks; retain only the HWND across that call.
+                if let Some(text)=text{unsafe { SendMessageW(text, WM_SETFONT, Some(WPARAM(next.0 as usize)), Some(LPARAM(1))); }}
                 if !previous.0.is_null() { let _ = unsafe { DeleteObject(previous.into()) }; }
             }
             if let Some(visuals)=self.handler().and_then(|handler|handler.cast::<IPreviewHandlerVisuals>().ok()){
@@ -361,7 +378,7 @@ impl PreviewState {
         let rect = self.content_rect();
         let text = wide(text);
         let child = unsafe { CreateWindowExW(WINDOW_EX_STYLE::default(), windows::core::w!("EDIT"), PCWSTR(text.as_ptr()),
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | WINDOW_STYLE((ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL) as u32),
+            WS_CHILD | WS_VSCROLL | WS_HSCROLL | WINDOW_STYLE((ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL) as u32),
             rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, Some(self.hwnd.get()), None, None, None)? };
         zsdesk_windows::theme::theme_control(child, self.colors.get().dark);
         unsafe {
@@ -425,7 +442,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
     let state = unsafe { Rc::from_raw(raw) };
     match message {
         WM_MOUSEACTIVATE if state.hover => LRESULT(MA_NOACTIVATE as isize),
-        WM_ERASEBKGND => LRESULT(1),
+        WM_SETCURSOR if wp.0==hwnd.0 as usize && lp.0 as u16==HTCLIENT as u16=>{
+            if let Ok(cursor)=unsafe{LoadCursorW(None,IDC_ARROW)}{unsafe{SetCursor(Some(cursor));}LRESULT(1)}
+            else{unsafe{DefWindowProcW(hwnd,message,wp,lp)}}
+        }
+        WM_ERASEBKGND => {
+            let mut rect=RECT::default();let _=unsafe{GetClientRect(hwnd,&mut rect)};
+            unsafe{FillRect(HDC(wp.0 as*mut _),&rect,state.brush.get());}LRESULT(1)
+        }
         WM_PAINT => { state.paint(); LRESULT(0) }
         WM_GETMINMAXINFO => {
             if lp.0 != 0 {
@@ -494,14 +518,15 @@ fn closes_preview(message: &MSG) -> bool {
 }
 
 fn system_preview(hwnd: HWND, path: &Path, rect: RECT) -> Result<SystemPreview> {
-    system_preview_with_provider(hwnd, path, rect, PreviewProviderPreference::System)
+    system_preview_with_provider(hwnd, path, rect, PreviewProviderPreference::System,current_preview_colors(zsdesk_windows::theme::system_dark_mode()))
 }
 
-fn system_preview_with_provider(hwnd: HWND, path: &Path, rect: RECT, preference: PreviewProviderPreference) -> Result<SystemPreview> {
+fn system_preview_with_provider(hwnd: HWND, path: &Path, rect: RECT, preference: PreviewProviderPreference,colors:PreviewColors) -> Result<SystemPreview> {
     let _dpi = PreviewDpiScope::for_window(hwnd);
     let discovery = super::preview_handlers::discover(path, preference);
     let mut failures = Vec::new();
     for candidate in discovery.candidates.iter().take(12) {
+        if !unsafe{IsWindow(Some(hwnd))}.as_bool(){bail!("预览窗口已关闭");}
         eprintln!("preview activate {:?} {:?} {}",candidate.clsid,candidate.context,candidate.label);
         // Never load an Office or third-party document decoder into this process.
         let first: IPreviewHandler = match unsafe { CoCreateInstance(&candidate.clsid, None, candidate.context) } {
@@ -513,6 +538,7 @@ fn system_preview_with_provider(hwnd: HWND, path: &Path, rect: RECT, preference:
         if !supported.iter().any(|value| *value) { failures.push(format!("{} 未提供兼容的只读预览接口", candidate.label)); continue; }
         let mut first = Some(first);
         for (kind, supported) in supported.into_iter().enumerate() {
+            if !unsafe{IsWindow(Some(hwnd))}.as_bool(){bail!("预览窗口已关闭");}
             if !supported { continue; }
             let handler = match first.take() {
                 Some(handler) => handler,
@@ -520,7 +546,7 @@ fn system_preview_with_provider(hwnd: HWND, path: &Path, rect: RECT, preference:
                     Ok(handler) => handler, Err(_) => break,
                 },
             };
-            match initialize_preview(handler, hwnd, path, rect, kind) {
+            match initialize_preview(handler, hwnd, path, rect, kind,colors) {
                 Ok(preview) => return Ok(preview),
                 Err(error) => failures.push(format!("{}：{error:#}", candidate.label)),
             }
@@ -530,13 +556,14 @@ fn system_preview_with_provider(hwnd: HWND, path: &Path, rect: RECT, preference:
     bail!("{}\r\n{}", discovery.unavailable, failures.into_iter().take(3).collect::<Vec<_>>().join("\r\n"))
 }
 
-fn initialize_preview(handler: IPreviewHandler, hwnd: HWND, path: &Path, rect: RECT, kind: usize) -> Result<SystemPreview> {
+fn initialize_preview(handler: IPreviewHandler, hwnd: HWND, path: &Path, rect: RECT, kind: usize,colors:PreviewColors) -> Result<SystemPreview> {
     eprintln!("preview initialize {kind}");
     let _dpi = PreviewDpiScope::for_window(hwnd);
     let site: IPreviewHandlerFrame = PreviewFrame { hwnd: hwnd.0 as isize,embedded:unsafe{GetWindowLongPtrW(hwnd,GWL_STYLE)}as u32&WS_CHILD.0!=0 }.into();
     let mut preview = SystemPreview { handler, _stream: None, _site: site, owner: hwnd, rendered:None };
     let with_site = preview.handler.cast::<IObjectWithSite>().context("预览器未提供宿主连接")?;
     unsafe { with_site.SetSite(&preview._site) }.context("预览器连接宿主失败")?;
+    if !unsafe{IsWindow(Some(hwnd))}.as_bool(){bail!("预览窗口已关闭");}
     eprintln!("preview site connected");
     match kind {
         0 => {
@@ -557,13 +584,25 @@ fn initialize_preview(handler: IPreviewHandler, hwnd: HWND, path: &Path, rect: R
         }
     }
     if !unsafe { IsWindow(Some(hwnd)) }.as_bool() { bail!("预览窗口已关闭"); }
+    // Set the requested palette before the handler creates/paints its child.
+    // Applying it only after DoPreview permits a light first frame in dark mode.
+    if let Ok(visuals)=preview.handler.cast::<IPreviewHandlerVisuals>(){
+        let _=unsafe{visuals.SetBackgroundColor(COLORREF(colors.background))};
+        let _=unsafe{visuals.SetTextColor(COLORREF(colors.text))};
+    }
     eprintln!("preview initialized; binding window");
     unsafe { preview.handler.SetWindow(hwnd, &rect) }.context("预览器绑定窗口失败")?;
+    if !unsafe{IsWindow(Some(hwnd))}.as_bool(){bail!("预览窗口已关闭");}
     eprintln!("preview bound; loading content");
     unsafe { preview.handler.DoPreview() }.context("预览器加载内容失败")?;
+    if !unsafe{IsWindow(Some(hwnd))}.as_bool(){bail!("预览窗口已关闭");}
     eprintln!("preview loaded");
     Ok(preview)
 }
+
+#[cfg(test)]
+#[path="preview_lifecycle_regression.rs"]
+mod preview_lifecycle_regression;
 
 fn preview_handler_clsid(path: &Path) -> Result<windows::core::GUID> {
     let extension = path.extension().and_then(|v| v.to_str()).context("文件没有预览类型")?;

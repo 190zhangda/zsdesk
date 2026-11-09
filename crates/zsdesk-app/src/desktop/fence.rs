@@ -25,7 +25,7 @@ pub fn set_blur(on: bool) { BLUR.with(|b| b.set(on)); }
 
 /// Applies or removes the frosted-glass blur and the matching rounded window region.
 pub fn apply_glass(hwnd: HWND) {
-    let on = BLUR.with(std::cell::Cell::get);
+    let on = BLUR.with(std::cell::Cell::get) && !is_desktop_item(hwnd);
     zsdesk_windows::theme::set_blur_behind(hwnd, on);
     shape_window(hwnd);
 }
@@ -33,7 +33,7 @@ pub fn apply_glass(hwnd: HWND) {
 /// Keeps the window region in step with the painted 10-DIP corners (after every resize).
 pub fn shape_window(hwnd: HWND) {
     if hwnd.0.is_null() { return; }
-    if !BLUR.with(std::cell::Cell::get) {
+    if !BLUR.with(std::cell::Cell::get) || is_desktop_item(hwnd) {
         let _ = unsafe { SetWindowRgn(hwnd, None, true) };
         return;
     }
@@ -45,6 +45,10 @@ pub fn shape_window(hwnd: HWND) {
     let region = unsafe { CreateRoundRectRgn(0, 0, r.right - r.left + 1, r.bottom - r.top + 1, diameter, diameter) };
     if region.0.is_null(){return;}
     if unsafe { SetWindowRgn(hwnd, Some(region), true) }==0{let _=unsafe{windows::Win32::Graphics::Gdi::DeleteObject(region.into())};}
+}
+
+fn is_desktop_item(hwnd: HWND) -> bool {
+    !unsafe { windows::Win32::UI::WindowsAndMessaging::GetPropW(hwnd, windows::core::w!("ZSDesk.DesktopItem")) }.0.is_null()
 }
 
 /// What the pointer is over.
@@ -104,6 +108,18 @@ pub struct Geometry {
 }
 
 impl Geometry {
+    pub fn desktop_item(width: i32, height: i32, dpi: u32, size: i32, count: usize) -> Self {
+        let mut geometry = Self { width, height, content: Rect::new(0, 0, width, height), icon_px: scale(size, dpi), ..Default::default() };
+        if count != 0 {
+            let icon = geometry.icon_px.min(width.saturating_sub(scale(8, dpi))).max(1);
+            geometry.cells.push(Cell {
+                cell: Rect::new(0, 0, width, height),
+                icon: Rect::new((width - icon) / 2, scale(4, dpi), icon, icon),
+                label: Rect::new(scale(2, dpi), scale(8, dpi) + icon, (width - scale(4, dpi)).max(0), (height - icon - scale(10, dpi)).max(0)),
+            });
+        }
+        geometry
+    }
     pub fn new(width: i32, height: i32, dpi: u32, fence: &Fence, count: usize, scroll: i32, browsing: bool) -> Self {
         let s = |v: i32| scale(v, dpi);
         let title_h = s(TITLE_H);
@@ -262,6 +278,9 @@ pub struct FenceWin {
     pub focus: Option<usize>,
     pub hover: FenceHit,
     pub scroll: i32,
+    pub zoom_remainder: i32,
+    /// A loose desktop icon has no fence header, frame, background or tabs.
+    pub standalone: bool,
     pub interaction: Option<Interaction>,
     pub surface: Option<Surface>,
     pub notify: Option<ChangeNotify>,
@@ -292,7 +311,7 @@ pub enum RenameTarget { Item(String), Title }
 impl FenceWin {
     pub fn new(id: u64) -> Self {
         Self { id, hwnd: HWND::default(), dpi: 96, entries: Vec::new(), selection: HashSet::new(), anchor: None, focus: None,
-            hover: FenceHit::None, scroll: 0, interaction: None, surface: None, notify: None, notify_path: None, drop: None,
+            hover: FenceHit::None, scroll: 0, zoom_remainder: 0, standalone: false, interaction: None, surface: None, notify: None, notify_path: None, drop: None,
             drop_hover: None, rename: None, message: None, tracking: false, peek: false, peek_blocked: false,
             tabs: Vec::new(), ghost: false, merge_hover: None, drop_tab: None }
     }
@@ -309,6 +328,7 @@ impl FenceWin {
 
     pub fn geometry(&self, fence: &Fence) -> Geometry {
         let r = self.window_rect();
+        if self.standalone { return Geometry::desktop_item(r.right-r.left, r.bottom-r.top, self.dpi, fence.icon_size.pixels(), self.entries.len()); }
         let mut g = if self.peek {
             let mut open = fence.clone();
             open.collapsed = false;
@@ -341,32 +361,33 @@ impl FenceWin {
     }
 
     /// Paints and presents the fence. `icon` resolves item bitmaps.
-    pub fn render(&mut self, gfx: &Gfx, fence: &Fence, palette: &FencePalette, show_counts: bool, mut icon: impl FnMut(&ShellEntry, i32) -> Option<ID2D1Bitmap>) {
-        if self.hwnd.0.is_null() { return; }
+    pub fn render(&mut self, gfx: &Gfx, fence: &Fence, palette: &FencePalette, show_counts: bool, mut icon: impl FnMut(&ShellEntry, i32) -> Option<ID2D1Bitmap>) -> bool {
+        if self.hwnd.0.is_null() { return false; }
         let rect = self.window_rect();
         let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
-        if w <= 0 || h <= 0 { return; }
+        if w <= 0 || h <= 0 { return false; }
         let g = self.geometry(fence);
         let bitmaps: Vec<Option<ID2D1Bitmap>> = g.cells.iter().enumerate().map(|(i, c)| {
             let visible = c.cell.bottom() >= g.content.y && c.cell.y <= g.content.bottom();
             if visible { icon(&self.entries[i], if fence.view == FenceView::List { scale(20, self.dpi) } else { g.icon_px }) } else { None }
         }).collect();
-        if Surface::ensure(&mut self.surface, w, h).is_none() { return; }
-        let Some(surface) = self.surface.as_ref() else { return };
+        if Surface::ensure(&mut self.surface, w, h).is_none() { return false; }
+        let Some(surface) = self.surface.as_ref() else { return false };
         let dpi = self.dpi;
         let sf = |v: f32| v * dpi as f32 / 96.0;
         let col = |c: zsdesk_ui::theme::Color| Color::rgba8(c.r, c.g, c.b, c.a);
-        let _ = gfx.draw(surface, |cv: &Canvas| {
+        let drawn = gfx.draw(surface, |cv: &Canvas| {
             let outer = RectF::new(0.5, 0.5, w as f32 - 1.0, h as f32 - 1.0);
             let radius = sf(10.0);
             let drop_all = self.drop_hover == Some(usize::MAX);
+            let hovered = !matches!(self.hover, FenceHit::None);
+            if !self.standalone {
             cv.round(outer, radius, col(palette.background));
             // Title bar.
             let title = RectF::new(0.0, 0.0, w as f32, g.title.height as f32);
             cv.push_clip(title);
             cv.round(outer, radius, col(palette.title));
             cv.pop_clip();
-            let hovered = !matches!(self.hover, FenceHit::None);
             let renaming_title = matches!(self.rename, Some((_, RenameTarget::Title)));
             if self.merge_hover.is_some() {
                 cv.push_clip(title);
@@ -437,10 +458,11 @@ impl FenceWin {
                 if self.hover == FenceHit::Back { cv.round(back, sf(4.0), col(palette.hover)); }
                 cv.glyph("\u{E72B}", back, sf(12.0), col(palette.text));
             }
+            }
             if g.content.height > 0 {
                 let content = rf(g.content);
                 cv.push_clip(content);
-                if self.entries.is_empty() {
+                if self.entries.is_empty() && !self.standalone {
                     let hint = self.message.clone().unwrap_or_else(|| if fence.is_desktop() { "将桌面图标拖到这里".into() } else { "此文件夹为空".into() });
                     cv.text(&hint, content, &TextStyle::ui(sf(12.0)).align(Align::Center), col(palette.text_secondary));
                 }
@@ -450,6 +472,9 @@ impl FenceWin {
                     let entry = &self.entries[i];
                     let selected = self.selection.contains(&entry.key);
                     let r = rf(cell.cell);
+                    // Nonzero alpha only over the icon's own cell. The rest of
+                    // the desktop remains native and receives clicks normally.
+                    if self.standalone { cv.fill(r, Color::rgba8(0, 0, 0, 1)); }
                     if self.drop_hover == Some(i) {
                         cv.round(r, sf(4.0), col(palette.selected));
                         cv.stroke_round(r, sf(4.0), col(palette.accent), sf(1.5));
@@ -496,17 +521,19 @@ impl FenceWin {
             }
             let highlight = drop_all || self.merge_hover.is_some();
             let border = if highlight { col(palette.accent) } else { col(palette.border) };
-            cv.stroke_round(outer, radius, border, if highlight { sf(2.0) } else { 1.0 });
+            if !self.standalone { cv.stroke_round(outer, radius, border, if highlight { sf(2.0) } else { 1.0 }); }
         });
+        if drawn.is_err() { return false; }
         let screen = unsafe { GetDC(None) };
         let alpha = if self.ghost { 150 } else { 255 };
         let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: alpha, AlphaFormat: AC_SRC_ALPHA as u8 };
         let position = POINT { x: rect.left, y: rect.top };
         let size = SIZE { cx: w, cy: h };
         let origin = POINT::default();
-        let _ = unsafe { UpdateLayeredWindow(self.hwnd, Some(screen), Some(&position), Some(&size), Some(surface.dc), Some(&origin),
+        let shown = unsafe { UpdateLayeredWindow(self.hwnd, Some(screen), Some(&position), Some(&size), Some(surface.dc), Some(&origin),
             Default::default(), Some(&blend), ULW_ALPHA) };
         unsafe { ReleaseDC(None, screen); }
+        shown.is_ok()
     }
 }
 
@@ -551,6 +578,20 @@ mod tests {
         assert!(g.cells.iter().all(|c| c.cell.x >= g.content.x && c.cell.right() <= g.content.right()));
         let scrolled = Geometry::new(340, 250, 96, &fence(), 30, 40, false);
         assert_eq!(scrolled.cells[0].cell.y, g.cells[0].cell.y - 40);
+    }
+
+    #[test]
+    fn released_item_geometry_has_no_fence_chrome_at_multiple_dpi() {
+        for dpi in [96,144,192] {
+            let geometry=Geometry::desktop_item(scale(96,dpi),scale(104,dpi),dpi,48,1);
+            assert!(geometry.title.is_empty()&&geometry.more.is_empty()&&geometry.add.is_empty());
+            assert!(geometry.tabs.is_empty()&&geometry.thumb.is_empty());
+            assert_eq!(geometry.cells.len(),1);
+            let cell=geometry.cells[0];
+            assert!(cell.icon.bottom()<=cell.label.y&&cell.label.bottom()<=geometry.height);
+            assert_eq!(geometry.hit(cell.icon.x+1,cell.icon.y+1,dpi,true,false),FenceHit::Item(0));
+        }
+        assert!(Geometry::desktop_item(96,104,96,48,0).cells.is_empty());
     }
 
     #[test]

@@ -140,11 +140,13 @@ impl WindowState {
         if !self.layout.tab_list.is_empty() {
             self.button_fill(cv, self.layout.tab_list, Hit::TabList, self.sf(4.0));
             let r = rf(self.layout.tab_list);
-            let count=self.session.tabs.len();let label=count.to_string();
-            let badge_w=self.sf((label.len()as f32*7.0+8.0).max(18.0)).min(r.w-self.sf(6.0));
-            let badge = RectF::new(r.x+(r.w-badge_w)/2.0,r.y+(r.h-self.sf(18.0))/2.0,badge_w,self.sf(18.0));
-            cv.stroke_round(badge, self.sf(3.0), text, self.sf(1.2).max(1.0));
-            cv.text(&label, badge, &TextStyle::ui(self.sf(if label.len()>4{9.0}else{11.0})).weight(600).align(Align::Center), text);
+            if self.session.ui.show_tab_count {
+                let count=self.session.tabs.len();let label=count.to_string();
+                let badge_w=self.sf((label.len()as f32*7.0+8.0).max(18.0)).min(r.w-self.sf(6.0));
+                let badge = RectF::new(r.x+(r.w-badge_w)/2.0,r.y+(r.h-self.sf(18.0))/2.0,badge_w,self.sf(18.0));
+                cv.stroke_round(badge, self.sf(3.0), text, self.sf(1.2).max(1.0));
+                cv.text(&label, badge, &TextStyle::ui(self.sf(if label.len()>4{9.0}else{11.0})).weight(600).align(Align::Center), text);
+            } else { cv.glyph("\u{E70D}",r,self.sf(12.0),text); }
         }
         if !self.layout.app_menu.is_empty() {
             self.button_fill(cv, self.layout.app_menu, Hit::AppMenu, self.sf(4.0));
@@ -327,6 +329,19 @@ impl WindowState {
         // Visible only around the native children (splitter, empty tree area while loading).
         let content = LayoutRect::new(l.nav_row.x, l.top, l.nav_row.width, (l.status.y - l.top).max(0));
         cv.fill(rf(content), c(p.content));
+        if self.session.ui.dual_pane {
+            for (index,header) in l.pane_headers.iter().enumerate() {
+                let active=(index==1)==self.active_pane_right;
+                cv.fill(rf(*header),c(if active {p.layer}else{p.content}));
+                let title=self.pane_title(index==1);
+                cv.text(&title,RectF::new((header.x+self.s(10))as f32,header.y as f32,
+                    (header.width-self.s(20)).max(0)as f32,header.height as f32),&self.ui_style(),c(if active{p.text}else{p.text_secondary}));
+                cv.line(header.x as f32,header.bottom()as f32-1.0,header.right()as f32,header.bottom()as f32-1.0,
+                    c(if active{p.accent}else{p.divider}),if active{2.0}else{1.0});
+            }
+            let split=l.pane_splitter;
+            cv.fill(rf(split),c(if self.hover==Hit::PaneSplitter || self.pane_splitter_drag.is_some(){p.hover}else{p.layer}));
+        }
         if !l.splitter.is_empty() && (self.hover == Hit::Splitter || self.splitter_drag.is_some()) {
             let x = l.splitter.x as f32 + l.splitter.width as f32 / 2.0;
             cv.line(x, l.splitter.y as f32, x, l.splitter.bottom() as f32, c(p.divider), 1.0);
@@ -360,10 +375,11 @@ impl WindowState {
         if !self.status.is_empty() || self.search_progress.is_some() {
             let x = left + w + self.sf(24.0);
             let text=if self.status.is_empty(){self.search_progress.as_deref().unwrap_or("")}else{&self.status};
-            cv.text(text, RectF::new(x, r.y, (l.status_details.x as f32 - x - self.sf(8.0)).max(0.0), r.h), &style, c(if self.status.is_empty(){p.text_secondary}else{p.danger}));
+            cv.text(text, RectF::new(x, r.y, (l.status_dual_pane.x as f32 - x - self.sf(8.0)).max(0.0), r.h), &style, c(if self.status.is_empty(){p.text_secondary}else{p.danger}));
         }
         let (mode, _) = self.view_mode;
-        for (rect, hit, g, on) in [(l.status_details, Hit::StatusDetails, glyph::DETAILS_VIEW, mode == 4), (l.status_tiles, Hit::StatusTiles, glyph::TILES_VIEW, mode == 1)] {
+        for (rect, hit, g, on) in [(l.status_dual_pane,Hit::StatusDualPane,"\u{E8A9}",self.session.ui.dual_pane),
+            (l.status_details, Hit::StatusDetails, glyph::DETAILS_VIEW, mode == 4), (l.status_tiles, Hit::StatusTiles, glyph::TILES_VIEW, mode == 1)] {
             if on { cv.round(rf(rect), self.sf(4.0), c(p.pressed)); cv.round(RectF::new(rect.x as f32 + self.sf(9.0), rect.bottom() as f32 - self.sf(3.0), rect.width as f32 - self.sf(18.0), self.sf(2.0)), self.sf(1.0), c(p.accent)); }
             self.button_fill(cv, rect, hit, self.sf(4.0));
             cv.glyph(g, rf(rect), self.sf(12.0), c(p.text));

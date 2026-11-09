@@ -226,6 +226,7 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
         // the pool while the host's first STA continues pumping COM messages.
         if !shutting_down&&workers.is_empty()&&queued.is_empty()&&pool.iter().all(|worker|worker.job.is_none()){
             shutting_down=true;ingress.accepting.set(false);
+            crate::context_menu_process::shutdown_idle_worker();
             for worker in &mut pool{
                 if !worker.ending{
                     worker.ending=true;let _=worker.commands.try_send(PoolCommand::Stop);
@@ -235,6 +236,7 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
         }
         // COM/TLS finalizers can still need the first STA after component code
         // returns. Keep pumping while the OS thread finishes; never block it.
+        if shutting_down{crate::context_menu_process::shutdown_idle_worker();}
         let retiring_menus=crate::desktop::pending_menu_threads()+zsdesk_windows::shell::file_transfer::pending_operations()+crate::context_menu_process::pending_workers();
         unsafe{if workers.iter().any(|worker|worker.ending)||pool.iter().any(|worker|worker.ending)||retiring_menus>0{SetTimer(Some(hwnd),1,25,None);}else{let _=KillTimer(Some(hwnd),1);}}
         status(&profile,&workers,&pool,queued.len(),last_error.as_deref(),&mut previous_status);
@@ -246,6 +248,8 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
         if received<0{last_error=Some(format!("应用消息循环失败：{}",windows::core::Error::from_thread()));continue;}
         unsafe{let _=TranslateMessage(&message);DispatchMessageW(&message);}
     }
+    crate::context_menu_process::shutdown_idle_worker();
+    crate::window::diagnostics::flush_at_shutdown();
     drop(window);drop(ingress);
     if let Err(error)=crate::fast_search::everything::shutdown_managed_if_unused(){trace(&format!("Everything shutdown: {error:#}"));}
     if let Some(error)=last_error{bail!("{error}");}Ok(())

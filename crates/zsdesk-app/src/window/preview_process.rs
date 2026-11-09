@@ -6,6 +6,9 @@ use serde::{Deserialize,Serialize};
 use windows::{core::PCWSTR,Win32::{Foundation::{CloseHandle,HANDLE,HWND,LPARAM,POINT,RECT,WPARAM},
     System::{JobObjects::*,Ole::{OleInitialize,OleUninitialize},Threading::CREATE_NO_WINDOW},UI::WindowsAndMessaging::*}};
 use zsdesk_core::model::explorer::PreviewProviderPreference;
+#[path="preview_selection.rs"]
+pub(super) mod selection;
+use selection::{ViewIdentity,ViewSnapshot};
 
 pub(super) const TIMER:usize=8;
 const LOAD_TIMEOUT:Duration=Duration::from_secs(30);
@@ -23,12 +26,21 @@ fn write_json(path:&Path,value:&impl Serialize)->Result<()> {
     let to:Vec<_>=path.as_os_str().encode_wide().chain(Some(0)).collect();
     unsafe{MoveFileExW(PCWSTR(from.as_ptr()),PCWSTR(to.as_ptr()),MOVEFILE_REPLACE_EXISTING)}?;Ok(())
 }
-fn cleanup(workspace:&Path){
+pub(super) fn cleanup(workspace:&Path){
     // This unique directory contains only this preview's protocol files/PDFs.
     if workspace.file_name().is_none_or(|name|!name.to_string_lossy().starts_with("preview-")){return;}
+    // A breakaway WPS renderer owns the only document-cleanup path. Its
+    // delete-on-close lease survives disposal of the visible preview helper.
+    if workspace.join("wps-active.lock").exists(){return;}
     if let Ok(items)=fs::read_dir(workspace){for item in items.flatten(){
         let name=item.file_name();let name=name.to_string_lossy();
-        if !["request.json","request.tmp","status.json","status.tmp","worker.stderr.log","wps-lifecycle.json"].contains(&name.as_ref()) && !(name.starts_with("wps-")&&name.ends_with(".pdf")){continue;}
+        let protocol= ["wps-request-","wps-result-","wps-cancel-"].iter().any(|prefix|
+            name.strip_prefix(prefix).is_some_and(|tail|{
+                let id=tail.strip_suffix(".json").or_else(||tail.strip_suffix(".tmp")).unwrap_or(tail);
+                !id.is_empty()&&id.bytes().all(|byte|byte.is_ascii_digit())
+            }));
+        if !["request.json","request.tmp","status.json","status.tmp","worker.stderr.log","wps-lifecycle.json","wps-worker.json"].contains(&name.as_ref())
+            && !protocol && !(name.starts_with("wps-")&&name.ends_with(".pdf")){continue;}
         if item.path().symlink_metadata().is_ok_and(|metadata|metadata.is_file()&&metadata.file_attributes()&0x400==0){let _=fs::remove_file(item.path());}
     }}
     let _=fs::remove_dir(workspace);
@@ -36,7 +48,7 @@ fn cleanup(workspace:&Path){
 
 pub(super) struct PreviewProcess {
     child:RefCell<Option<Child>>,job:Option<usize>,workspace:PathBuf,request:Request,
-    hwnd:Cell<HWND>,started:Instant,ready:Cell<bool>,reported_exit:bool,
+    hwnd:Cell<HWND>,started:Instant,ready:Cell<bool>,reported_exit:bool,selection:Option<ViewIdentity>,
 }
 impl PreviewProcess {
     pub(super) fn open_with_options(owner:HWND,path:&Path,provider:PreviewProviderPreference,dark:bool,hover:bool)->Result<Self>{
@@ -51,9 +63,13 @@ impl PreviewProcess {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
         fs::create_dir(&workspace)?;
         let request=Request{parent:std::process::id(),owner:owner.0 as isize,path:path.to_path_buf(),provider,dark,hover,generation:1,close:false,embedded};
-        write_json(&workspace.join("request.json"),&request)?;
-        let mut command=Command::new(std::env::current_exe()?);
-        let stderr=fs::File::create(workspace.join("worker.stderr.log"))?;
+        // Errors before spawning still own this newly created protocol directory.
+        let prepared=(||->Result<_>{
+            write_json(&workspace.join("request.json"),&request)?;
+            Ok((std::env::current_exe()?,fs::File::create(workspace.join("worker.stderr.log"))?))
+        })();
+        let (executable,stderr)=match prepared{Ok(prepared)=>prepared,Err(error)=>{cleanup(&workspace);return Err(error);}};
+        let mut command=Command::new(executable);
         command.arg("--preview-worker").arg(workspace.join("request.json"))
             .env("ZSDESK_PREVIEW_WORKSPACE",&workspace).creation_flags(CREATE_NO_WINDOW.0)
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(stderr);
@@ -61,12 +77,12 @@ impl PreviewProcess {
         let job=unsafe{CreateJobObjectW(None,PCWSTR::null())};
         let job=match job{Ok(job)=>job,Err(error)=>{let _=child.kill();let _=child.wait();cleanup(&workspace);return Err(error.into());}};
         let mut limits=JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags=JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        limits.BasicLimitInformation.LimitFlags=JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE|JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         let attached=unsafe{SetInformationJobObject(job,JobObjectExtendedLimitInformation,(&limits as*const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),std::mem::size_of_val(&limits)as u32)
             .and_then(|_|AssignProcessToJobObject(job,HANDLE(child.as_raw_handle())))};
         if let Err(error)=attached{let _=child.kill();let _=child.wait();let _=unsafe{CloseHandle(job)};cleanup(&workspace);return Err(error.into());}
         unsafe{SetTimer(Some(owner),TIMER,100,None);}
-        Ok(Self{child:RefCell::new(Some(child)),job:Some(job.0 as usize),workspace,request,hwnd:Cell::new(HWND::default()),started:Instant::now(),ready:Cell::new(false),reported_exit:false})
+        Ok(Self{child:RefCell::new(Some(child)),job:Some(job.0 as usize),workspace,request,hwnd:Cell::new(HWND::default()),started:Instant::now(),ready:Cell::new(false),reported_exit:false,selection:None})
     }
     pub(super) fn is_open(&self)->bool{
         self.child.borrow_mut().as_mut().is_some_and(|child|child.try_wait().ok().flatten().is_none())
@@ -93,14 +109,17 @@ impl PreviewProcess {
     }
     pub(super) fn update(&mut self,path:&Path)->Result<()>{
         if self.request.path==path{return Ok(());}
-        self.request.path=path.into();self.request.generation=self.request.generation.wrapping_add(1);
-        self.started=Instant::now();self.ready.set(false);write_json(&self.workspace.join("request.json"),&self.request)
+        let mut next=self.request.clone();next.path=path.into();next.generation=next.generation.wrapping_add(1);
+        // A failed IPC write must not acknowledge a selection the helper never saw.
+        write_json(&self.workspace.join("request.json"),&next)?;
+        self.request=next;self.started=Instant::now();self.ready.set(false);Ok(())
     }
     pub(super) fn poll(&mut self)->Option<String>{
         let exited=self.child.borrow_mut().as_mut().and_then(|child|child.try_wait().ok().flatten());
         if let Some(exit)=exited {
             if !self.reported_exit && !exit.success(){
                 self.reported_exit=true;
+                super::diagnostics::record("preview","worker-exit",exit.code());
                 return Some(format!("预览宿主异常退出（{exit}），文件管理窗口可继续使用。"));
             }
             return None;
@@ -115,6 +134,7 @@ impl PreviewProcess {
             }}
         }
         if self.is_open()&&!self.ready.get()&&self.started.elapsed()>LOAD_TIMEOUT{
+            super::diagnostics::record("preview","load-timeout",Some(0x800705b4u32 as i32));
             self.close();return Some("预览加载超时，已关闭预览宿主；文件管理窗口可继续使用。".into());
         }
         None
@@ -138,6 +158,7 @@ impl PreviewProcess {
 impl Drop for PreviewProcess{fn drop(&mut self){self.close();}}
 
 pub(crate) fn run_if_requested()->Option<Result<()>>{
+    if let Some(result)=super::wps_preview::run_worker_if_requested(){return Some(result);}
     if std::env::args_os().nth(1).as_deref()!=Some(std::ffi::OsStr::new("--preview-worker")){return None;}
     Some((||{
         let path=PathBuf::from(std::env::args_os().nth(2).context("缺少预览请求")?);
@@ -195,18 +216,37 @@ fn run_worker(path:&Path)->Result<()>{
     preview.close();Ok(())
 }
 
+pub(super) fn selected_preview_request(slot:&super::Slot)->Option<(PathBuf,PreviewProviderPreference,bool)>{
+    let snapshot=ViewSnapshot::capture(slot)?;
+    let path=snapshot.selected_path(slot)?;
+    Some((path,snapshot.provider,snapshot.dark))
+}
+
+fn pane_context(slot:&super::Slot)->Option<([i32;4],PreviewProviderPreference,bool)>{
+    slot.try_borrow().ok().and_then(|slot|slot.as_ref().and_then(|state|state.preview_rect.map(|rect|
+        ([rect.x,rect.y,rect.width,rect.height],state.session.ui.preview_provider,state.dark))))
+}
 pub(super) fn sync_pane(owner:HWND,slot:&super::Slot,pane:&mut Option<PreviewProcess>){
-    let context=slot.try_borrow().ok().and_then(|slot|slot.as_ref().and_then(|state|state.preview_rect.map(|rect|{
-        let path=if state.pending.is_none(){state.browser.as_ref().and_then(|browser|browser.first_selected_path()).unwrap_or_default()}else{PathBuf::new()};
-        (path,[rect.x,rect.y,rect.width,rect.height],state.session.ui.preview_provider,state.dark)
-    })));
-    let Some((path,bounds,provider,dark))=context else{*pane=None;return;};
-    if pane.as_ref().is_some_and(|pane|pane.request.provider!=provider||pane.request.dark!=dark||(!pane.is_open()&&pane.request.path!=path)){*pane=None;}
+    let context=pane_context(slot);
+    let Some((bounds,provider,dark))=context else{*pane=None;return;};
+    let snapshot=ViewSnapshot::capture(slot);
+    let identity=snapshot.as_ref().map(|snapshot|snapshot.identity.clone());
+    // The 100 ms supervision timer must not continuously enter Shell to fetch
+    // the same selection. The native selection revision invalidates this cache.
+    let unchanged=pane.as_ref().is_some_and(|pane|pane.selection==identity);
+    let path=if unchanged{pane.as_ref().unwrap().request.path.clone()}
+        else{snapshot.as_ref().and_then(|snapshot|snapshot.selected_path(slot)).unwrap_or_default()};
+    // A COM callback may have switched tabs, moved a pane or closed the window.
+    if snapshot.as_ref().is_some_and(|snapshot|!snapshot.current(slot,true))||pane_context(slot)!=context{return;}
+    if pane.as_ref().is_some_and(|pane|pane.request.provider!=provider||(!pane.is_open()&&pane.request.path!=path)){*pane=None;}
     if pane.is_none(){
         match PreviewProcess::open_impl(owner,&path,provider,dark,false,Some(bounds)){
             Ok(process)=>*pane=Some(process),
             Err(error)=>if let Ok(mut slot)=slot.try_borrow_mut(){if let Some(state)=slot.as_mut(){state.show_message(format!("无法打开预览窗格：{error}"));}},
         }
     }
-    if let Some(pane)=pane.as_mut(){let _=pane.update(&path);pane.layout(bounds);}
+    if let Some(pane)=pane.as_mut(){
+        if pane.update(&path).is_ok(){pane.selection=identity;}
+        let _=pane.set_dark(dark);pane.layout(bounds);
+    }
 }

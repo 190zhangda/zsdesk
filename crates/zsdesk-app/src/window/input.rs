@@ -58,6 +58,8 @@ impl WindowState {
             Command::CopyPath => self.copy_paths(),
             Command::TogglePreview => { let d = self.session.ui.show_details; self.set_panes(!self.session.ui.show_preview, d && self.session.ui.show_preview); }
             Command::ToggleDetails => { let p = self.session.ui.show_preview; self.set_panes(p && self.session.ui.show_details, !self.session.ui.show_details); }
+            Command::ToggleDualPane => self.toggle_dual_pane(),
+            Command::SwitchPane => {self.activate_pane(!self.active_pane_right);self.focus_view();},
             Command::NewWindow => self.new_window(),
             Command::ToggleFullscreen => self.toggle_fullscreen(),
             Command::FocusNext => self.cycle_focus(false),
@@ -96,7 +98,8 @@ impl WindowState {
 
     fn row_of(&self, hit: Hit) -> Option<LayoutRect> {
         Some(match hit {
-            Hit::None | Hit::Splitter => return None,
+            Hit::None | Hit::Splitter | Hit::PaneSplitter => return None,
+            Hit::PaneHeader(index)=>self.layout.pane_headers[index],
             Hit::Tab(_) | Hit::TabClose(_) | Hit::NewTab if self.layout.vertical_tabs=>self.layout.tab_panel,
             Hit::Caption | Hit::Tab(_) | Hit::TabClose(_) | Hit::NewTab | Hit::TabList | Hit::AppMenu => self.layout.strip,
             Hit::Search if self.search_panel.open => self.layout.search,
@@ -104,7 +107,7 @@ impl WindowState {
             Hit::Back | Hit::Forward | Hit::Up | Hit::Refresh | Hit::Address | Hit::Search => self.layout.nav_row,
             Hit::Command(_) => self.layout.command_row,
             Hit::Bookmark(_) | Hit::BookmarkOverflow | Hit::BookmarksBar => self.layout.bookmarks_row,
-            Hit::StatusDetails | Hit::StatusTiles | Hit::Status => self.layout.status,
+            Hit::StatusDetails | Hit::StatusTiles | Hit::StatusDualPane | Hit::Status => self.layout.status,
         })
     }
 
@@ -149,6 +152,8 @@ impl WindowState {
             Hit::Bookmark(i) => (self.session.bookmarks.get(i).map(|b| b.target.address()).unwrap_or_default(), self.layout.bookmarks.get(i).copied().unwrap_or_default()),
             Hit::StatusDetails => ("在窗口中显示每一项的相关信息 (Ctrl+Shift+6)".into(), self.layout.status_details),
             Hit::StatusTiles => ("使用大缩略图显示项 (Ctrl+Shift+2)".into(), self.layout.status_tiles),
+            Hit::StatusDualPane => ("开启或关闭双栏布局".into(),self.layout.status_dual_pane),
+            Hit::PaneHeader(index) => (self.pane_title(index==1),self.layout.pane_headers[index]),
             _ => (String::new(), LayoutRect::default()),
         };
         self.tooltip_text = wide(&text);
@@ -162,6 +167,14 @@ impl WindowState {
     }
 
     pub(super) fn mouse_move(&mut self, p: POINT, _keys: usize) {
+        if let Some((start_x,ratio))=self.pane_splitter_drag {
+            let width=self.layout.browser.width+self.layout.other_browser.width;
+            if width>0 {
+                self.session.ui.pane_ratio=(i32::from(ratio)+(p.x-start_x)*1000/width).clamp(200,800)as u16;
+                self.relayout();self.position_children();
+            }
+            return;
+        }
         if !self.tracking_mouse {
             let mut track = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: self.hwnd, dwHoverTime: 0 };
             self.tracking_mouse = unsafe { TrackMouseEvent(&mut track) }.is_ok();
@@ -210,6 +223,8 @@ impl WindowState {
                 unsafe { SetCapture(self.hwnd); }
             }
             Hit::Splitter => { self.splitter_drag = Some((p.x, self.layout.tree.width)); unsafe { SetCapture(self.hwnd); } }
+            Hit::PaneSplitter => {self.pane_splitter_drag=Some((p.x,self.session.ui.pane_ratio));unsafe{SetCapture(self.hwnd);}},
+            Hit::PaneHeader(index)=>{self.activate_pane(index==1);self.focus_view();self.pressed=None;return;},
             Hit::Address if self.crumb_at(p.x, p.y).is_none() && !self.address_editing => { self.pressed = None; unsafe { self.focus_address(); } return; }
             Hit::Search => { self.pressed = None; unsafe { self.open_integrated_search(); } return; }
             Hit::SearchPanel(_) => unsafe { let _ = SetCapture(self.hwnd); },
@@ -222,6 +237,7 @@ impl WindowState {
     pub(super) fn mouse_up(&mut self, p: POINT) {
         let pressed = self.pressed.take();
         let had_capture = unsafe { GetCapture() } == self.hwnd;
+        if self.pane_splitter_drag.take().is_some() {if had_capture{let _=unsafe{ReleaseCapture()};}self.save();self.invalidate();return;}
         if self.splitter_drag.take().is_some() { if had_capture { let _ = unsafe { ReleaseCapture() }; } self.save(); self.invalidate(); return; }
         if let Some(drag) = self.tab_drag.take() {
             if had_capture { let _ = unsafe { ReleaseCapture() }; }
@@ -249,6 +265,7 @@ impl WindowState {
             Hit::BookmarkOverflow => unsafe { self.bookmarks_overflow() },
             Hit::StatusDetails => self.set_view(menus::view_choice("details")),
             Hit::StatusTiles => self.set_view(menus::view_choice("large")),
+            Hit::StatusDualPane => self.toggle_dual_pane(),
             _ => {}
         }
     }
@@ -263,6 +280,17 @@ impl WindowState {
             },
             _ => {}
         }
+    }
+
+    pub(super) fn double_click(&mut self,p:POINT) {
+        if self.session.ui.double_click_close_tab {
+            if let Hit::Tab(index)=self.layout.hit(p.x,p.y) {
+                self.tab_drag=None;self.pressed=None;
+                if unsafe{GetCapture()}==self.hwnd{let _=unsafe{ReleaseCapture()};}
+                unsafe{self.close_tab(index);}return;
+            }
+        }
+        self.mouse_down(p);
     }
 
     pub(super) fn right_click(&mut self, p: POINT) {
@@ -370,14 +398,11 @@ impl WindowState {
         // IExplorerBrowser reads pane visibility only while initializing, so the
         // view is recreated and returns to the same folder, selection and layout.
         unsafe { self.capture_active(); }
-        self.cancel_fast_search();self.browser = None;self.browser_role=BrowserRole::Fresh;
+        self.folder_sizes.cancel();self.cancel_fast_search();self.browser = None;self.browser_role=BrowserRole::Fresh;
         self.pending = None;
         self.queued = None;
         self.shown_tab = None;
-        let panes = Panes { preview:false, details };
-        let created=if cfg!(test) {
-            unsafe { ExplorerBrowserHost::create_transient(self.hwnd, win_rect(self.layout.browser), self.modern, panes) }
-        } else { unsafe { ExplorerBrowserHost::create(self.hwnd, win_rect(self.layout.browser), self.modern, panes) } };
+        let created=self.create_browser();
         match created {
             Ok(browser) => {browser.set_context_menu_options(crate::context_preferences::native(&self.session.ui.context_menu));self.browser = Some(browser);},
             Err(error) => self.show_message(format!("无法切换窗格：{error}")),
@@ -515,6 +540,8 @@ impl WindowState {
         let choice = popup(self.hwnd, &menus::app_menu_with_capabilities(state, crate::edition::THEMED), anchor);
         match choice.as_deref() {
             Some("new-tab") => unsafe { self.new_tab(ShellLocation::ThisPc) },
+            Some("new-window")=>self.new_window(),
+            Some("diagnostics")=>if let Err(error)=diagnostics::show(self.hwnd){self.show_message(format!("无法打开诊断日志：{error}"));},
             Some("quick-search") => unsafe{self.execute(Command::FocusSearch)},
             Some("quick-search-window") => unsafe { self.open_integrated_search(); },
             Some("quick-search-settings") => unsafe { self.search_settings_menu(); },
@@ -542,6 +569,7 @@ impl WindowState {
                 menu_ui.navigation_auto_expand=Some(self.navigation_auto_expand());
                 let spec=menus::interface_settings_menu(&menu_ui);
                 if let Some(id)=popup(self.hwnd,&spec,Some(self.layout.app_menu)){
+                    if id=="dual-pane" {self.toggle_dual_pane();return;}
                     if self.search_engine_menu_action(&id) { return; }
                     if menus::interface_requires_dialog(&id){
                         match crate::fast_search::everything::choose_executable(self.hwnd){
@@ -551,6 +579,8 @@ impl WindowState {
                     }
                     if id=="navigation-auto-expand" {self.session.ui.navigation_auto_expand=menu_ui.navigation_auto_expand;}
                     if menus::apply_interface_setting(&mut self.session.ui,&id){
+                        if id=="everything-folder-sizes" {self.cancel_folder_sizes();}
+                        if id=="navigation-recycle-bin" || id=="navigation-network" || id.starts_with("navigation-this-pc-") {self.rebuild_navigation_tree();}
                         self.crumbs_for=None;
                         if id=="search-all-files" || id=="search-current-folder"{
                             let scope=if self.session.ui.search_all_files{None}else{
@@ -560,6 +590,7 @@ impl WindowState {
                             unsafe{SetTimer(Some(self.hwnd),TIMER_SEARCH,20,None);}
                         }
                         self.save();self.measure_bookmarks();self.relayout();self.position_children();
+                        if id=="everything-folder-sizes" {self.poll_folder_sizes();}
                         if id.starts_with("search-backend-"){self.search_backend_changed();}
                         if (id=="navigation-auto-expand" || id=="navigation-expand-system" || id=="interface-navigation") && self.pending.is_none() && self.session.ui.show_tree {
                             if let Some(tree)=&self.tree {

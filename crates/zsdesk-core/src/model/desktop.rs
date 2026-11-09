@@ -173,19 +173,22 @@ pub struct DesktopConfig {
     pub version: u32,
     #[serde(default)] pub settings: DesktopSettings,
     #[serde(default)] pub fences: Vec<Fence>,
+    /// Desktop items explicitly taken out of automatic grouping. Each entry
+    /// reuses a one-item icon layout, but is never a titled fence or tab.
+    #[serde(default)] pub released_items: Vec<Fence>,
     /// 退出整理模式时保存的桌面格子，再次整理时恢复。
     #[serde(default)] pub stash: Vec<Fence>,
     pub next_id: u64,
 }
 
 impl Default for DesktopConfig {
-    fn default() -> Self { Self { version: CONFIG_VERSION, settings: DesktopSettings::default(), fences: Vec::new(), stash: Vec::new(), next_id: 1 } }
+    fn default() -> Self { Self { version: CONFIG_VERSION, settings: DesktopSettings::default(), fences: Vec::new(), released_items: Vec::new(), stash: Vec::new(), next_id: 1 } }
 }
 
 impl DesktopConfig {
     pub fn take_id(&mut self) -> u64 { let id = self.next_id; self.next_id += 1; id }
     pub fn normalize(&mut self) {
-        let largest = self.fences.iter().chain(&self.stash).map(|f| f.id.max(f.group)).max().unwrap_or(0);
+        let largest = self.fences.iter().chain(&self.stash).chain(&self.released_items).map(|f| f.id.max(f.group)).max().unwrap_or(0);
         self.next_id = self.next_id.max(largest + 1);
         for fence in self.fences.iter_mut().chain(self.stash.iter_mut()) {
             fence.placement.width = fence.placement.width.max(MIN_FENCE_W);
@@ -195,10 +198,44 @@ impl DesktopConfig {
         }
         normalize_groups(&mut self.fences);
         normalize_groups(&mut self.stash);
+        self.released_items.retain(|item| item.members.len() == 1 && item.is_desktop());
+        let mut released_keys=std::collections::HashSet::new();
+        self.released_items.retain(|item|released_keys.insert(item.members[0].to_lowercase()));
+        for item in &mut self.released_items {
+            item.title.clear(); item.group = 0; item.tab_active = false;
+            item.collapsed = false; item.locked = true; item.rule = None; item.catch_all = false;
+            item.view = FenceView::Icons;
+            item.placement.width = item.placement.width.clamp(72, 192);
+            item.placement.height = item.placement.height.clamp(84, 224);
+        }
         self.settings.opacity = self.settings.opacity.clamp(10, 100);
     }
-    pub fn fence(&self, id: u64) -> Option<&Fence> { self.fences.iter().find(|f| f.id == id) }
-    pub fn fence_mut(&mut self, id: u64) -> Option<&mut Fence> { self.fences.iter_mut().find(|f| f.id == id) }
+    pub fn fence(&self, id: u64) -> Option<&Fence> { self.fences.iter().chain(&self.released_items).find(|f| f.id == id) }
+    pub fn fence_mut(&mut self, id: u64) -> Option<&mut Fence> { self.fences.iter_mut().chain(&mut self.released_items).find(|f| f.id == id) }
+    pub fn is_released(&self, id: u64) -> bool { self.released_items.iter().any(|item| item.id == id) }
+    pub fn is_released_key(&self, key: &str) -> bool {
+        self.released_items.iter().any(|item| item.members.iter().any(|member| member.eq_ignore_ascii_case(key)))
+    }
+    pub fn distributed_items(&self,items:&[ItemInfo])->Vec<Vec<usize>> {
+        let mut groups=distribute(&self.fences,items);
+        for group in &mut groups { group.retain(|index|!self.is_released_key(&items[*index].key)); }
+        groups
+    }
+    /// A visual move only: the file itself and its path are never changed here.
+    pub fn release_item(&mut self, key: String, placement: Placement) -> u64 {
+        for fence in self.fences.iter_mut().chain(&mut self.stash) {
+            fence.members.retain(|member| !member.eq_ignore_ascii_case(&key));
+        }
+        if let Some(item) = self.released_items.iter_mut().find(|item| item.members.first().is_some_and(|member| member.eq_ignore_ascii_case(&key))) {
+            item.placement = placement;
+            return item.id;
+        }
+        let id = self.take_id();
+        let mut item = Fence::new(id, "", FenceSource::Desktop, placement);
+        item.members.push(key); item.locked = true;
+        self.released_items.push(item);
+        id
+    }
 
     // ---- tab groups ----------------------------------------------------------
 
@@ -332,8 +369,10 @@ impl DesktopConfig {
     /// Puts `keys` into fence `target` (manual membership), removing them from other desktop fences.
     /// `before` inserts ahead of an existing member to support manual reordering.
     pub fn assign(&mut self, target: u64, keys: &[String], before: Option<&str>) {
+        if !self.fences.iter().any(|f| f.id == target && f.is_desktop()) { return; }
+        self.released_items.retain(|item| !item.members.iter().any(|member| keys.iter().any(|key| member.eq_ignore_ascii_case(key))));
         for fence in self.fences.iter_mut().filter(|f| f.is_desktop()) {
-            fence.members.retain(|m| !keys.contains(m));
+            fence.members.retain(|member| !keys.iter().any(|key|member.eq_ignore_ascii_case(key)));
         }
         let Some(fence) = self.fence_mut(target).filter(|f| f.is_desktop()) else { return };
         let at = before.and_then(|b| fence.members.iter().position(|m| m == b)).unwrap_or(fence.members.len());
@@ -343,7 +382,7 @@ impl DesktopConfig {
     /// Updates manual memberships after a rename.
     pub fn rename_member(&mut self, old: &str, new: &str) -> bool {
         let mut changed = false;
-        for fence in self.fences.iter_mut() {
+        for fence in self.fences.iter_mut().chain(&mut self.released_items) {
             for member in fence.members.iter_mut().filter(|m| m.eq_ignore_ascii_case(old)) { *member = new.to_string(); changed = true; }
         }
         changed
@@ -504,6 +543,31 @@ pub fn auto_layout(count: usize, area_w: i32, area_h: i32) -> Vec<Bounds> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn released_desktop_items_survive_rules_restart_and_explicit_reassignment() {
+        let key=r"C:\Users\Test\Desktop\报告.txt";
+        let mut config=DesktopConfig{fences:vec![fence(1,Some(Category::Documents),true)],next_id:2,..Default::default()};
+        config.fences[0].members.push(key.into());
+        let position=Placement{monitor:"DISPLAY1".into(),x:200,y:100,width:96,height:104};
+        let id=config.release_item(key.into(),position.clone());
+        assert!(config.fences[0].members.is_empty());
+        assert_eq!(config.distributed_items(&[info(key,false)]),vec![Vec::<usize>::new()]);
+        let mut restored:DesktopConfig=serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        restored.normalize();
+        assert_eq!(restored.fence(id).unwrap().placement,position);
+        assert!(restored.fence(id).unwrap().title.is_empty());
+        assert_eq!(restored.release_item(key.to_uppercase(),position),id);
+        assert_eq!(restored.released_items.len(),1);
+        restored.assign(1,&[key.into()],None);
+        assert!(restored.released_items.is_empty());
+        assert_eq!(restored.distributed_items(&[info(key,false)]),vec![vec![0]]);
+    }
+    #[test]
+    fn old_desktop_profiles_default_to_no_released_items() {
+        let mut value=serde_json::to_value(DesktopConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("released_items");
+        assert!(serde_json::from_value::<DesktopConfig>(value).unwrap().released_items.is_empty());
+    }
     #[test]
     fn existing_profiles_hide_counts_until_enabled() {
         let mut value = serde_json::to_value(DesktopConfig::default()).unwrap();

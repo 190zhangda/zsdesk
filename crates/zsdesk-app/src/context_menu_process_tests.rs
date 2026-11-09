@@ -14,6 +14,11 @@ unsafe extern "system" fn owner_proc(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRE
     unsafe{DefWindowProcW(hwnd,msg,wp,lp)}
 }
 struct Owner(HWND);impl Drop for Owner{fn drop(&mut self){let _=unsafe{DestroyWindow(self.0)};}}
+struct PoolCleanup;
+impl Drop for PoolCleanup{fn drop(&mut self){
+    shutdown_idle_worker();let deadline=Instant::now()+Duration::from_secs(5);
+    while pending_workers()>0&&Instant::now()<deadline{pump(10);}
+}}
 pub(crate) struct Environment{key:&'static str,previous:Option<std::ffi::OsString>}
 impl Environment{pub(crate) fn set(key:&'static str,value:impl AsRef<std::ffi::OsStr>)->Self{let previous=std::env::var_os(key);std::env::set_var(key,value);Self{key,previous}}}
 impl Drop for Environment{fn drop(&mut self){if let Some(previous)=&self.previous{std::env::set_var(self.key,previous);}else{std::env::remove_var(self.key);}}}
@@ -38,7 +43,7 @@ fn complete_with_guard(client:&mut Client,owner:HWND,before:&mut dyn FnMut(bool)
     loop{
         ensure!(unsafe{IsWindow(Some(owner))}.as_bool(),"parent window was lost");
         if let Some(result)=client.poll(before){return Ok((result.map_err(|error|format!("{error:#}")),client.timings().unwrap_or_default()));}
-        ensure!(Instant::now()<deadline,"worker test exceeded protocol timeout");pump(10);
+        ensure!(Instant::now()<deadline,"worker test exceeded protocol timeout");pump(0);client.wait_for_progress(50);
     }
 }
 
@@ -60,6 +65,7 @@ fn read_clipboard_retry(stage:&str)->Result<(windows::Win32::System::Com::IDataO
 fn exercise(root:&Path,desktop_name:&str)->Result<serde_json::Value>{
     unsafe{OleInitialize(None)?;}
     struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
+    let _pool=PoolCleanup;
     let _desktop=Environment::set("ZSDESK_MENU_TEST_DESKTOP",desktop_name);let _root=Environment::set("ZSDESK_MENU_ROOT",root.join("workers"));
     let (files,pidls,fixtures)=sparse(root)?;
     let module=HINSTANCE(unsafe{GetModuleHandleW(None)?}.0);let class=w!("ZSDesk.MenuIsolation.Parent");
@@ -70,6 +76,7 @@ fn exercise(root:&Path,desktop_name:&str)->Result<serde_json::Value>{
     let started=Instant::now();let quick=QuickMenu::new(pidls.len(),false,&options)?;let construction=started.elapsed().as_micros()as u64;
     let picked=quick.track_raw(owner.0,point);ensure!(picked.is_none()&&ENTERED.with(std::cell::Cell::get),"immediate popup did not open/dismiss");drop(quick);
     let mut workers=Vec::new();
+    let mut reusable_pid=None;
     for probe in ["crash","memory-limit","dismiss","menu-dismiss"]{
         let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE",probe);let mut client=Client::spawn(owner.0,point,pidls.clone(),None,options.clone(),MenuInterceptions::default(),Mode::More)?;
         let child=client.pid().context("worker pid")?;ensure!(child!=std::process::id(),"extension ran in parent");
@@ -78,13 +85,60 @@ fn exercise(root:&Path,desktop_name:&str)->Result<serde_json::Value>{
         ensure!(limits.ProcessMemoryLimit==WORKER_MEMORY_LIMIT&&limits.BasicLimitInformation.LimitFlags.contains(JOB_OBJECT_LIMIT_PROCESS_MEMORY|JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK|JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION)
             &&!limits.BasicLimitInformation.LimitFlags.contains(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE),"worker resource/child lifetime policy changed");
         let(result,timing)=complete(&mut client,owner.0)?;
-        if probe=="crash"{ensure!(result.as_ref().is_err_and(|error|error.to_ascii_lowercase().contains("c0000005")),"unhandled worker access violation was not detected: {result:?}");}else{ensure!(matches!(result,Ok(MenuOutcome::Dismissed)),"{probe} failed: {result:?}");}
-        workers.push(serde_json::json!({"probe":probe,"pid":child,"outcome":result,"bind_microseconds":timing.0,"populate_microseconds":timing.1,"parent_alive":true,"memory_limit_bytes":limits.ProcessMemoryLimit,"child_process_breakaway":true,"kill_on_job_close":false}));drop(client);
+        let diagnostic=read_recent_diagnostics()["current"].clone();
+        if probe=="crash"{
+            ensure!(result.as_ref().is_err_and(|error|error.to_ascii_lowercase().contains("c0000005")),"unhandled worker access violation was not detected: {result:?}");
+            ensure!(diagnostic["worker_exit_hex"]=="0xC0000005"&&diagnostic["fault"]["exception_code"]=="0xC0000005","crash code/module evidence was not retained");
+        }else{ensure!(matches!(result,Ok(MenuOutcome::Dismissed)),"{probe} failed: {result:?}");}
+        let stages=client.detailed_timings();
+        if probe=="dismiss"{reusable_pid=Some(child);}
+        if probe=="menu-dismiss"{
+            ensure!(reusable_pid==Some(child)&&stages.reused_process&&stages.process_spawn_microseconds==0&&stages.com_microseconds==0,"warm request rebuilt its worker/COM apartment");
+            ensure!(stages.parent_to_menu_microseconds.is_some()&&stages.menu_open_observation.as_deref()==Some("visible-classic-menu"),"production menu-open timing was not observed");
+        }
+        workers.push(serde_json::json!({"probe":probe,"pid":child,"outcome":result,"bind_microseconds":timing.0,"populate_microseconds":timing.1,"stages":stages,"diagnostic":diagnostic,"parent_alive":true,"memory_limit_bytes":limits.ProcessMemoryLimit,"child_process_breakaway":true,"kill_on_job_close":false}));drop(client);
     }
+    // A cached status/decision from an earlier request cannot grant a later
+    // selection. Exercise session rotation without a third-party popup dwell.
+    let mut rotations=Vec::new();let mut previous=None;let mut rotated=false;
+    {
+        let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE","dismiss");
+        for index in 0..=MAX_SESSION_REQUESTS{
+            let mut client=Client::spawn(owner.0,point,vec![pidls[(index as usize)%pidls.len()].clone()],None,options.clone(),MenuInterceptions::default(),Mode::More)?;
+            let identity=(client.pid().unwrap(),client.ordinal);
+            let mut validations=0;
+            let(result,_)=complete_with_guard(&mut client,owner.0,&mut|before|{ensure_not_invoking(before);validations+=1;index!=0})?;
+            ensure!(matches!(result,Ok(MenuOutcome::Dismissed))&&validations==1,"stale request authorization was reused");
+            if let Some((pid,ordinal))=previous{if ordinal==MAX_SESSION_REQUESTS{ensure!(pid!=identity.0&&identity.1==1,"request limit did not rotate process");rotated=true;}
+                else{ensure!(pid==identity.0&&identity.1==ordinal+1,"idle worker unexpectedly lost its session");}}
+            previous=Some(identity);rotations.push(serde_json::json!({"pid":identity.0,"ordinal":identity.1}));drop(client);
+        }
+    }
+    ensure!(rotated,"request-count bound was not exercised");
+    shutdown_idle_worker();
     let end=Instant::now()+Duration::from_secs(5);while pending_workers()>0&&Instant::now()<end{pump(10);}ensure!(pending_workers()==0,"menu worker did not exit");
     for (path,record) in files.0.iter().zip(&fixtures){ensure!(fs::metadata(path)?.len()==record["logical_bytes"].as_u64().unwrap(),"fixture content length changed");}
     drop(owner);drop(files);
-    Ok(serde_json::json!({"fixtures":fixtures,"logical_total_bytes":24u64*1024*1024*1024,"quick_menu_construct_microseconds":construction,"quick_menu_native_popup":true,"workers":workers,"all_workers_exited":true,"fixtures_removed":true,"fault_injection":"unhandled noncontinuable SEH access violation 0xc0000005 before extension invocation"}))
+    Ok(serde_json::json!({"fixtures":fixtures,"logical_total_bytes":24u64*1024*1024*1024,"quick_menu_construct_microseconds":construction,"quick_menu_native_popup":true,"workers":workers,"reuse_rotation":rotations,"all_workers_exited":true,"fixtures_removed":true,"fault_injection":"unhandled noncontinuable SEH access violation 0xc0000005 before extension invocation"}))
+}
+fn ensure_not_invoking(before:bool){assert!(!before,"dismiss-only probe attempted an invocation");}
+
+pub(super) fn background_details_command(menu:&ShellMenu)->Result<u32>{
+    // Populate native view submenus, then invoke their actual numeric command.
+    // DefView does not expose a canonical string verb for every view mode.
+    let _=menu.submenu_with_verb("viewdetails");
+    let count=unsafe{GetMenuItemCount(Some(menu.hmenu()))};
+    for index in 0..count.max(0){
+        let sub=unsafe{GetSubMenu(menu.hmenu(),index)};if sub.is_invalid(){continue;}
+        for item in 0..unsafe{GetMenuItemCount(Some(sub))}.max(0){
+            let mut text=[0u16;128];let length=unsafe{GetMenuStringW(sub,item as u32,Some(&mut text),MF_BYPOSITION)}.max(0)as usize;
+            let label=String::from_utf16_lossy(&text[..length]).replace('&',"").to_lowercase();
+            if label.starts_with("详细信息")||label=="details"{
+                let id=unsafe{GetMenuItemID(sub,item)};ensure!(ShellMenu::is_shell_id(id),"invalid Details command");return Ok(id);
+            }
+        }
+    }
+    anyhow::bail!("native Details menu command unavailable")
 }
 #[test]
 #[ignore="Private desktop, sparse 24 GiB selection and extension worker process isolation; requires ZSDESK_NATIVE_TEST_OUTPUT"]
@@ -102,6 +156,7 @@ fn exercise_modern_owner(root:&Path,desktop_name:&str)->Result<serde_json::Value
     use windows::Win32::System::{DataExchange::GetClipboardSequenceNumber,Ole::OleSetClipboard};
     unsafe{OleInitialize(None)?;}
     struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
+    let _pool=PoolCleanup;
     struct Clipboard{previous:windows::Win32::System::Com::IDataObject,ours:Option<u32>,child:Option<u32>}
     impl Clipboard{
         fn restore(&mut self)->Result<()>{
@@ -114,7 +169,7 @@ fn exercise_modern_owner(root:&Path,desktop_name:&str)->Result<serde_json::Value
                 if !ours||before!=unsafe{GetClipboardSequenceNumber()}{break Ok(());}
                 match unsafe{OleSetClipboard(&self.previous)}{
                     Ok(())=>break Ok(()),
-                    Err(error) if error.code().0 as u32==0x800401d0&&Instant::now()<deadline=>pump(20),
+                    Err(error) if matches!(error.code().0 as u32,0x800401d0|0x800401d4)&&Instant::now()<deadline=>pump(20),
                     Err(error)=>break Err(error).context("restore native-menu clipboard after bounded retry"),
                 }
             };
@@ -139,8 +194,15 @@ fn exercise_modern_owner(root:&Path,desktop_name:&str)->Result<serde_json::Value
     // menu command is permitted; it is never treated as an empty clipboard.
     let(previous,initial_sequence)=read_clipboard_retry("preserve before native copy")?;
     let mut clipboard=Clipboard{previous,ours:None,child:None};
+    let warm_pid={
+        let _warm=Environment::set("ZSDESK_MENU_TEST_PROBE","menu-dismiss");
+        let mut warm=Client::spawn(owner.0,POINT{x:70,y:100},vec![pidls[0].clone()],None,ContextMenuOptions{modern:false,..Default::default()},MenuInterceptions::default(),Mode::More)?;
+        let pid=warm.pid().context("warmup worker")?;let(result,_)=complete(&mut warm,owner.0)?;
+        ensure!(matches!(result,Ok(MenuOutcome::Dismissed)),"warmup menu did not dismiss");drop(warm);pid
+    };
     let mut client=Client::spawn(owner.0,POINT{x:70,y:100},pidls,None,ContextMenuOptions{modern:true,..Default::default()},MenuInterceptions::default(),Mode::More)?;
     let child=client.pid().context("worker PID")?;
+    ensure!(child==warm_pid&&client.detailed_timings().reused_process,"new selection did not reuse idle process");
     clipboard.child=Some(child);
     let mut external_clipboard_change=false;
     let(result,timing)=match complete_with_guard(&mut client,owner.0,&mut |before_invoke|{
@@ -173,9 +235,28 @@ fn exercise_modern_owner(root:&Path,desktop_name:&str)->Result<serde_json::Value
     ensure!(matches!(result,Ok(MenuOutcome::ShellInvoked|MenuOutcome::NativeHandled)),"native copy did not finish: {evidence}");
     ensure!(exact,"native copy used a different selection: {evidence}");
     for path in &fixtures.0{ensure!(fs::read(path)?==b"ZSDesk native owner command fixture","fixture changed");}
-    clipboard.restore()?;drop(clipboard);drop(client);
+    clipboard.restore()?;drop(clipboard);drop(client);shutdown_idle_worker();
     let deadline=Instant::now()+Duration::from_secs(5);while pending_workers()>0&&Instant::now()<deadline{pump(10);}
     ensure!(pending_workers()==0,"native menu worker did not retire");
+    // A visible modern presenter is not a TrackPopupMenu. Cancellation must
+    // close that exact presenter before the idle/retirement policy can finish.
+    {
+        let _cancel_probe=Environment::set("ZSDESK_MENU_TEST_PROBE","modern-cancel");
+        let path=root.join("cancel.txt");fs::write(&path,b"cancel fixture")?;fixtures.0.push(path.clone());
+        let pidl=zsdesk_windows::shell::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(path)).context("cancel PIDL")?;
+        let mut client=Client::spawn(owner.0,POINT{x:70,y:100},vec![pidl],None,ContextMenuOptions{modern:true,..Default::default()},MenuInterceptions::default(),Mode::More)?;
+        let deadline=Instant::now()+Duration::from_secs(15);
+        loop {
+            ensure!(client.poll(&mut|_|true).is_none(),"cancel fixture finished before menu opened");
+            if client.detailed_timings().menu_open_observation.as_deref()==Some("native-presenter-open"){break;}
+            ensure!(Instant::now()<deadline,"modern cancel fixture never became visible");client.wait_for_progress(20);pump(5);
+        }
+        client.cancel();let deadline=Instant::now()+Duration::from_secs(5);
+        loop{if client.poll(&mut|_|false).is_some(){break;}ensure!(Instant::now()<deadline,"modern presenter did not cancel");client.wait_for_progress(20);pump(5);}
+        drop(client);shutdown_idle_worker();
+        let deadline=Instant::now()+Duration::from_secs(5);while pending_workers()>0&&Instant::now()<deadline{pump(10);}
+        ensure!(pending_workers()==0,"cancelled modern presenter retained worker");
+    }
     Ok(evidence)
 }
 

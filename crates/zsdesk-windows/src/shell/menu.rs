@@ -14,7 +14,7 @@ use windows::{
         System::Com::{CoTaskMemFree, IDataObject},
         UI::{
             Shell::{
-                Common::ITEMIDLIST, IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, IShellView, IShellItem,
+                Common::ITEMIDLIST, IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, IShellView, IShellItem,IExplorerBrowser,
                 ILClone, ILRemoveLastID, SHBindToParent, SVGIO_BACKGROUND, SVGIO_SELECTION,
                 SHCreateShellItemArrayFromIDLists, BHID_DataObject,
                 CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX, CMIC_MASK_PTINVOKE,
@@ -48,6 +48,13 @@ pub use quick_menu::{QuickAction,QuickMenu};
 pub type ViewMenuDelegate=fn(HWND,&IShellView,LPARAM)->Result<()>;
 thread_local!{static VIEW_MENU_DELEGATE:Cell<Option<ViewMenuDelegate>>=const{Cell::new(None)};}
 pub fn set_view_menu_delegate(delegate:Option<ViewMenuDelegate>){VIEW_MENU_DELEGATE.with(|current|current.set(delegate));}
+pub(crate) fn view_menu_is_delegated()->bool{VIEW_MENU_DELEGATE.with(|current|current.get().is_some())}
+pub type MenuDiagnosticDelegate=fn(&str,windows::core::HRESULT);
+thread_local!{static DIAGNOSTIC:Cell<Option<MenuDiagnosticDelegate>>=const{Cell::new(None)};}
+pub fn set_diagnostic_delegate(delegate:Option<MenuDiagnosticDelegate>){DIAGNOSTIC.with(|current|current.set(delegate));}
+fn diagnostic(phase:&str,status:windows::core::HRESULT){
+    if let Some(record)=DIAGNOSTIC.with(Cell::get){let _=std::panic::catch_unwind(||record(phase,status));}
+}
 
 /// Keeps process-wide menu compatibility state alive while multiple UI STAs
 /// share it. Drop only after all those UI threads have stopped.
@@ -207,17 +214,42 @@ pub fn failure_message() -> u32 {
 
 #[cfg(all(target_arch = "x86_64", target_env = "msvc"))]
 extern "C" {
+    fn zs_menu_install_fault_report(path:PCWSTR)->windows::core::HRESULT;
+    fn zs_menu_dismiss_active(owner:HWND)->windows::core::HRESULT;
     fn zs_menu_for_mixed_items(owner: HWND, count: u32, pidls: *const *const ITEMIDLIST, context: *mut *mut core::ffi::c_void) -> windows::core::HRESULT;
     fn zs_menu_set_hidden_features(hidden: u32);
     fn zs_menu_set_original_callback(callback: Option<unsafe extern "system" fn(*mut core::ffi::c_void, POINT) -> windows::core::HRESULT>);
     fn zs_menu_track_standalone(owner: HWND, context: *mut core::ffi::c_void, menu: HMENU,
-        count: u32, pidls: *const *const ITEMIDLIST, folder: *mut core::ffi::c_void, background: i32,
+        count: u32, pidls: *const *const ITEMIDLIST, folder: *mut core::ffi::c_void, background: i32, source_browser:*mut core::ffi::c_void,
         point: *mut POINT, applications: *const u32, application_count: u32, intercept: u32,
         before: Option<unsafe extern "system" fn(*mut core::ffi::c_void) -> windows::core::HRESULT>, before_context: *mut core::ffi::c_void,
         outcome: *mut NativeMenuResult) -> windows::core::HRESULT;
 }
 
+/// Last-chance native fault evidence for an isolated extension worker only.
+/// The handler writes code/module/offset and keeps normal crash propagation.
+pub fn install_fault_report(path:&std::path::Path)->Result<()>{
+    if !path.is_absolute(){return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80070057u32 as i32)));}
+    #[cfg(all(target_arch="x86_64",target_env="msvc"))]{
+        use std::os::windows::ffi::OsStrExt;
+        let text:Vec<u16>=path.as_os_str().encode_wide().chain(Some(0)).collect();
+        return unsafe{zs_menu_install_fault_report(PCWSTR(text.as_ptr()))}.ok();
+    }
+    #[cfg(not(all(target_arch="x86_64",target_env="msvc")))]
+    Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80004001u32 as i32)))
+}
+
+/// Cancels only the current thread's native presenter for this exact owner.
+/// Callers must not cancel a command after granting its execution barrier.
+pub fn dismiss_active_menu(owner:HWND)->Result<()>{
+    #[cfg(all(target_arch="x86_64",target_env="msvc"))]
+    {return unsafe{zs_menu_dismiss_active(owner)}.ok();}
+    #[cfg(not(all(target_arch="x86_64",target_env="msvc")))]
+    Ok(())
+}
+
 pub fn report_failure(owner: HWND, error: windows::core::HRESULT) {
+    diagnostic("native-menu-failure",error);
     let message = failure_message();
     if message != 0 {
         let root = unsafe { windows::Win32::UI::WindowsAndMessaging::GetAncestor(owner, windows::Win32::UI::WindowsAndMessaging::GA_ROOT) };
@@ -343,13 +375,13 @@ impl ShellMenu {
     /// Only explicitly intercepted application actions return to the fence.
     pub fn track_selected(&self, owner: HWND, point: POINT, pidls: &[Vec<u8>], application_count: usize,
             intercept: MenuInterceptions) -> Result<MenuOutcome> {
-        self.track_standalone(owner, point, pidls, None, false, application_count, intercept, &mut || Ok(()))
+        self.track_standalone(owner, point, pidls, None, false, None, application_count, intercept, &mut || Ok(()))
     }
 
     /// Revalidate an asynchronous selection before a Shell operation executes.
     pub fn track_selected_before(&self, owner: HWND, point: POINT, pidls: &[Vec<u8>], application_count: usize,
             intercept: MenuInterceptions, before:&mut dyn FnMut()->Result<()>) -> Result<MenuOutcome> {
-        self.track_standalone(owner,point,pidls,None,false,application_count,intercept,before)
+        self.track_standalone(owner,point,pidls,None,false,None,application_count,intercept,before)
     }
 
     pub fn track_folder_background(&self, owner: HWND, point: POINT, path: &std::path::Path, application_count: usize,
@@ -357,14 +389,18 @@ impl ShellMenu {
         let folder = if application_count==0 && context_menu_options().modern {
             unsafe { super::shell_item(&zsdesk_core::model::explorer::ShellLocation::Path(path.to_path_buf())) }.ok()
         } else { None };
-        self.track_standalone(owner, point, &[], folder.as_ref(), true, application_count, MenuInterceptions::default(), before)
+        self.track_standalone(owner, point, &[], folder.as_ref(), true, None, application_count, MenuInterceptions::default(), before)
     }
 
     pub fn track_background_item(&self,owner:HWND,point:POINT,folder:&IShellItem,before:&mut dyn FnMut()->Result<()>)->Result<MenuOutcome>{
-        self.track_standalone(owner,point,&[],Some(folder),true,0,MenuInterceptions::default(),before)
+        self.track_standalone(owner,point,&[],Some(folder),true,None,0,MenuInterceptions::default(),before)
     }
 
-    fn track_standalone(&self, owner: HWND, mut point: POINT, pidls: &[Vec<u8>], folder: Option<&IShellItem>, background: bool,
+    pub fn track_background_view(&self,owner:HWND,point:POINT,folder:&IShellItem,browser:&IExplorerBrowser,before:&mut dyn FnMut()->Result<()>)->Result<MenuOutcome>{
+        self.track_standalone(owner,point,&[],Some(folder),true,Some(browser),0,MenuInterceptions::default(),before)
+    }
+
+    fn track_standalone(&self, owner: HWND, mut point: POINT, pidls: &[Vec<u8>], folder: Option<&IShellItem>, background: bool, browser:Option<&IExplorerBrowser>,
             application_count: usize, intercept: MenuInterceptions, before: &mut dyn FnMut() -> Result<()>) -> Result<MenuOutcome> {
         let applications = application_ids(application_count)?;
         #[cfg(all(target_arch = "x86_64", target_env = "msvc"))]
@@ -381,7 +417,7 @@ impl ShellMenu {
                 let active = ActiveMenuScope::enter(&self.menu, true);
                 let result = unsafe { zs_menu_track_standalone(owner, self.menu.as_raw(), self.hmenu,
                     count, identifiers.as_ptr(), folder.map_or(std::ptr::null_mut(), Interface::as_raw),
-                    i32::from(background), &mut point, applications.as_ptr(), applications.len() as u32, intercept.bits(),
+                    i32::from(background), browser.map_or(std::ptr::null_mut(),Interface::as_raw), &mut point, applications.as_ptr(), applications.len() as u32, intercept.bits(),
                     Some(before_shell), (&mut observer as *mut BeforeShell<'_>).cast(), &mut outcome) };
                 drop(active);
                 if result.is_ok() {
@@ -546,8 +582,8 @@ fn trim_separators(menu: HMENU) {
 const VIEW_MENU_SUBCLASS: usize = 0x5A53_4D50;
 struct ViewMenuState { view: IShellView, modern: Rc<Cell<bool>> }
 
-/// Hosts the original menu only in original mode, using the view's own native
-/// IContextMenu. This lets filters keep a precise canonical-verb/command map.
+/// Installed delegates own both menu styles. Extension activation belongs to
+/// the isolated menu worker, never to the main file view's UI process.
 pub(crate) unsafe fn attach_view_menu(view: &IShellView, modern: Rc<Cell<bool>>) {
     let Ok(window) = (unsafe { view.GetWindow() }) else { return };
     let mut existing = 0usize;
@@ -570,16 +606,12 @@ unsafe extern "system" fn view_menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
     if let Some(result) = forward_menu_message(msg, wp, lp) { return result; }
     let state = unsafe { &*(data as *const ViewMenuState) };
     if msg==WM_CONTEXTMENU{
-        // In Windows 11 mode the hosted Shell view owns the complete modern
-        // menu.  Let ExplorerBrowser handle the message directly; routing it
-        // through ZSDesk's worker would rebuild a classic popup and introduce
-        // a visible first-right-click delay.
-        if state.modern.get() {
-            return unsafe { DefSubclassProc(hwnd, msg, wp, lp) };
-        }
         if let Some(delegate)=VIEW_MENU_DELEGATE.with(Cell::get){
             let view=state.view.clone();
-            if let Err(error)=delegate(hwnd,&view,lp){report_failure(hwnd,error.code());}
+            diagnostic("main-context-delegate",windows::core::HRESULT(0));
+            let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||delegate(hwnd,&view,lp)))
+                .unwrap_or_else(|_|Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000ffffu32 as i32))));
+            if let Err(error)=result{report_failure(hwnd,error.code());}
             return LRESULT(0);
         }
     }
@@ -604,8 +636,13 @@ unsafe extern "system" fn show_expanded_view_menu(raw_view: *mut core::ffi::c_vo
     let Some(view) = (unsafe { IShellView::from_raw_borrowed(&raw_view) }) else {
         return windows::core::HRESULT(0x8000_4003u32 as i32);
     };
-    let result = unsafe { view.GetWindow() }
-        .and_then(|owner| show_original_view_menu_at(owner, view, point));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||unsafe { view.GetWindow() }
+        .and_then(|owner| {
+            if let Some(delegate)=VIEW_MENU_DELEGATE.with(Cell::get){
+                let packed=LPARAM(((point.x as u16 as u32)|((point.y as u16 as u32)<<16))as isize);
+                delegate(owner,view,packed)
+            }else{show_original_view_menu_at(owner, view, point)}
+        }))).unwrap_or_else(|_|Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000ffffu32 as i32))));
     match result { Ok(()) => windows::core::HRESULT(0), Err(error) => error.code() }
 }
 

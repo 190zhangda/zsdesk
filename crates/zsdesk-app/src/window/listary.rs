@@ -42,6 +42,7 @@ pub(super) fn publish(owner: HWND, path: Option<&Path>) {
 
 impl WindowState {
     pub(super) fn publish_listary_folder(&self) {
+        if self.background_pane {return;}
         let ready = self.pending.is_none() && self.queued.is_none() && self.shown_tab == Some(self.session.active_tab().id);
         publish(self.hwnd, ready.then(|| self.current_location().as_path()).flatten());
     }

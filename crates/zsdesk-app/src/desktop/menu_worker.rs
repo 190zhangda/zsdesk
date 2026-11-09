@@ -19,13 +19,13 @@ pub(super) enum Target{Items{pidls:Vec<Vec<u8>>,key:Option<String>},Background{f
 #[derive(Clone)]
 pub(super) struct Request{
     pub fence:u64,pub owner:isize,pub point:POINT,pub profile:PathBuf,pub items:Vec<MenuItemSpec>,pub target:Target,pub extended:bool,
-    pub generation:u64,pub queued:Instant,pub ui_thread:u32,pub foreground:isize,
+    pub generation:u64,pub queued:Instant,pub input_started:Instant,pub ui_thread:u32,pub foreground:isize,
     pub mode:crate::context_menu_process::Mode,
     #[cfg(test)] pub probe:Option<Probe>,
 }
 impl Request{
     pub fn new(fence:u64,owner:HWND,point:POINT,profile:PathBuf,items:Vec<MenuItemSpec>,target:Target,extended:bool)->Self{
-        Self{fence,owner:owner.0 as isize,point,profile,items,target,extended,generation:0,queued:Instant::now(),ui_thread:unsafe{GetCurrentThreadId()},foreground:unsafe{GetForegroundWindow()}.0 as isize,mode:crate::context_menu_process::Mode::More,#[cfg(test)]probe:None}
+        let now=Instant::now();Self{fence,owner:owner.0 as isize,point,profile,items,target,extended,generation:0,queued:now,input_started:now,ui_thread:unsafe{GetCurrentThreadId()},foreground:unsafe{GetForegroundWindow()}.0 as isize,mode:crate::context_menu_process::Mode::More,#[cfg(test)]probe:None}
     }
 }
 #[derive(Clone,Debug,Default,serde::Serialize)]
@@ -34,9 +34,20 @@ pub(super) struct Timing{
     pub queue_microseconds:u64,pub bind_microseconds:u64,pub populate_microseconds:u64,
     pub input_to_menu_microseconds:Option<u64>,pub result:String,
     pub extension_process:Option<u32>,
+    pub initial_validation_microseconds:u64,pub settings_microseconds:u64,pub request_snapshot_microseconds:u64,
+    pub isolation:crate::context_menu_process::MenuTimings,
 }
+struct ValidationEvent(usize);
+impl Drop for ValidationEvent{fn drop(&mut self){let _=unsafe{windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(self.0 as*mut _))};}}
+pub(super) struct ValidationAnswer{sender:mpsc::SyncSender<bool>,wake:Arc<ValidationEvent>}
+impl ValidationAnswer{
+    fn wake(&self){let _=unsafe{windows::Win32::System::Threading::SetEvent(windows::Win32::Foundation::HANDLE(self.wake.0 as*mut _))};}
+    pub fn send(&self,value:bool)->Result<(),mpsc::SendError<bool>>{let result=self.sender.send(value);self.wake();result}
+    pub fn try_send(&self,value:bool)->Result<(),mpsc::TrySendError<bool>>{let result=self.sender.try_send(value);self.wake();result}
+}
+impl Drop for ValidationAnswer{fn drop(&mut self){self.wake();}}
 pub(super) enum Event{
-    Validate{request:Request,before_invoke:bool,answer:mpsc::SyncSender<bool>},
+    Validate{request:Request,before_invoke:bool,answer:ValidationAnswer},
     Finished{request:Request,ids:Vec<String>,outcome:Result<MenuOutcome,(i32,String)>,timing:Timing},
 }
 struct Shared{
@@ -142,13 +153,16 @@ unsafe extern "system" fn procedure(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->
 fn error_abort()->windows::core::Error{windows::core::Error::from_hresult(windows::core::HRESULT(0x80004004u32 as i32))}
 fn validate(shared:&Shared,request:&Request,before_invoke:bool)->windows::core::Result<()>{
     if !shared.current(request.generation){return Err(error_abort());}
-    let (answer,receiver)=mpsc::sync_channel(1);shared.push(Event::Validate{request:request.clone(),before_invoke,answer});
+    let event=unsafe{windows::Win32::System::Threading::CreateEventW(None,false,false,None)}?;
+    let wake=Arc::new(ValidationEvent(event.0 as usize));
+    let (sender,receiver)=mpsc::sync_channel(1);shared.push(Event::Validate{request:request.clone(),before_invoke,answer:ValidationAnswer{sender,wake:wake.clone()}});
     let deadline=Instant::now()+Duration::from_secs(2);
     loop{
-        match receiver.recv_timeout(Duration::from_millis(20)){Ok(true)if shared.current(request.generation)=>return Ok(()),Ok(_)|Err(mpsc::RecvTimeoutError::Disconnected)=>return Err(error_abort()),Err(mpsc::RecvTimeoutError::Timeout)=>{}}
+        match receiver.try_recv(){Ok(true)if shared.current(request.generation)=>return Ok(()),Ok(_)|Err(mpsc::TryRecvError::Disconnected)=>return Err(error_abort()),Err(mpsc::TryRecvError::Empty)=>{}}
         if !shared.current(request.generation)||Instant::now()>=deadline{return Err(error_abort());}
         let mut message=MSG::default();
         for _ in 0..32{if !unsafe{PeekMessageW(&mut message,None,0,0,PM_REMOVE)}.as_bool(){break;}if message.message==WM_QUIT{shared.stop.store(true,Ordering::Release);return Err(error_abort());}unsafe{let _=TranslateMessage(&message);DispatchMessageW(&message);}}
+        let _=crate::context_menu_process::wait_signal(&[wake.0],deadline.saturating_duration_since(Instant::now()).as_millis().min(100)as u32);
     }
 }
 fn foreground_allowed(expected:isize)->bool{unsafe{GetForegroundWindow()}.0 as isize==expected}
@@ -186,7 +200,7 @@ fn legacy_probe(shared:&Shared,state:&WindowState,owner:HWND,request:&Request,ti
         _=>{let spec=MenuSpec{items:request.items.clone(),..Default::default()};let selected=super::popup(owner,&spec,request.point);*ids=selected.clone().into_iter().collect();Ok(selected.map_or(MenuOutcome::Dismissed,|_|MenuOutcome::Application(zsdesk_windows::shell::menu::APP_FIRST)))},
     };
     let _=unsafe{KillTimer(Some(owner),CANCEL_TIMER)};
-    timing.input_to_menu_microseconds=state.entered.get().map(|entered|micros(entered.duration_since(request.queued)));
+    timing.input_to_menu_microseconds=state.entered.get().map(|entered|micros(entered.saturating_duration_since(request.input_started)));
     // Keep the zero-area owner alive for modeless Shell dialogs and clipboard
     // rendering; hiding/destroying it here would also hide its owned dialogs.
     if unsafe{GetForegroundWindow()}==owner&&unsafe{IsWindow(Some(source))}.as_bool(){let _=unsafe{SetForegroundWindow(source)};}
@@ -197,25 +211,33 @@ fn perform(shared:&Shared,state:&WindowState,owner:HWND,request:&Request,timing:
     // forwarding. Production extension code is always in a child process.
     #[cfg(test)]if request.probe.is_some(){return legacy_probe(shared,state,owner,request,timing,ids);}
     let _=(state,owner,ids);
+    let stage=Instant::now();
     validate(shared,request,false)?;
+    timing.initial_validation_microseconds=micros(stage.elapsed());
     if !foreground_allowed(request.foreground){return Err(windows::core::Error::new(windows::core::HRESULT(0x80004004u32 as i32),"菜单打开前前台窗口已改变"));}
+    let stage=Instant::now();
     let options=crate::storage::load(&request.profile).map(|session|crate::context_preferences::native(&session.ui.context_menu)).unwrap_or_default();
+    timing.settings_microseconds=micros(stage.elapsed());let stage=Instant::now();
     let(pidls,folder,intercept)=match &request.target{
         Target::Items{pidls,key}=>(pidls.clone(),None,MenuInterceptions{rename:key.is_some(),open:pidls.len()==1&&key.is_some()}),
         Target::Background{folder}=>(Vec::new(),folder.clone(),MenuInterceptions::default()),
     };
+    timing.request_snapshot_microseconds=micros(stage.elapsed());
+    let input_to_client=micros(request.input_started.elapsed());
     let mut client=crate::context_menu_process::Client::spawn_extended(HWND(request.owner as*mut _),request.point,pidls,folder,options,intercept,request.mode,request.extended)
         .map_err(|error|windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32),error.to_string()))?;
     timing.extension_process=client.pid();
     loop{
         if !shared.current(request.generation){client.cancel();return Err(error_abort());}
-        if let Some(result)=client.poll(&mut|before|validate(shared,request,before).is_ok()){
+        if let Some(result)=client.poll(&mut|before|validate(shared,request,before).is_ok()&&(before||foreground_allowed(request.foreground))){
             if let Some((bind,populate))=client.timings(){timing.bind_microseconds=bind;timing.populate_microseconds=populate;}
+            timing.isolation=client.detailed_timings();
+            timing.input_to_menu_microseconds=timing.isolation.parent_to_menu_microseconds.map(|time|time.saturating_add(input_to_client));
             return result.map_err(|error|windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32),error.to_string()));
         }
         let mut message=MSG::default();for _ in 0..32{if !unsafe{PeekMessageW(&mut message,None,0,0,PM_REMOVE)}.as_bool(){break;}
             if message.message==WM_QUIT{client.cancel();return Err(error_abort());}unsafe{let _=TranslateMessage(&message);DispatchMessageW(&message);}}
-        thread::sleep(Duration::from_millis(10));
+        client.wait_for_progress(100);
     }
 }
 fn run(shared:Arc<Shared>)->windows::core::Result<()>{
@@ -235,6 +257,7 @@ fn run(shared:Arc<Shared>)->windows::core::Result<()>{
         }
         let mut message=MSG::default();let status=unsafe{GetMessageW(&mut message,None,0,0)}.0;if status<=0{break;}unsafe{let _=TranslateMessage(&message);DispatchMessageW(&message);}
     }
+    crate::context_menu_process::shutdown_idle_worker_for_thread();
     shared.window.store(0,Ordering::Release);drop(owner);Ok(())
 }
 

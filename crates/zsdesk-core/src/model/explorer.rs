@@ -295,6 +295,15 @@ impl Default for QuickSearchPreferences {
 #[serde(default)]
 pub struct ExplorerUi {
     pub tab_placement: TabPlacement,
+    pub dual_pane: bool,
+    /// Split position in thousandths, independent of monitor scaling.
+    pub pane_ratio: u16,
+    pub double_click_close_tab: bool,
+    pub close_window_on_last_tab: bool,
+    pub show_tab_count: bool,
+    pub mouse_gestures: bool,
+    /// Uses indexed metadata only; never starts a directory-size scan.
+    pub everything_folder_sizes: bool,
     pub show_tree: bool,
     /// Navigation tree width in DIP.
     pub tree_width: i32,
@@ -311,21 +320,35 @@ pub struct ExplorerUi {
     pub forward_unhandled_windows: bool,
     pub preview_provider: PreviewProviderPreference,
     pub navigation_auto_expand: Option<bool>,
+    pub navigation_show_recycle_bin: bool,
+    pub navigation_show_network: bool,
+    pub navigation_expand_this_pc: Option<bool>,
     pub appearance: AppearancePreferences,
     pub window: Option<WindowPlacement>,
 }
 
 impl Default for ExplorerUi {
     fn default() -> Self {
-        Self { tab_placement:TabPlacement::Top, show_tree: true, tree_width: 220, show_bookmarks: true, show_preview: false, show_details: false,
+        Self { tab_placement:TabPlacement::Top, dual_pane:false, pane_ratio:500,
+            double_click_close_tab:true, mouse_gestures:true, everything_folder_sizes:false,
+            close_window_on_last_tab:true,show_tab_count:true,
+            show_tree: true, tree_width: 220, show_bookmarks: true, show_preview: false, show_details: false,
             command_bar: CommandBarPreferences::default(), context_menu: ContextMenuPreferences::default(),
             search_all_files: true, search_backend: SearchBackendPreference::Everything, space_preview: true,
             everything_executable:None,
             hover_preview: false, preview_provider: PreviewProviderPreference::System,
             forward_unhandled_windows: true,
-            navigation_auto_expand: None, appearance: AppearancePreferences::default(),
+            navigation_auto_expand: None,navigation_show_recycle_bin:true,navigation_show_network:true,navigation_expand_this_pc:None,
+            appearance: AppearancePreferences::default(),
             window: None }
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ExplorerPaneSession {
+    pub tabs: Vec<ExplorerTab>,
+    pub active_tab: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -334,6 +357,8 @@ pub struct ExplorerSession {
     pub tabs: Vec<ExplorerTab>,
     pub active_tab: usize,
     pub next_id: u64,
+    #[serde(default)]
+    pub secondary_pane: ExplorerPaneSession,
     #[serde(default)]
     pub ui: ExplorerUi,
 }
@@ -345,6 +370,7 @@ impl Default for ExplorerSession {
             tabs: vec![ExplorerTab::new(1, ShellLocation::ThisPc)],
             active_tab: 0,
             next_id: 2,
+            secondary_pane: ExplorerPaneSession::default(),
             ui: ExplorerUi::default(),
         }
     }
@@ -360,9 +386,12 @@ impl ExplorerSession {
         for tab in &mut self.tabs {
             tab.normalize();
         }
+        for tab in &mut self.secondary_pane.tabs { tab.normalize(); }
+        self.secondary_pane.active_tab = self.secondary_pane.active_tab.min(self.secondary_pane.tabs.len().saturating_sub(1));
+        self.ui.pane_ratio = self.ui.pane_ratio.clamp(200, 800);
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
         self.ui.tree_width = self.ui.tree_width.clamp(120, 800);
-        let largest = self.tabs.iter().map(|t|t.id)
+        let largest = self.tabs.iter().chain(self.secondary_pane.tabs.iter()).map(|t|t.id)
             .chain(self.bookmarks.iter().map(|b|b.id)).max().unwrap_or(0);
         self.next_id = self.next_id.max(largest.saturating_add(1));
     }
@@ -480,6 +509,10 @@ mod tests {
         assert!(!ui.space_preview && !ui.hover_preview && ui.navigation_auto_expand.is_none());
         assert_eq!(ui.appearance, AppearancePreferences::default());
         assert_eq!(ui.search_backend, SearchBackendPreference::Everything);
+        assert!(!ui.dual_pane && !ui.everything_folder_sizes);
+        assert!(ui.close_window_on_last_tab && ui.show_tab_count);
+        assert!(ui.navigation_show_recycle_bin && ui.navigation_show_network);
+        assert_eq!(ui.navigation_expand_this_pc,None);
         let background: QuickSearchPreferences = serde_json::from_str("{}").unwrap();
         assert!(!background.enabled && !background.start_with_windows);
         assert_eq!(background.hotkey, "Ctrl+Alt+Space");

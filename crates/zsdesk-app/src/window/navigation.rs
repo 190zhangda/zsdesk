@@ -10,6 +10,17 @@ pub(super) struct NavigationRequest {
 impl NavigationRequest { pub(super) fn new(tab:ExplorerTab)->Self {Self{tab,from_tree:false}} }
 
 impl WindowState {
+    pub(super) fn navigation_tree_options(&self)->zsdesk_windows::shell::NamespaceTreeOptions {
+        zsdesk_windows::shell::NamespaceTreeOptions{show_recycle_bin:self.session.ui.navigation_show_recycle_bin,
+            show_network:self.session.ui.navigation_show_network,expand_this_pc:self.session.ui.navigation_expand_this_pc}
+    }
+    pub(super) fn rebuild_navigation_tree(&mut self) {
+        self.tree=None;
+        match unsafe{NamespaceTreeHost::create_with_options(self.hwnd,win_rect(self.layout.tree),self.current_location(),self.navigation_tree_options())} {
+            Ok(tree)=>{self.tree=Some(tree);self.theme_children();self.relayout();self.position_children();},
+            Err(error)=>self.show_message(format!("无法更新导航窗格：{error}")),
+        }
+    }
     pub(super) fn navigation_auto_expand(&self)->bool {
         self.session.ui.navigation_auto_expand.unwrap_or_else(NamespaceTreeHost::system_auto_expand)
     }
@@ -36,7 +47,9 @@ impl WindowState {
         if let Some(tab)=self.session.tabs.iter_mut().find(|t|t.id==id) {tab.view=snapshot;}
     }
     pub(super) unsafe fn request_navigation(&mut self,request:NavigationRequest) {
-        self.end_address_edit();
+        self.navigation_epoch=self.navigation_epoch.wrapping_add(1);
+        self.folder_sizes.cancel();
+        if !self.background_pane {self.end_address_edit();}
         if self.pending.is_some() {self.queued=Some(request);return;}
         if !self.session.tabs.iter().any(|t|t.id==request.tab.id) {return;}
         let target=request.tab.current().clone();
@@ -70,6 +83,9 @@ impl WindowState {
         if tab.navigate(location) {unsafe {self.request_navigation(NavigationRequest{tab,from_tree});}}
     }
     pub(super) unsafe fn navigation_completed(&mut self,location:ShellLocation) {
+        self.navigation_epoch=self.navigation_epoch.wrapping_add(1);
+        self.view_hwnd=self.browser.as_ref().and_then(|b|b.view_window()).unwrap_or_default();
+        if let Some(identity)=self.identity_for_source(self.browser_source){wheel_input::install(self.view_hwnd,self.hwnd,identity);}
         let completed_request=self.pending.is_some();
         let completed_tab = self.pending.as_ref().map(|request| request.tab.id).or(self.shown_tab);
         let active_completion = completed_tab == Some(self.session.active_tab().id);
@@ -94,7 +110,7 @@ impl WindowState {
             }
             if active_completion {
                 self.search_scope = self.search_controls().origin;
-                if self.queued.is_none() && unsafe{GetFocus()}!=self.search_edit {
+                if !self.background_pane && self.queued.is_none() && unsafe{GetFocus()}!=self.search_edit {
                     if let ShellLocation::Search{query,..}=&location {
                         self.search_controls_mut().draft = Some(query.clone());
                         let _=unsafe{SetWindowTextW(self.search_edit,PCWSTR(wide(query).as_ptr()))};
@@ -106,7 +122,7 @@ impl WindowState {
             // Leaving the results: forget the scope and clear the box (unless typing).
             self.search_scope=None; self.search_result=None;
             self.search_controls_mut().origin = None;
-            if unsafe {GetFocus()}!=self.search_edit {
+            if !self.background_pane && unsafe {GetFocus()}!=self.search_edit {
                 self.search_controls_mut().draft = Some(String::new());
                 let _=unsafe {SetWindowTextW(self.search_edit,PCWSTR::null())};
             }
@@ -141,7 +157,7 @@ impl WindowState {
             // Like Explorer, the tree and the file view sync differently: a tree
             // click keeps the clicked row; any other navigation never opens
             // tree branches unless "展开到打开的文件夹" is on.
-            if !matches!(&current,ShellLocation::Search{..}){if let Some(tree)=self.tree.as_ref().filter(|_|self.session.ui.show_tree) {
+            if !self.background_pane && !matches!(&current,ShellLocation::Search{..}){if let Some(tree)=self.tree.as_ref().filter(|_|self.session.ui.show_tree) {
                 if from_tree {unsafe {tree.adopt_location(&current);}} else {unsafe {tree.select_location_with_policy(&current,self.navigation_auto_expand());}}
             }}
             self.theme_children();
@@ -153,6 +169,7 @@ impl WindowState {
         else if let Some(request)=self.open_requests.pop_front(){unsafe {self.open_requested(request);}}
     }
     pub(super) unsafe fn navigation_failed(&mut self) {
+        self.navigation_epoch=self.navigation_epoch.wrapping_add(1);
         self.cancel_fast_search();self.browser_role=BrowserRole::Ordinary;
         self.launch_selection=None;
         self.launch_selections.clear();
@@ -181,6 +198,10 @@ impl WindowState {
     }
     pub(super) unsafe fn close_tab(&mut self,index:usize) {
         if index>=self.session.tabs.len() {return;}
+        if self.session.tabs.len()==1 && self.session.ui.close_window_on_last_tab {
+            if self.close_last_pane_tab() {return;}
+            post(self.hwnd,WM_CLOSE,0,0);return;
+        }
         unsafe {self.capture_active();}
         let active_id=self.session.active_tab().id;
         let removed=self.session.tabs.remove(index);
@@ -221,6 +242,7 @@ impl WindowState {
     }
     /// Refreshes breadcrumb, window title, search hint and button states.
     pub(super) unsafe fn update_address(&mut self) {
+        if self.background_pane { return; }
         self.publish_listary_folder();
         unsafe { self.sync_search_tab_edit(); }
         let target=self.pending.as_ref().filter(|p|p.tab.id==self.session.active_tab().id).map(|p|p.tab.current().clone()).unwrap_or_else(||self.current_location().clone());
@@ -255,6 +277,7 @@ impl WindowState {
     }
     pub(super) unsafe fn focus_address(&mut self) {
         self.address_editing=true;
+        if let Some(identity)=self.identity_for_source(self.browser_source) {address_input::begin(self.address_edit,self.hwnd,identity);}
         self.hover_crumb=None;
         let text=match self.current_location() {ShellLocation::ThisPc=>"此电脑".to_string(),l=>l.address()};
         let _=unsafe {SetWindowTextW(self.address_edit,PCWSTR(wide(&text).as_ptr()))};
@@ -266,11 +289,15 @@ impl WindowState {
     pub(super) fn end_address_edit(&mut self) {
         if !self.address_editing {return;}
         self.address_editing=false;
+        address_input::end(self.address_edit);
         let _=unsafe {ShowWindow(self.address_edit,SW_HIDE)};
         self.invalidate_rect(self.layout.nav_row);
     }
     pub(super) unsafe fn commit_address(&mut self) {
         let text=window_text(self.address_edit);
+        unsafe{self.commit_address_text(&text);}
+    }
+    pub(super) unsafe fn commit_address_text(&mut self,text:&str) {
         if let Some(request)=super::terminal::parse(&text) {
             match request {
                 Ok(request)=>if self.launch_terminal(&request) { self.end_address_edit(); },
@@ -287,7 +314,7 @@ impl WindowState {
             self.show_message("SFTP/SSH 访问需要先安装 SSHFS-Win（WinFsp），安装后可直接输入 sftp:// 地址".into());
             return;
         }
-        match parse_address(&text) {
+        match parse_address(text) {
             Some(location)=>{
                 self.end_address_edit();
                 unsafe {self.navigate_to(location);}

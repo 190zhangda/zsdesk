@@ -57,6 +57,31 @@ fn edit_palette_isolation(output:&std::path::Path)->Result<()>{
         &&brush_info.lbColor.0==0x456789,"destroying one window deleted the other window's GDI brush");
     check(second.hwnd,edit_b,0x456789,0x6789ab)?;drop(second);Ok(())
 }
+
+fn last_tab_close_policy(output:&std::path::Path)->Result<()> {
+    let runner=palette_window(output,"last-tab")?;
+    unsafe{SetWindowPos(runner.hwnd,None,140,120,800,540,SWP_NOACTIVATE|SWP_NOZORDER)?;runner.slot.borrow_mut().as_mut().unwrap().create(runner.hwnd)?;}
+    let ready=||->Result<()> {
+        let end=Instant::now()+Duration::from_secs(12);
+        loop{pump(25);if runner.slot.borrow().as_ref().is_some_and(|state|state.pending.is_none()&&state.queued.is_none()){return Ok(());}
+            ensure!(Instant::now()<end,"last-tab fixture navigation timed out");}
+    };
+    ready()?;
+    let old_id=runner.slot.borrow().as_ref().unwrap().session.active_tab().id;
+    {
+        let mut slot=runner.slot.borrow_mut();let state=slot.as_mut().unwrap();state.session.ui.close_window_on_last_tab=false;
+        unsafe{state.close_tab(0);}
+    }
+    ready()?;
+    ensure!(unsafe{IsWindow(Some(runner.hwnd))}.as_bool(),"disabled last-tab-close still closed the window");
+    ensure!(runner.slot.borrow().as_ref().unwrap().session.active_tab().id!=old_id,"disabled last-tab-close did not retain a fresh tab");
+    let close={let mut slot=runner.slot.borrow_mut();let state=slot.as_mut().unwrap();state.session.ui.close_window_on_last_tab=true;
+        state.layout.tabs.iter().find(|tab|tab.index==state.session.active_tab).context("last tab close bounds")?.close};
+    let x=close.x+close.width/2;let y=close.y+close.height/2;let packed=LPARAM(((x as u16 as u32)|((y as u16 as u32)<<16))as isize);
+    unsafe{SendMessageW(runner.hwnd,WM_LBUTTONDOWN,Some(WPARAM(1)),Some(packed));SendMessageW(runner.hwnd,WM_LBUTTONUP,Some(WPARAM(0)),Some(packed));}
+    pump(100);ensure!(!unsafe{IsWindow(Some(runner.hwnd))}.as_bool(),"closing the last visible tab did not close the file window");
+    Ok(())
+}
 fn pump(ms:u64){
     let end=Instant::now()+Duration::from_millis(ms);
     while Instant::now()<end{
@@ -174,6 +199,7 @@ fn run(output:&std::path::Path)->Result<serde_json::Value>{
     let deadline=Instant::now()+Duration::from_secs(12);
     loop{pump(40);if slot.borrow().as_ref().is_some_and(|s|s.pending.is_none()&&s.shown_tab.is_some()){break;}ensure!(Instant::now()<deadline,"Shell navigation timed out");}
     edit_palette_isolation(output)?;
+    last_tab_close_policy(output)?;
     let acc=Accelerators(unsafe{CreateAcceleratorTableW(&accelerator_table())?});
     let mode=||slot.borrow().as_ref().unwrap().browser.as_ref().unwrap().view_mode().unwrap();
     let normal=rectangle(hwnd)?;let mut frames=Vec::new();
@@ -262,13 +288,14 @@ fn run(output:&std::path::Path)->Result<serde_json::Value>{
             materials.push(serde_json::json!({"backdrop":backdrop,"color":scheme,"dwm_supported":available,"dwm_value":actual}));
         }
     }
+    let dual=dual_pane::native_exercise(&slot,output,pump)?;
     caption_click(hwnd,2)?;ensure!(!unsafe{IsWindow(Some(hwnd))}.as_bool(),"caption close failed");
     ensure!(storage::load(&config)?.ui.window==Some(saved),"closing changed saved normal geometry");
-    let report=serde_json::json!({"caption_button_clicks":true,"all_resize_cursor_handles":true,"saved_geometry_reopens":true,"manual_resize":frames,"saved_size":[saved.width,saved.height],"maximize_restore_cycles":3,"fullscreen_normal_and_maximized":true,"materials":materials,
+    let report=serde_json::json!({"dual_pane":dual,"caption_button_clicks":true,"all_resize_cursor_handles":true,"saved_geometry_reopens":true,"manual_resize":frames,"saved_size":[saved.width,saved.height],"maximize_restore_cycles":3,"fullscreen_normal_and_maximized":true,"materials":materials,
         "ctrl_wheel_high_resolution_and_direction":true,"wheel_text_edit_preserved":true,"view_presets":presets,"focus_cycle":true,"tab_shortcuts":true,"native_shell_loaded":true,"tab_positions":["left","right","top"],
         "caption_input":"queued down/up with bounded tracking watchdog","caption_cancel_releases_capture":true,"caption_drag_out_and_back":true,"caption_visual_per_hwnd":true,
         "theme_composition_systemcolor_notifications":true,"high_contrast_notification_reentrant":true,"windows_theme_preferences_changed":false,
-        "edit_palette_per_hwnd":true,"owned_brush_teardown":true,"deferred_paint_per_hwnd":true});
+        "edit_palette_per_hwnd":true,"owned_brush_teardown":true,"deferred_paint_per_hwnd":true,"last_tab_close_setting":true});
     drop(acc);drop(owner);pump(60);drop(slot);Ok(report)
 }
 

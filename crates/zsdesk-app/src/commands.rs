@@ -17,6 +17,8 @@ pub enum Command {
     CopyPath,
     TogglePreview,
     ToggleDetails,
+    ToggleDualPane,
+    SwitchPane,
     NewWindow,
     ToggleFullscreen,
     FocusNext,
@@ -30,6 +32,11 @@ pub enum Command {
 }
 
 impl Command {
+    pub const fn pane_specific(self)->bool {
+        matches!(self,Self::NewTab|Self::CloseTab|Self::NextTab|Self::PreviousTab|Self::Back|Self::Forward|Self::Up|
+            Self::Refresh|Self::ReopenTab|Self::NewFolder|Self::CopyPath|Self::ZoomIn|Self::ZoomOut|Self::ResetZoom|
+            Self::ViewPreset(_)|Self::SelectTab(_))
+    }
     pub const fn id(self) -> u16 {
         match self {
             Self::NewTab => 2001,
@@ -48,6 +55,8 @@ impl Command {
             Self::CopyPath => 2014,
             Self::TogglePreview => 2015,
             Self::ToggleDetails => 2016,
+            Self::ToggleDualPane => 2017,
+            Self::SwitchPane => 2018,
             Self::NewWindow => 2030,
             Self::ToggleFullscreen => 2031,
             Self::FocusNext => 2032,
@@ -78,6 +87,8 @@ impl Command {
             2014 => Some(Self::CopyPath),
             2015 => Some(Self::TogglePreview),
             2016 => Some(Self::ToggleDetails),
+            2017 => Some(Self::ToggleDualPane),
+            2018 => Some(Self::SwitchPane),
             2030 => Some(Self::NewWindow),
             2031 => Some(Self::ToggleFullscreen),
             2032 => Some(Self::FocusNext),
@@ -97,7 +108,7 @@ mod tests {
     use super::Command;
     #[test]
     fn ids_round_trip() {
-        for c in [Command::NewTab, Command::NewFolder, Command::ToggleDetails, Command::SelectTab(1), Command::SelectTab(9)] {
+        for c in [Command::NewTab, Command::NewFolder, Command::ToggleDetails,Command::ToggleDualPane,Command::SwitchPane, Command::SelectTab(1), Command::SelectTab(9)] {
             assert_eq!(Command::from_id(c.id()), Some(c));
         }
         assert_eq!(Command::from_id(2020), None);

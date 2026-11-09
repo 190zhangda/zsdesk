@@ -98,14 +98,9 @@ fn exercise(root:&Path,name:&str)->Result<serde_json::Value>{
     let _desktop=Environment::set("ZSDESK_MENU_TEST_DESKTOP",name);let _root=Environment::set("ZSDESK_MENU_ROOT",root.join("workers"));
     unsafe{OleInitialize(None)?;}let _apartment=Apartment;
     let folder=root.join("files");fs::create_dir_all(&folder)?;let(files,_,records)=sparse(&folder)?;let(host,window,point)=setup(root,&folder)?;
-    MORE.with(|value|value.set(false));ENTERED.with(|value|value.set(None));QUICK.with(|value|value.set(false));let before=zsdesk_windows::shell::menu_diagnostics();let started=Instant::now();
-    right_click(window,point);let entered=ENTERED.with(Cell::get).context("real fence right-click did not open its popup")?;
-    let after=zsdesk_windows::shell::menu_diagnostics();ensure!(QUICK.with(Cell::get),"fence bypassed immediate common menu");
-    ensure!(before.presenter_creations==after.presenter_creations&&before.last_public_populate_microseconds==after.last_public_populate_microseconds,"fence first menu loaded Shell extensions");
-    ensure!(MENU_WORKER.with(|worker|worker.borrow().is_none()),"ordinary fence right-click started an extension worker");
-    let elapsed=entered.duration_since(started).as_micros()as u64;let mut rows=Vec::new();
-    for failed in [true,false]{
-        let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE",if failed{"crash"}else{"dismiss"});MORE.with(|value|value.set(true));
+    let before=zsdesk_windows::shell::menu_diagnostics();let mut rows=Vec::new();
+    for failed in [true,false,false]{
+        let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE",if failed{"crash"}else{"menu-dismiss"});
         let previous=menu_diagnostics()["recent"].as_array().map_or(0,Vec::len);right_click(window,point);
         let end=Instant::now()+Duration::from_secs(12);
         loop{pump(20);let report=menu_diagnostics();if report["recent"].as_array().is_some_and(|rows|rows.len()>previous){break;}ensure!(Instant::now()<end,"fence extension result timed out: {report}");}
@@ -114,12 +109,17 @@ fn exercise(root:&Path,name:&str)->Result<serde_json::Value>{
         let child=timing["extension_process"].as_u64().with_context(||format!("fence did not start an extension process: {timing}"))?;
         ensure!(child!=u64::from(std::process::id()),"fence executed extension in parent: {timing}");
         if failed{ensure!(DIALOGS.with(Cell::get)>0,"fence extension failure had no error feedback");}
+        else{ensure!(timing["input_to_menu_microseconds"].as_u64().is_some(),"real menu visibility was not observed: {timing}");}
         rows.push(serde_json::json!({"injected_access_violation":failed,"timing":timing,"host_alive":true}));
     }
+    let after=zsdesk_windows::shell::menu_diagnostics();
+    ensure!(before.presenter_creations==after.presenter_creations&&before.last_public_populate_microseconds==after.last_public_populate_microseconds,"fence UI constructed Shell extensions in parent");
+    ensure!(rows[2]["timing"]["isolation"]["reused_process"]==true,"warm fence menu did not reuse eligible worker: {rows:?}");
     let beats=HEARTBEATS.with(Cell::get);drop(host);pump(40);drop(files);
+    crate::context_menu_process::shutdown_idle_worker();
     let end=Instant::now()+Duration::from_secs(5);while crate::context_menu_process::pending_workers()>0&&Instant::now()<end{pump(10);}ensure!(crate::context_menu_process::pending_workers()==0&&pending_menu_threads()==0,"fence menu worker did not retire");
     Ok(serde_json::json!({"actual_mapping_fence":true,"host_start_called":false,"organize_called":false,"fixtures":records,"selected_bytes":24u64*1024*1024*1024,
-        "first_menu_microseconds":elapsed,"query_context_menu_called":false,"workers":rows,"host_heartbeats":beats,"fixtures_removed":true,"all_workers_exited":true}))
+        "query_context_menu_in_main":false,"workers":rows,"host_heartbeats":beats,"fixtures_removed":true,"all_workers_exited":true}))
 }
 #[test]
 #[ignore="Actual mapping fence right-click on a private desktop with sparse 24 GiB files; requires ZSDESK_NATIVE_TEST_OUTPUT"]

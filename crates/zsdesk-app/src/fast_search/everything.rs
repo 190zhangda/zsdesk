@@ -105,18 +105,25 @@ fn query_with(options:&QueryOptions,cookie:u32,configured:Option<&Path>,cancel:i
     query_with_progress(options,cookie,configured,cancel,REQUEST_FLAGS,&mut||{})
 }
 fn query_packet(options:&QueryOptions,hwnd:HWND,cookie:u32,flags:u32)->Vec<u8>{
-    let mut payload=Vec::new();for value in [hwnd.0 as usize as u32,cookie,0,options.offset,options.limit,flags,options.sort.code()]{payload.extend(value.to_le_bytes());}
+    query_packet_with_search_flags(options,hwnd,cookie,flags,0)
+}
+fn query_packet_with_search_flags(options:&QueryOptions,hwnd:HWND,cookie:u32,flags:u32,search_flags:u32)->Vec<u8>{
+    let mut payload=Vec::new();for value in [hwnd.0 as usize as u32,cookie,search_flags,options.offset,options.limit,flags,options.sort.code()]{payload.extend(value.to_le_bytes());}
     for unit in options.text.encode_utf16().chain(Some(0)){payload.extend(unit.to_le_bytes());}payload
 }
 fn query_with_progress(options:&QueryOptions,cookie:u32,configured:Option<&Path>,cancel:impl Fn()->bool,flags:u32,pending:&mut dyn FnMut())->Result<SearchPage>{
     validate(options)?;if cancel(){bail!("搜索已取消");}
     let server=runtime::ensure_running(configured,&cancel,false)?;runtime::wait_ready(&server,&cancel,pending)?;
+    query_connection(options,cookie,&server,cancel,flags,0)
+}
+fn query_connection(options:&QueryOptions,cookie:u32,server:&runtime::Connection,cancel:impl Fn()->bool,flags:u32,search_flags:u32)->Result<SearchPage>{
+    validate(options)?;if cancel(){bail!("搜索已取消");}
     let instance=HINSTANCE(unsafe{GetModuleHandleW(None)?}.0);
     unsafe{RegisterClassW(&WNDCLASSW{hInstance:instance,lpfnWndProc:Some(window_proc),lpszClassName:CLASS,..Default::default()});}
     let mut reply=Box::new(Reply{cookie,data:None});
     let hwnd=unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),CLASS,PCWSTR::null(),WINDOW_STYLE::default(),0,0,0,0,Some(HWND_MESSAGE),None,Some(instance),Some((&mut*reply as*mut Reply).cast()))?};
     struct Owned(HWND);impl Drop for Owned{fn drop(&mut self){let _=unsafe{DestroyWindow(self.0)};}}let _window=Owned(hwnd);
-    let mut payload=query_packet(options,hwnd,cookie,flags);
+    let mut payload=query_packet_with_search_flags(options,hwnd,cookie,flags,search_flags);
     let data=COPYDATASTRUCT{dwData:QUERY2_UNICODE,cbData:payload.len()as u32,lpData:payload.as_mut_ptr().cast()};let mut accepted=0;
     if unsafe{SendMessageTimeoutW(server.hwnd,WM_COPYDATA,WPARAM(hwnd.0 as usize),LPARAM(&data as*const _ as isize),SMTO_ABORTIFHUNG,1500,Some(&mut accepted))}.0==0||accepted==0{
         bail!("Everything 未接受查询，请检查是否为 1.4.1 以上非 Lite 版本，以及两者的权限级别");
@@ -136,6 +143,60 @@ fn query_with_progress(options:&QueryOptions,cookie:u32,configured:Option<&Path>
 }
 pub fn query_page(profile:&Path,options:&QueryOptions,cookie:u32,cancel:impl Fn()->bool)->Result<SearchPage>{
     query_with(options,cookie,runtime::configured(profile).as_deref(),cancel)
+}
+
+/// Reads only indexed folder sizes, for a bounded set of already visible paths.
+/// This never requests a filesystem scan, enables an index, or treats a missing
+/// index entry as a zero-byte folder. Call only from a cancellable worker.
+pub(crate) fn query_folder_sizes(profile:&Path,paths:&[PathBuf],cookie:u32,cancel:impl Fn()->bool)->Result<Vec<(PathBuf,Option<u64>)>> {
+    ensure!(paths.len()<=64,"一次最多查询 64 个可见文件夹");
+    if paths.is_empty(){return Ok(Vec::new());}
+    if cancel(){bail!("文件夹大小查询已取消");}
+    let started=Instant::now();
+    let cancelled=||cancel()||started.elapsed()>Duration::from_secs(8);
+    let server=runtime::ensure_running(runtime::configured(profile).as_deref(),&cancelled,false)?;
+    if cancelled(){bail!("文件夹大小查询已取消或超时");}
+    ensure!(runtime::ipc(server.hwnd,401,0)?!=0,"Everything 索引尚未就绪");
+    // Official Everything SDK: WM_USER/411, FILE_INFO_FOLDER_SIZE=2.
+    // Refuse unindexed sizes rather than triggering on-demand disk metadata.
+    ensure!(runtime::ipc(server.hwnd,411,2)?!=0,"Everything 未启用文件夹大小索引；请在 Everything 索引设置中启用大小索引");
+    let mut results=Vec::with_capacity(paths.len());
+    for (index,path) in paths.iter().enumerate(){
+        if cancel(){bail!("文件夹大小查询已取消");}
+        ensure!(started.elapsed()<=Duration::from_secs(8),"文件夹大小查询超时");
+        let Some(text)=folder_size_pattern(path)else{results.push((path.clone(),None));continue;};
+        // MATCHPATH | REGEX. Anchors and escaping make the lookup literal even
+        // for names containing Everything operators or regex metacharacters.
+        let options=QueryOptions{text,offset:0,limit:2,sort:SearchSort::NameAsc};
+        let page=query_connection(&options,cookie.wrapping_add(index as u32),&server,&cancelled,REQUEST_FULL_PATH|REQUEST_SIZE,0x4|0x8)?;
+        let lookup=folder_size_literal(path).map(PathBuf::from).unwrap_or_else(||path.clone());
+        let mut matches=page.items.into_iter().filter(|item|item.is_dir&&crate::explorer_forwarder::same_path(&item.path,&lookup));
+        let size=matches.next().and_then(|item|item.size);
+        // Case-sensitive directories can contain case variants. Do not guess.
+        results.push((path.clone(),if page.total==1&&matches.next().is_none(){size}else{None}));
+    }
+    Ok(results)
+}
+
+fn folder_size_pattern(path:&Path)->Option<String>{
+    let normalized=folder_size_literal(path)?;
+    let mut pattern=String::from("^");
+    for ch in normalized.chars(){
+        if "\\.^$|?*+()[]{}".contains(ch){pattern.push('\\');}
+        pattern.push(ch);
+    }
+    pattern.push('$');
+    (pattern.chars().count()<=512).then_some(pattern)
+}
+fn folder_size_literal(path:&Path)->Option<String>{
+    if !path.is_absolute(){return None;}
+    let path=path.to_str()?;
+    if path.contains('\0'){return None;}
+    let path=path.strip_prefix(r"\\?\UNC\").map(|value|format!(r"\\{value}"))
+        .unwrap_or_else(||path.strip_prefix(r"\\?\").unwrap_or(path).to_owned());
+    let normalized=path.replace('/',r"\");
+    let literal=if Path::new(&normalized).parent().is_none(){normalized.as_str()}else{normalized.trim_end_matches('\\')};
+    Some(literal.to_owned())
 }
 /// Compatibility entry used by the existing main-window and native IPC probes.
 pub(super) fn query(text:&str,cookie:u32,configured:Option<&Path>,cancel:impl Fn()->bool)->Result<(Vec<PathBuf>,u64,bool)>{
@@ -177,6 +238,20 @@ pub(super) fn run(shared:Arc<Shared>,sender:SyncSender<SearchEvent>,configured:O
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn folder_size_lookup_escapes_paths_and_requests_only_indexed_size(){
+        assert_eq!(folder_size_pattern(Path::new(r"C:\资料\a[1]+.x")),Some(r"^C:\\资料\\a\[1\]\+\.x$".into()));
+        assert_eq!(folder_size_pattern(Path::new(r"\\?\C:\a\b")),folder_size_pattern(Path::new(r"C:\a\b")));
+        assert_eq!(folder_size_pattern(Path::new(r"\\?\UNC\server\share\x")),folder_size_pattern(Path::new(r"\\server\share\x")));
+        assert!(folder_size_pattern(Path::new("relative")).is_none());
+        let options=QueryOptions{text:folder_size_pattern(Path::new(r"C:\a" )).unwrap(),limit:2,..Default::default()};
+        let packet=query_packet_with_search_flags(&options,HWND(123usize as*mut _),7,REQUEST_FULL_PATH|REQUEST_SIZE,0x4|0x8);
+        assert_eq!(u32_at(&packet,8).unwrap(),12);assert_eq!(u32_at(&packet,20).unwrap(),0x14);
+    }
+    #[test]fn folder_size_unknown_and_zero_have_different_wire_values(){
+        let bytes=packet(&[(r"C:\empty",0,0,1),(r"C:\unknown",u64::MAX,0,1),(r"C:\large",u32::MAX as u64+1,0,1)],3,0);
+        let page=decode_page(&bytes,&QueryOptions::default()).unwrap();
+        assert_eq!(page.items.iter().map(|item|item.size).collect::<Vec<_>>(),[Some(0),None,Some(u32::MAX as u64+1)]);
+    }
     #[test]fn ui_query2_packet_requests_paths_without_unneeded_file_metadata(){
         let options=QueryOptions{text:"中文 query".into(),offset:10,limit:200,sort:SearchSort::NameDesc};
         let packet=query_packet(&options,HWND(0x1234usize as*mut _),7,REQUEST_FULL_PATH);
@@ -213,6 +288,17 @@ pub(super) fn run(shared:Arc<Shared>,sender:SyncSender<SearchEvent>,configured:O
         assert!(validate(&QueryOptions{offset:u32::MAX,..Default::default()}).is_err());
         assert!(validate(&QueryOptions{text:"中文".repeat(256),..Default::default()}).is_ok());
         assert!(decode_page(&packet(&[],0,0),&QueryOptions::default()).unwrap().items.is_empty());
+    }
+    #[test]
+    #[ignore="Requires isolated Everything with folder size indexing and ZSDESK_EVERYTHING_FOLDER_TEST_PATH/BYTES"]
+    fn native_everything_folder_size_lookup_is_indexed_and_exact()->Result<()>{
+        let path=PathBuf::from(std::env::var_os("ZSDESK_EVERYTHING_FOLDER_TEST_PATH").context("folder fixture")?);
+        let expected=std::env::var("ZSDESK_EVERYTHING_FOLDER_TEST_BYTES")?.parse::<u64>()?;
+        let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("native output")?);
+        let missing=path.join("__zsdesk_folder_size_missing__");ensure!(!missing.exists(),"missing fixture exists");
+        let values=query_folder_sizes(&output.join("folder-size-test-profile.json"),&[path.clone(),missing.clone()],0x5a535a31,||false)?;
+        ensure!(values==vec![(path,Some(expected)),(missing,None)],"indexed folder size/unknown mismatch: {values:?}");
+        Ok(())
     }
     #[test]
     #[ignore="Requires an isolated Everything instance and fixture query"]

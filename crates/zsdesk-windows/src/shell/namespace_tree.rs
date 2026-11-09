@@ -1,8 +1,8 @@
-//! Navigation tree (`INameSpaceTreeControl`) styled like the Windows 11 pane.
+//! Navigation tree (`INameSpaceTreeControl`) using the current system's metrics.
 //!
 //! The system Quick access namespace provides the user's pinned/frequent
 //! folders. Known folders remain available on systems without that namespace.
-//! Roots use the Shell's group padding and DPI-scaled, comfortably spaced rows.
+//! Root expansion follows the initial location; spacing is owned by the native Shell.
 
 use std::{cell::{Cell, RefCell}, collections::HashMap, rc::{Rc,Weak}, time::{Duration,Instant}};
 
@@ -10,7 +10,6 @@ use windows::{
     core::{implement, Error, Interface, Ref, Result, BOOL, HRESULT, PCWSTR, PWSTR},
     Win32::{
         Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
-        Graphics::Gdi::{GetObjectW, HGDIOBJ, LOGFONTW},
         Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES,
         System::{
             Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER},
@@ -19,8 +18,8 @@ use windows::{
             SystemServices::{SFGAO_FOLDER, SFGAO_STREAM},
         },
         UI::{
-            Controls::{TVGN_CARET, TVM_SELECTITEM, TVM_SETBKCOLOR, TVM_SETTEXTCOLOR, TVM_SETEXTENDEDSTYLE, TVM_SETINDENT,
-                TVM_SETITEMHEIGHT, TVS_EX_DOUBLEBUFFER, TVM_EXPAND, TVE_COLLAPSE},
+            Controls::{TVGN_CARET, TVM_SELECTITEM, TVM_SETBKCOLOR, TVM_SETTEXTCOLOR, TVM_SETEXTENDEDSTYLE,
+                TVS_EX_DOUBLEBUFFER, TVM_EXPAND, TVE_COLLAPSE},
             HiDpi::GetDpiForWindow,
             Input::KeyboardAndMouse::{GetFocus, SetFocus, IsWindowEnabled},
             Shell::{
@@ -33,7 +32,7 @@ use windows::{
                 SICHINT_CANONICAL, SICHINT_TEST_FILESYSPATH_IF_NOT_EQUAL, NSTCGNI_PARENT, NSTCGNI_NEXTVISIBLE,
                 NSTCS_AUTOHSCROLL, NSTCS_FULLROWSELECT, NSTCS_HASEXPANDOS, NSTCS_NOEDITLABELS,
                 NSTCS_SHOWSELECTIONALWAYS, NSTCS_FADEINOUTEXPANDOS, NSTCS_TABSTOP, NSTCS_ROOTHASEXPANDO,
-                NSTCS_ALLOWJUNCTIONS, NSTCS2_DISPLAYPADDING, NSTCS2_INTERRUPTNOTIFICATIONS,
+                NSTCS_ALLOWJUNCTIONS, NSTCS2_INTERRUPTNOTIFICATIONS,
                 NTSCS2_NOSINGLETONAUTOEXPAND,
                 SHCONTF_FOLDERS, SHFILEINFOW, SHGFI_OPENICON, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_SYSICONINDEX,
                 FOLDERID_Desktop, FOLDERID_Downloads, FOLDERID_Documents, FOLDERID_Pictures,
@@ -41,7 +40,7 @@ use windows::{
                 KF_FLAG_DEFAULT,
             },
             WindowsAndMessaging::{EnumChildWindows, FindWindowExW, GetClassNameW, GetWindowRect, MoveWindow,
-                PostMessageW, ShowWindow, SW_HIDE, SW_SHOW, SendMessageW, WM_GETFONT,
+                PostMessageW, ShowWindow, SW_HIDE, SW_SHOW, SendMessageW,
                 IsChild, IsWindow, IsWindowVisible, SetTimer, KillTimer, WM_KEYDOWN, WM_SYSKEYDOWN, WM_NCDESTROY},
         },
     },
@@ -55,6 +54,41 @@ use super::{
 
 const S_FALSE: HRESULT = HRESULT(1);
 const SYNC_TIMER:usize=0x5a53_5359;
+const QUICK_ACCESS:&str="shell:::{679F85CB-0220-4080-B29B-5540CC05AAB6}";
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum InitialRoot { ThisPc, QuickAccess, Neither }
+
+fn initial_root(location:&ShellLocation)->InitialRoot {
+    match location {
+        ShellLocation::ThisPc | ShellLocation::Path(_) => InitialRoot::ThisPc,
+        ShellLocation::Search{scope:Some(_),..} => InitialRoot::ThisPc,
+        ShellLocation::Shell{parsing_name,..} => {
+            let name=parsing_name.get(..6).filter(|prefix|prefix.eq_ignore_ascii_case("shell:"))
+                .map_or(parsing_name.as_str(),|_|&parsing_name[6..]);
+            if name.eq_ignore_ascii_case("MyComputerFolder") || name.eq_ignore_ascii_case("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}") {InitialRoot::ThisPc}
+            else if name.eq_ignore_ascii_case("QuickAccess") || name.eq_ignore_ascii_case("Home")
+                || name.eq_ignore_ascii_case("::{679F85CB-0220-4080-B29B-5540CC05AAB6}")
+                || name.eq_ignore_ascii_case("::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}") {InitialRoot::QuickAccess}
+            else {InitialRoot::Neither}
+        }
+        _ => InitialRoot::Neither,
+    }
+}
+
+fn root_style(root:InitialRoot,initial:InitialRoot)->u32 {
+    (NSTCRS_VISIBLE.0 | if root==initial {NSTCRS_EXPANDED.0}else{0}) as u32
+}
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct NamespaceTreeOptions {
+    pub show_recycle_bin:bool,
+    pub show_network:bool,
+    pub expand_this_pc:Option<bool>,
+}
+impl Default for NamespaceTreeOptions {
+    fn default()->Self {Self{show_recycle_bin:true,show_network:true,expand_this_pc:None}}
+}
 
 thread_local! {
     static PENDING_SYNCS:RefCell<HashMap<isize,Weak<PendingTreeSync>>>=RefCell::new(HashMap::new());
@@ -90,6 +124,20 @@ impl NamespaceTreeHost {
     /// COM must be initialized as STA on the current UI thread. `parent` must
     /// be a valid window owned by that thread and outlive this host.
     pub unsafe fn create(parent: HWND, rect: RECT) -> Result<Self> {
+        unsafe {Self::create_for_location(parent,rect,&Self::system_launch_location())}
+    }
+
+    /// Creates roots for the first displayed folder. This affects startup only;
+    /// later navigation preserves manual expansion and the auto-expand policy.
+    /// # Safety
+    /// The same STA and parent-window lifetime requirements as `create` apply.
+    pub unsafe fn create_for_location(parent:HWND,rect:RECT,location:&ShellLocation)->Result<Self> {
+        unsafe{Self::create_with_options(parent,rect,location,NamespaceTreeOptions::default())}
+    }
+
+    /// Root visibility is local to this tree and never changes Windows policy.
+    pub unsafe fn create_with_options(parent:HWND,rect:RECT,location:&ShellLocation,options:NamespaceTreeOptions)->Result<Self> {
+        let initial=initial_root(location);
         let tree: INameSpaceTreeControl = unsafe { CoCreateInstance(&NamespaceTreeControl, None, CLSCTX_INPROC_SERVER)? };
         let style = (NSTCS_HASEXPANDOS.0 | NSTCS_ROOTHASEXPANDO.0 | NSTCS_FULLROWSELECT.0
             | NSTCS_SHOWSELECTIONALWAYS.0 | NSTCS_AUTOHSCROLL.0 | NSTCS_ALLOWJUNCTIONS.0
@@ -99,7 +147,9 @@ impl NamespaceTreeHost {
         let hwnd = unsafe { tree.cast::<IOleWindow>().and_then(|w| w.GetWindow()).unwrap_or_default() };
 
         if let Ok(extended) = tree.cast::<INameSpaceTreeControl2>() {
-            let styles = NSTCS2_DISPLAYPADDING | NSTCS2_INTERRUPTNOTIFICATIONS | NTSCS2_NOSINGLETONAUTOEXPAND;
+            let styles = NSTCS2_INTERRUPTNOTIFICATIONS | NTSCS2_NOSINGLETONAUTOEXPAND;
+            // Do not change DISPLAYPADDING: the Shell version and its display
+            // preferences own root spacing, independently of navigation policy.
             let _ = unsafe { extended.SetControlStyle2(styles, styles) };
         }
 
@@ -107,11 +157,11 @@ impl NamespaceTreeHost {
         let enum_flags = SHCONTF_FOLDERS.0 as u32;
 
         let quick_access = ShellLocation::Shell {
-            parsing_name: "shell:::{679F85CB-0220-4080-B29B-5540CC05AAB6}".into(),
+            parsing_name: QUICK_ACCESS.into(),
             title: "快速访问".into(),
         };
         let quick_access_added = unsafe { shell_item(&quick_access) }.is_ok_and(|item| {
-            unsafe { tree.AppendRoot(&item, enum_flags, (NSTCRS_VISIBLE.0 | NSTCRS_EXPANDED.0) as u32, &filter) }.is_ok()
+            unsafe { tree.AppendRoot(&item, enum_flags, root_style(InitialRoot::QuickAccess,initial), &filter) }.is_ok()
         });
         if !quick_access_added {
             for folder in [&FOLDERID_Desktop, &FOLDERID_Downloads, &FOLDERID_Documents,
@@ -122,8 +172,11 @@ impl NamespaceTreeHost {
             }
         }
         let this_pc = unsafe { shell_item(&ShellLocation::ThisPc)? };
-        unsafe { tree.AppendRoot(&this_pc, enum_flags, NSTCRS_VISIBLE.0 as u32, &filter)?; }
-        for folder in [&FOLDERID_RecycleBinFolder, &FOLDERID_NetworkFolder] {
+        let this_pc_style=options.expand_this_pc.map_or_else(||root_style(InitialRoot::ThisPc,initial),|expanded|
+            (NSTCRS_VISIBLE.0 | if expanded{NSTCRS_EXPANDED.0}else{0})as u32);
+        unsafe { tree.AppendRoot(&this_pc, enum_flags, this_pc_style, &filter)?; }
+        for (folder,visible) in [(&FOLDERID_RecycleBinFolder,options.show_recycle_bin),(&FOLDERID_NetworkFolder,options.show_network)] {
+            if !visible{continue;}
             if let Ok(item) = unsafe { SHGetKnownFolderItem::<IShellItem>(folder, KF_FLAG_DEFAULT, None) } {
                 let _ = unsafe { tree.AppendRoot(&item, enum_flags, NSTCRS_VISIBLE.0 as u32, &filter) };
             }
@@ -143,7 +196,6 @@ impl NamespaceTreeHost {
             host.pending_sync.native_tree.set(view);
             unsafe { SendMessageW(view, TVM_SETEXTENDEDSTYLE, Some(WPARAM(TVS_EX_DOUBLEBUFFER as usize)), Some(LPARAM(TVS_EX_DOUBLEBUFFER as isize))); }
         }
-        host.apply_metrics();
         Ok(host)
     }
 
@@ -161,24 +213,6 @@ impl NamespaceTreeHost {
 
     pub fn hwnd(&self) -> HWND { self.hwnd }
 
-    fn apply_metrics(&self) {
-        let Some(view) = self.tree_view() else { return };
-        let dpi = unsafe { GetDpiForWindow(view) }.max(96);
-        let mut font = LOGFONTW::default();
-        let handle = unsafe { SendMessageW(view, WM_GETFONT, None, None) };
-        if handle.0 != 0 {
-            unsafe { GetObjectW(HGDIOBJ(handle.0 as *mut _), std::mem::size_of::<LOGFONTW>() as i32,
-                Some((&mut font as *mut LOGFONTW).cast())); }
-        }
-        // Keep system text-size accessibility settings from clipping a row.
-        // Native tree views round odd heights down; round up explicitly.
-        let height = (scale(32, dpi).max(font.lfHeight.saturating_abs() + scale(12, dpi)) + 1) & !1;
-        unsafe {
-            SendMessageW(view, TVM_SETITEMHEIGHT, Some(WPARAM(height as usize)), None);
-            SendMessageW(view, TVM_SETINDENT, Some(WPARAM(scale(20, dpi) as usize)), None);
-        }
-    }
-
     /// Applies light/dark colors to the tree.
     pub fn apply_theme(&self, dark: bool, background: u32, text: u32) {
         crate::theme::theme_control(self.hwnd, dark);
@@ -189,7 +223,6 @@ impl NamespaceTreeHost {
                 SendMessageW(view, TVM_SETTEXTCOLOR, None, Some(LPARAM(COLORREF(text).0 as isize)));
             }
         }
-        self.apply_metrics();
     }
 
     /// Resizes the native namespace tree.
@@ -201,7 +234,6 @@ impl NamespaceTreeHost {
         if self.hwnd.0.is_null() { return; }
         let rect = navigation_rect(rect, unsafe { GetDpiForWindow(self.hwnd) });
         let _ = unsafe { MoveWindow(self.hwnd, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, true) };
-        self.apply_metrics();
     }
 
     pub fn set_visible(&self, visible: bool) {
@@ -281,6 +313,15 @@ impl NamespaceTreeHost {
         let result=unsafe {RegGetValueW(HKEY_CURRENT_USER,windows::core::w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"),
             windows::core::w!("NavPaneExpandToCurrentFolder"),RRF_RT_REG_DWORD,None,Some((&mut value as *mut u32).cast()),Some(&mut size))};
         result.is_ok() && value!=0
+    }
+
+    /// Reads Explorer's startup preference without changing the user's setting.
+    /// LaunchTo=1 means This PC; missing or other values keep the Home default.
+    pub fn system_launch_location()->ShellLocation {
+        let mut value=0u32;let mut size=4u32;
+        let result=unsafe {RegGetValueW(HKEY_CURRENT_USER,windows::core::w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"),
+            windows::core::w!("LaunchTo"),RRF_RT_REG_DWORD,None,Some((&mut value as *mut u32).cast()),Some(&mut size))};
+        launch_location(result.is_ok().then_some(value))
     }
 
     unsafe fn select_exposed(&self,item:&IShellItem)->bool {
@@ -444,9 +485,14 @@ fn scale(value: i32, dpi: u32) -> i32 {
     ((i64::from(value) * i64::from(dpi.max(96)) + 48) / 96) as i32
 }
 
+fn launch_location(value:Option<u32>)->ShellLocation {
+    if value==Some(1) {ShellLocation::ThisPc}
+    else {ShellLocation::Shell{parsing_name:QUICK_ACCESS.into(),title:"快速访问".into()}}
+}
+
 fn navigation_rect(rect: RECT, dpi: u32) -> RECT {
     let horizontal = scale(4, dpi).min((rect.right - rect.left).max(0) / 2);
-    let vertical = scale(8, dpi).min((rect.bottom - rect.top).max(0) / 2);
+    let vertical = scale(4, dpi).min((rect.bottom - rect.top).max(0) / 2);
     RECT { left: rect.left + horizontal, top: rect.top + vertical,
         right: (rect.right - horizontal).max(rect.left + horizontal),
         bottom: (rect.bottom - vertical).max(rect.top + vertical) }
@@ -613,6 +659,27 @@ mod tests {
         NSTCEHT_NOWHERE, NSTCEHT_ONITEMICON, NSTCEHT_ONITEMLABEL, NSTCEHT_ONITEMSTATEICON};
 
     #[test]
+    fn initial_root_follows_explicit_location() {
+        assert_eq!(initial_root(&ShellLocation::ThisPc),InitialRoot::ThisPc);
+        assert_eq!(initial_root(&ShellLocation::Path(r"C:\\".into())),InitialRoot::ThisPc);
+        for name in [QUICK_ACCESS,"SHELL:Home","shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}"] {
+            assert_eq!(initial_root(&ShellLocation::Shell{parsing_name:name.into(),title:String::new()}),InitialRoot::QuickAccess);
+        }
+        let recycle=ShellLocation::Shell{parsing_name:"shell:RecycleBinFolder".into(),title:String::new()};
+        assert_eq!(initial_root(&recycle),InitialRoot::Neither);
+        assert_eq!(root_style(InitialRoot::QuickAccess,InitialRoot::ThisPc)&NSTCRS_EXPANDED.0 as u32,0);
+        assert_ne!(root_style(InitialRoot::ThisPc,InitialRoot::ThisPc)&NSTCRS_EXPANDED.0 as u32,0);
+    }
+
+    #[test]
+    fn explorer_launch_preference_maps_this_pc_without_registry_writes() {
+        assert_eq!(launch_location(Some(1)),ShellLocation::ThisPc);
+        for value in [None,Some(0),Some(2),Some(3),Some(u32::MAX)] {
+            assert_eq!(initial_root(&launch_location(value)),InitialRoot::QuickAccess);
+        }
+    }
+
+    #[test]
     fn entire_selected_row_opens_the_folder() {
         for hit in [NSTCEHT_ONITEMICON, NSTCEHT_ONITEMLABEL, NSTCEHT_ONITEMSTATEICON, NSTCEHT_ONITEMRIGHT] {
             assert_eq!(navigation_click(hit.0 as u32, NSTCECT_LBUTTON.0 as u32), Some(false));
@@ -639,6 +706,38 @@ mod tests {
         assert_eq!(navigation_click(hit, (NSTCECT_RBUTTON.0 | NSTCECT_DBLCLICK.0) as u32), None);
         assert_eq!(navigation_click(hit, NSTCECT_RBUTTON.0 as u32), None);
         assert_eq!(navigation_click(hit, 0), None);
+    }
+
+    #[test]
+    #[ignore="Native Shell metric comparison; requires an interactive Windows session"]
+    fn native_navigation_metrics_follow_system_tree()->std::result::Result<(),Box<dyn std::error::Error>> {
+        use windows::Win32::{System::Ole::{OleInitialize,OleUninitialize},UI::{WindowsAndMessaging::*,
+            Controls::{TVM_GETITEMHEIGHT,TVM_GETINDENT},Shell::NSTCS2_DISPLAYPADDING}};
+        unsafe{OleInitialize(None)?;}
+        struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
+        struct Window(HWND);impl Drop for Window{fn drop(&mut self){let _=unsafe{DestroyWindow(self.0)};}}
+        let owner=Window(unsafe{CreateWindowExW(WS_EX_NOACTIVATE,windows::core::w!("STATIC"),windows::core::w!("Tree metrics"),WS_POPUP,0,0,600,500,None,None,None,None)?});
+        let rect=RECT{left:0,top:0,right:250,bottom:480};
+        let native:INameSpaceTreeControl=unsafe{CoCreateInstance(&NamespaceTreeControl,None,CLSCTX_INPROC_SERVER)?};
+        unsafe{native.Initialize(owner.0,&rect,(NSTCS_HASEXPANDOS.0|NSTCS_ROOTHASEXPANDO.0|NSTCS_FULLROWSELECT.0|NSTCS_SHOWSELECTIONALWAYS.0
+            |NSTCS_AUTOHSCROLL.0|NSTCS_ALLOWJUNCTIONS.0|NSTCS_NOEDITLABELS.0|NSTCS_FADEINOUTEXPANDOS.0|NSTCS_TABSTOP.0)as u32)?;}
+        let raw=unsafe{native.cast::<IOleWindow>()?.GetWindow()?};let mut baseline=HWND::default();
+        let _=unsafe{EnumChildWindows(Some(raw),Some(find_tree_view),LPARAM((&mut baseline as*mut HWND)as isize))};
+        assert!(!baseline.0.is_null());
+        let host=unsafe{NamespaceTreeHost::create_for_location(owner.0,rect,&ShellLocation::ThisPc)?};
+        let actual=host.tree_view().ok_or("native tree window")?;
+        let metrics=|hwnd|[TVM_GETITEMHEIGHT,TVM_GETINDENT].map(|message|unsafe{SendMessageW(hwnd,message,None,None)}.0);
+        assert_eq!(metrics(actual),metrics(baseline),"application replaced native row height/indent");
+        assert_eq!(unsafe{host.tree.cast::<INameSpaceTreeControl2>()?.GetControlStyle2(NSTCS2_DISPLAYPADDING)?},
+            unsafe{native.cast::<INameSpaceTreeControl2>()?.GetControlStyle2(NSTCS2_DISPLAYPADDING)?},"application replaced native root padding");
+        for dark in [false,true,false] {
+            crate::theme::theme_control(raw,dark);crate::theme::theme_control(baseline,dark);
+            host.apply_theme(dark,0xffffff,0);unsafe{host.resize(rect);}
+            for hwnd in [baseline,actual] {unsafe{SendMessageW(hwnd,WM_THEMECHANGED,None,None);}}
+            assert_eq!(metrics(actual),metrics(baseline),"theme/resize replaced native metrics");
+        }
+        eprintln!("native tree dpi={} height/indent={:?}",unsafe{GetDpiForWindow(actual)},metrics(actual));
+        drop(host);drop(native);Ok(())
     }
 
     #[test]
@@ -681,7 +780,21 @@ mod tests {
         let x=unsafe{GetSystemMetrics(SM_XVIRTUALSCREEN)+GetSystemMetrics(SM_CXVIRTUALSCREEN)}+1000;
         let y=unsafe{GetSystemMetrics(SM_YVIRTUALSCREEN)+GetSystemMetrics(SM_CYVIRTUALSCREEN)}+1000;
         let owner=Window(unsafe{CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,class,windows::core::w!("tree sync"),WS_POPUP,x,y,520,600,None,None,Some(instance),None)?});
-        let host=unsafe{NamespaceTreeHost::create(owner.0,RECT{left:0,top:0,right:280,bottom:570})?};
+        let host=unsafe{NamespaceTreeHost::create_for_location(owner.0,RECT{left:0,top:0,right:280,bottom:570},&ShellLocation::ThisPc)?};
+        pump();
+        let pc_item=unsafe {shell_item(&ShellLocation::ThisPc)?};
+        assert!(unsafe {host.tree.GetItemState(&pc_item,NSTCIS_EXPANDED.0 as u32)?}&NSTCIS_EXPANDED.0 as u32!=0,
+            "This PC startup did not expand the This PC root");
+        if let Ok(quick)=unsafe {shell_item(&launch_location(Some(2)))} {
+            if let Ok(state)=unsafe {host.tree.GetItemState(&quick,NSTCIS_EXPANDED.0 as u32)} {
+                assert_eq!(state&NSTCIS_EXPANDED.0 as u32,0,"This PC startup expanded Quick access");
+            }
+        }
+        unsafe {host.tree.SetItemState(&pc_item,NSTCIS_EXPANDED.0 as u32,0)?;
+            host.select_location_with_policy(&ShellLocation::ThisPc,false);}
+        pump();
+        assert_eq!(unsafe {host.tree.GetItemState(&pc_item,NSTCIS_EXPANDED.0 as u32)?}&NSTCIS_EXPANDED.0 as u32,0,
+            "later navigation reset a manually collapsed startup root");
         unsafe{host.tree.RemoveAllRoots()?;}
         let root_item=unsafe{shell_item(&ShellLocation::Path(fixture.clone()))?};
         unsafe{host.tree.AppendRoot(&root_item,SHCONTF_FOLDERS.0 as u32,NSTCRS_VISIBLE.0 as u32,&host._filter)?;}

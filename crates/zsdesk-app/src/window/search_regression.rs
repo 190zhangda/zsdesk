@@ -143,6 +143,47 @@ fn address_focus(runner: &OwnedRunner) -> Result<Value> {
     Ok(json!({"reentrant_focus_loss_cycles":3,"hover_preserves_focus":true,"activation_does_not_reopen_address":true}))
 }
 
+fn address_submit(runner: &OwnedRunner, output: &Path) -> Result<Value> {
+    let edit = runner.slot.borrow().as_ref().unwrap().address_edit;
+    let mut routes = Vec::new();
+    for route in ["queued-key", "sent-key", "character-only"] {
+        let target = output.join(format!("address-{route}"));
+        fs::create_dir_all(&target)?;
+        command(runner.hwnd, Command::FocusAddress); pump(20);
+        unsafe { SetWindowTextW(edit, PCWSTR(wide(&target.to_string_lossy()).as_ptr()))?; }
+        let flags = unsafe { SendMessageW(edit, WM_GETDLGCODE, Some(WPARAM(VK_RETURN.0 as usize)), None) }.0;
+        ensure!(flags & DLGC_WANTMESSAGE as isize != 0, "address does not own Return in native dialog translation");
+        if route == "queued-key" {
+            let message = MSG { hwnd: edit, message: WM_KEYDOWN, wParam: WPARAM(VK_RETURN.0 as usize), ..Default::default() };
+            ensure!(address_input::pre_translate(&message), "queued Return not consumed before Shell");
+        } else {
+            // A native modal loop can deliver input while the owner is borrowed.
+            let _borrow = runner.slot.borrow_mut();
+            send(edit, if route == "sent-key" { WM_KEYDOWN } else { WM_CHAR }, VK_RETURN.0 as usize, LPARAM(0));
+        }
+        if route != "character-only" {send(edit,WM_KEYUP,VK_RETURN.0 as usize,LPARAM(0));send(edit, WM_CHAR, 13, LPARAM(0));}
+        let mut ticket = MSG::default();
+        ensure!(unsafe { PeekMessageW(&mut ticket, Some(runner.hwnd), pane_input::MESSAGE, pane_input::MESSAGE, PM_REMOVE) }.as_bool(), "Return did not post an address ticket");
+        let mut duplicate = MSG::default();
+        ensure!(!unsafe { PeekMessageW(&mut duplicate, Some(runner.hwnd), pane_input::MESSAGE, pane_input::MESSAGE, PM_REMOVE) }.as_bool(), "Return and WM_CHAR submitted twice");
+        // Reproduce a queued focus/update callback replacing the live EDIT.
+        { let mut slot = runner.slot.borrow_mut(); let state = slot.as_mut().unwrap();
+            unsafe { state.browser.as_ref().unwrap().focus(); state.update_address(); }
+        }
+        unsafe { SetWindowTextW(edit, windows::core::w!("shell:MyComputerFolder"))?; DispatchMessageW(&ticket); }
+        wait_navigation(runner)?;
+        ensure!(runner.slot.borrow().as_ref().unwrap().current_location() == &ShellLocation::Path(target), "deferred Return read the replaced address instead of the captured text");
+        routes.push(route);
+    }
+    command(runner.hwnd, Command::FocusAddress); pump(20);
+    unsafe { SetWindowTextW(edit, windows::core::w!("shell:MyComputerFolder"))?; }
+    send(edit, WM_KEYDOWN, VK_RETURN.0 as usize, LPARAM(0));
+    { let mut slot = runner.slot.borrow_mut(); unsafe { slot.as_mut().unwrap().select_tab(0); } }
+    wait_navigation(runner)?;
+    ensure!(runner.slot.borrow().as_ref().unwrap().current_location() == &ShellLocation::Path(output.join("fixture")), "old address navigated the new tab");
+    Ok(json!({"routes":routes,"text_survives_focus_reset":true,"single_submission":true,"stale_tab_rejected":true}))
+}
+
 fn write_surface(state: &WindowState, path: &Path) -> Result<()> {
     let surface = state.surface.as_ref().context("paint surface")?;
     let length = (surface.width * surface.height * 4) as usize;
@@ -380,12 +421,13 @@ fn run(output: &Path) -> Result<Value> {
     let _apartment = Apartment;
     let runner = create_runner(output)?;
     let focus = address_focus(&runner)?;
+    let submit = address_submit(&runner, output)?;
     let tabs = side_tabs(&runner, output)?;
     let search = search_close_race(&runner)?;
     let tab_search = search_tab_state(&runner, output)?;
     drop(runner);
     pump(25);
-    Ok(json!({"address":focus,"tabs":tabs,"search":search,"tab_search":tab_search,"physical_input_generated":false}))
+    Ok(json!({"address":focus,"address_submit":submit,"tabs":tabs,"search":search,"tab_search":tab_search,"physical_input_generated":false}))
 }
 
 #[test]

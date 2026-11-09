@@ -13,6 +13,7 @@ mod input;
 mod keyboard;
 mod routing_settings;
 mod navigation;
+mod address_input;
 mod terminal;
 mod quick_preview;
 pub(crate) mod preview_process;
@@ -28,6 +29,12 @@ mod context_menu;
 #[cfg(test)]mod context_menu_regression;
 mod listary;
 mod mouse_navigation;
+mod dual_pane;
+mod pane_input;
+mod mouse_gestures;
+mod wheel_input;
+mod folder_sizes;
+pub(crate) mod diagnostics;
 #[cfg(test)]mod integration_navigation_regression;
 #[cfg(test)]
 mod selection_regression;
@@ -143,6 +150,7 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
     let instance = HINSTANCE(unsafe { GetModuleHandleW(None)? }.0);
     let class = wide("ZSDesk.Native.Explorer");
     let wc = WNDCLASSW {
+        style: CS_DBLCLKS,
         lpfnWndProc: Some(window_proc), hInstance: instance,
         hIcon: unsafe { LoadIconW(Some(instance), PCWSTR(101usize as *const u16))? },
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? }, hbrBackground: HBRUSH::default(),
@@ -176,9 +184,14 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
     preview_process::sync_pane(hwnd,&slot,&mut pane_preview);
     let mut hover_preview=hover_preview::HoverPreview::new(hwnd);
     let mut middle_click=hover_preview::MiddleClick::new(hwnd);
+    let mut gestures=mouse_gestures::MouseGestures::default();
     loop {
         let result = unsafe { GetMessageW(&mut msg, None, 0, 0) }.0;
         if result <= 0 { break; }
+        if diagnostics::dispatch(&msg){continue;}
+        if address_input::pre_translate(&msg){continue;}
+        dual_pane::activate_for_message(&slot,&msg);
+        if gestures.process(hwnd,&msg,&slot) { hover_preview.dismiss(&mut quick_preview);continue; }
         if mouse_navigation::pre_translate(hwnd,&msg){continue;}
         if msg.hwnd==hwnd && msg.message==WM_TIMER && msg.wParam.0==preview_process::TIMER {
             if let Some(dark)=slot.try_borrow().ok().and_then(|slot|slot.as_ref().map(|state|state.dark)){
@@ -203,10 +216,10 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
         let plain_key=msg.message==WM_KEYDOWN && ![VK_CONTROL,VK_SHIFT,VK_MENU].iter().any(|k|unsafe{GetKeyState(k.0 as i32)}<0);
         let enabled=slot.try_borrow().ok().and_then(|s|s.as_ref().map(|s|s.session.ui.space_preview)).unwrap_or(false);
         if plain_key && !text_input_window(msg.hwnd) && (msg.wParam.0==VK_SPACE.0 as usize || (msg.wParam.0==VK_ESCAPE.0 as usize && quick_preview.as_ref().is_some_and(|p|p.is_open()))){
+            if msg.lParam.0 as usize & (1usize<<30)!=0 { continue; }
             if quick_preview.as_ref().is_some_and(|p|p.is_open()){hover_preview.dismiss(&mut quick_preview);quick_preview=None;continue;}
             if enabled && msg.wParam.0==VK_SPACE.0 as usize {
-                let request=slot.try_borrow().ok().and_then(|s|s.as_ref().and_then(|s|s.browser.as_ref()
-                    .and_then(|b|b.first_selected_path()).map(|path|(path,s.session.ui.preview_provider,s.dark))));
+                let request=preview_process::selected_preview_request(&slot);
                 if let Some((path,provider,dark))=request {
                     match preview_process::PreviewProcess::open_with_options(hwnd,&path,provider,dark,false){Ok(preview)=>quick_preview=Some(preview),Err(error)=>{if let Ok(mut s)=slot.try_borrow_mut(){if let Some(s)=s.as_mut(){s.show_message(format!("无法预览：{error}"));}}}}
                     continue;
@@ -250,7 +263,7 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
         }
         if msg.message==WM_SHELL_SELECTION_CHANGED {
             if let Some(preview)=quick_preview.as_mut().filter(|p|p.is_open() && !p.is_hover()){
-                let path=slot.try_borrow().ok().and_then(|s|s.as_ref().and_then(|s|s.browser.as_ref().and_then(|b|b.first_selected_path())));
+                let path=preview_process::selected_preview_request(&slot).map(|(path,_,_)|path);
                 if let Some(path)=path{let _=preview.update(&path);}
             }
         }
@@ -320,6 +333,15 @@ struct WindowState {
     config_path: PathBuf,
     modern: bool,
     browser: Option<ExplorerBrowserHost>,
+    browser_source: usize,
+    folder_sizes: folder_sizes::FolderSizes,
+    view_hwnd: HWND,
+    navigation_epoch: u64,
+    other_pane: dual_pane::InactivePane,
+    active_pane_right: bool,
+    background_pane: bool,
+    routing_pane_message: bool,
+    pane_splitter_drag: Option<(i32,u16)>,
     tree: Option<NamespaceTreeHost>,
     address_edit: HWND,
     search_edit: HWND,
@@ -388,6 +410,8 @@ impl WindowState {
         Self {
             search_panel:search_panel::SearchPanel::default(),
             hwnd: HWND::default(), dpi: 96, session, config_path, modern, browser: None, tree: None,
+            browser_source:0,folder_sizes:Default::default(),view_hwnd:HWND::default(),navigation_epoch:0,
+            other_pane:Default::default(),active_pane_right:false,background_pane:false,routing_pane_message:false,pane_splitter_drag:None,
             address_edit: HWND::default(), search_edit: HWND::default(), rename_hwnd: HWND::default(), rename_index: None,
             tooltip: HWND::default(), tooltip_text: vec![0], font: HFONT::default(), gfx: None, surface: None,
             palette: Palette::light(), dark: false, mica: false, active: true, layout: ChromeLayout::default(),
@@ -407,10 +431,12 @@ impl WindowState {
     }
 
     unsafe fn create(&mut self, hwnd: HWND) -> Result<()> {
+        diagnostics::initialize();diagnostics::record("window","create",None);
         self.hwnd = hwnd;
         self.dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
         listary::initialize(hwnd)?;
         context_menu::install();
+        zsdesk_windows::shell::set_folder_open_capture(Some(pane_input::capture_folder_open));
         let key = crate::instance::property(&self.config_path);
         unsafe { SetPropW(hwnd, PCWSTR(key.as_ptr()), Some(windows::Win32::Foundation::HANDLE(1usize as *mut _)))?; }
         let route_key = crate::routing_control::profile_property(&self.config_path);
@@ -432,18 +458,15 @@ impl WindowState {
         self.drop_registration = unsafe { DropRegistration::register(hwnd, handler) }.ok();
         self.measure_bookmarks();
         self.relayout();
-        let panes = Panes { preview: false, details: self.session.ui.show_details };
-        #[cfg(not(test))]
-        let browser = unsafe { ExplorerBrowserHost::create(hwnd, win_rect(self.layout.browser), self.modern, panes)? };
-        #[cfg(test)]
-        let browser = unsafe { ExplorerBrowserHost::create_transient(hwnd, win_rect(self.layout.browser), self.modern, panes)? };
+        let browser = self.create_browser()?;
         self.browser = Some(browser);
         if let Some(browser)=&self.browser{browser.set_context_menu_options(crate::context_preferences::native(&self.session.ui.context_menu));}
-        self.tree = unsafe { NamespaceTreeHost::create(hwnd, win_rect(self.layout.tree)) }.ok();
+        self.tree = unsafe { NamespaceTreeHost::create_with_options(hwnd, win_rect(self.layout.tree), self.current_location(),self.navigation_tree_options()) }.ok();
         self.theme_children();
         self.position_children();
         unsafe { SetTimer(Some(hwnd), TIMER_STATUS, 1200, None); }
         unsafe { self.navigate_current(); }
+        if self.session.ui.dual_pane { self.ensure_dual_pane(); }
         #[cfg(not(test))]
         {
             self.check_integration();
@@ -516,7 +539,7 @@ impl WindowState {
             caption_button: self.caption_buttons().map(|r|r[0]), command_bar: &self.session.ui.command_bar,
             tab_count: self.session.tabs.len(), active_tab: self.session.active_tab,
             show_tree: self.session.ui.show_tree && self.tree.is_some() && (!self.session.ui.show_preview || width>=self.s(if self.session.ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top{900}else{1110})), tree_width: self.s(self.session.ui.tree_width),
-            show_bookmarks: self.session.ui.show_bookmarks, status_bar: !self.status.is_empty() || self.search_progress.is_some(), bookmark_widths: &self.bookmark_widths,
+            show_bookmarks: self.session.ui.show_bookmarks, status_bar: true, bookmark_widths: &self.bookmark_widths,
         };
         let mut layout=ChromeLayout::new(&input);
         layout.retain_tab_viewport(&self.layout,self.session.tabs.len(),self.session.active_tab);
@@ -528,6 +551,7 @@ impl WindowState {
             self.layout.browser.width-=width+self.s(1);
             self.preview_rect=Some(LayoutRect::new(area.x+area.width-width,area.y,width,area.height));
         }
+        self.layout_dual_pane();
         self.layout_crumbs();
         self.drop_zones.set(DropZones { bookmarks: self.layout.bookmarks_row, strip: self.layout.strip,tabs:self.layout.tab_panel });
         let frame_height=if crate::edition::THEMED && self.mica {self.layout.browser.y}else{self.layout.strip.height};
@@ -536,6 +560,7 @@ impl WindowState {
 
     fn position_children(&mut self) {
         if let Some(browser) = &self.browser { unsafe { browser.resize(win_rect(self.layout.browser)); } }
+        self.position_other_pane();
         if let Some(tree) = &self.tree {
             let visible = self.session.ui.show_tree && !self.layout.tree.is_empty();
             if visible { unsafe { tree.resize(win_rect(self.layout.tree)); } }
@@ -624,6 +649,8 @@ impl WindowState {
         // DefView owns its ItemsView theme lifecycle. Retheming it during
         // asynchronous navigation suppresses selection backgrounds in new views.
         if let Some(tree) = &self.tree { tree.apply_theme(self.dark, colorref(self.palette.content), colorref(self.palette.text)); }
+        if let Some(browser)=&self.browser {browser.set_content_background(self.dark,colorref(self.palette.content));}
+        self.theme_other_pane();
     }
 
     fn invalidate(&self) { let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) }; }
@@ -671,7 +698,7 @@ impl WindowState {
     }
 
     fn save(&mut self) {
-        let result = storage::save_window(&self.config_path, &self.session, self.secondary_window);
+        let result = storage::save_window(&self.config_path, &self.canonical_session(), self.secondary_window);
         if let Err(e) = result { self.show_message(format!("保存会话失败：{e}")); }
     }
 
@@ -689,9 +716,13 @@ impl WindowState {
     }
 
     unsafe fn destroy(&mut self) {
+        pane_input::discard(self.hwnd);
+        diagnostics::record("window","close",None);diagnostics::close(self.hwnd);
         context_menu::destroy(self.hwnd);
+        self.folder_sizes.cancel();
         self.cancel_fast_search();self.fast_search=None;
         unsafe { self.capture_active(); self.commit_bookmark_rename(); }
+        self.destroy_other_pane();
         self.remember_placement();
         self.drop_registration = None;
         self.tree = None;
@@ -983,6 +1014,10 @@ fn track_caption_buttons(hwnd: HWND, msg: u32, wp: WPARAM) {
 /// Messages that arrive while a modal loop holds the state.
 unsafe fn reentrant(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
+        WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT && !text_input_window(HWND(wp.0 as *mut _)) => {
+            if let Ok(cursor)=unsafe{LoadCursorW(None,IDC_ARROW)} {unsafe{SetCursor(Some(cursor));}}
+            LRESULT(1)
+        }
         WM_SETTINGCHANGE if theme_setting_changed(wp,lp)=>{
             // WM_SETTINGCHANGE may carry a borrowed system string. Convert it
             // to a pointer-free refresh before deferring through a modal loop.
@@ -996,7 +1031,7 @@ unsafe fn reentrant(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         }
         WM_CLOSE | WM_LAYOUT | WM_ACTION | WM_SHELL_NAVIGATED | WM_SHELL_FOLDER_INVOKED | WM_SHELL_NAVIGATION_FAILED | WM_BOOKMARK_PATH_DROPPED
         | WM_OPEN_REQUEST | WM_TREE_NAVIGATE | WM_OPEN_TAB_PATH | WM_SHELL_SELECTION_CHANGED | crate::routing_control::WM_RESULT | WM_FAST_SEARCH | WM_DIAGNOSTIC
-        | WM_CANCELMODE | WM_CAPTURECHANGED | WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED | WM_SYSCOLORCHANGE => {
+        | WM_CANCELMODE | WM_CAPTURECHANGED | WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED | WM_SYSCOLORCHANGE | pane_input::MESSAGE => {
             defer_message(hwnd,msg,wp,lp);
             LRESULT(0)
         }
@@ -1066,6 +1101,7 @@ unsafe fn hit_test(hwnd: HWND, lp: LPARAM) -> LRESULT {
 
 impl WindowState {
     unsafe fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        if dual_pane::browser_message(msg) && !self.routing_pane_message { return self.route_browser_message(msg,wp,lp); }
         let point = || POINT { x: x_lparam(lp.0), y: y_lparam(lp.0) };
         match msg {
             WM_PAINT => {
@@ -1106,9 +1142,9 @@ impl WindowState {
             WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED | WM_SYSCOLORCHANGE => self.refresh_system_theme(),
             WM_TIMER => {
                 if wp.0==TIMER_PLACEMENT{let _=unsafe{KillTimer(Some(self.hwnd),TIMER_PLACEMENT)};self.remember_placement();self.save();}
-                if wp.0 == TIMER_STATUS { self.refresh_status();self.poll_search_settings(); }
+                if wp.0 == TIMER_STATUS { self.refresh_status();self.poll_search_settings();self.poll_pane_searches();self.poll_folder_sizes(); }
                 if wp.0 == TIMER_SEARCH { let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_SEARCH) }; unsafe { self.live_search(); } }
-                if wp.0 == TIMER_FAST_SEARCH { let _=unsafe{KillTimer(Some(self.hwnd),TIMER_FAST_SEARCH)};self.poll_fast_search(); }
+                if wp.0 == TIMER_FAST_SEARCH { let _=unsafe{KillTimer(Some(self.hwnd),TIMER_FAST_SEARCH)};self.poll_pane_searches(); }
                 if wp.0 == TIMER_MESSAGE {
                     let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_MESSAGE) };
                     self.status.clear();
@@ -1124,26 +1160,26 @@ impl WindowState {
             }
             WM_LBUTTONDOWN => self.mouse_down(point()),
             WM_LBUTTONUP => self.mouse_up(point()),
-            WM_LBUTTONDBLCLK => self.mouse_down(point()),
+            WM_LBUTTONDBLCLK => self.double_click(point()),
             WM_MBUTTONUP => self.middle_click(point()),
             WM_RBUTTONUP => self.right_click(point()),
             WM_CANCELMODE => {
-                self.tab_drag = None; self.splitter_drag = None; self.pressed = None;
+                self.tab_drag = None; self.splitter_drag = None; self.pane_splitter_drag=None; self.pressed = None;
                 if unsafe { GetCapture() } == self.hwnd { let _ = unsafe { ReleaseCapture() }; }
                 self.set_hover(Hit::None, None); self.invalidate();
             }
-            WM_CAPTURECHANGED => { self.tab_drag = None; self.splitter_drag = None; self.pressed = None; self.invalidate(); }
+            WM_CAPTURECHANGED => { self.tab_drag = None; self.splitter_drag = None; self.pane_splitter_drag=None; self.pressed = None; self.invalidate(); }
             WM_SETCURSOR => {
                 if (lp.0 & 0xFFFF) as u32 == HTCLIENT {
                     let mut p = POINT::default();
                     let _ = unsafe { GetCursorPos(&mut p) };
                     let _ = unsafe { ScreenToClient(self.hwnd, &mut p) };
                     let cursor = match self.layout.hit(p.x, p.y) {
-                        Hit::Splitter => Some(IDC_SIZEWE),
+                        Hit::Splitter | Hit::PaneSplitter => Some(IDC_SIZEWE),
                         Hit::Address if !self.address_editing && self.crumb_at(p.x, p.y).is_none() => Some(IDC_IBEAM),
                         _ => None,
                     };
-                    let cursor = cursor.or(self.splitter_drag.map(|_| IDC_SIZEWE)).unwrap_or(IDC_ARROW);
+                    let cursor = cursor.or(self.splitter_drag.or(self.pane_splitter_drag.map(|(x,w)|(x,i32::from(w)))).map(|_| IDC_SIZEWE)).unwrap_or(IDC_ARROW);
                     if let Ok(c) = unsafe { LoadCursorW(None, cursor) } { unsafe { SetCursor(Some(c)); } }
                     return Some(LRESULT(1));
                 }
@@ -1168,11 +1204,14 @@ impl WindowState {
                         unsafe { SetTimer(Some(self.hwnd), TIMER_SEARCH, 250, None); }
                     }
                 } else {
-                    post(self.hwnd, WM_ACTION, id, 0);
+                    if Command::from_id(id as u16).is_some_and(Command::pane_specific) {
+                        self.queue_pane_action(self.browser_source,id);
+                    }else{post(self.hwnd, WM_ACTION, id, 0);}
                 }
                 return Some(LRESULT(0));
             }
             WM_ACTION => unsafe { self.action(wp.0, lp.0) },
+            pane_input::MESSAGE => self.receive_pane_input(wp.0),
             WM_SHELL_NAVIGATED => if lp.0 != 0 { unsafe { self.navigation_completed(*Box::from_raw(lp.0 as *mut ShellLocation)); } },
             WM_SHELL_FOLDER_INVOKED => if lp.0 != 0 { unsafe { self.navigate_to(*Box::from_raw(lp.0 as *mut ShellLocation)); } },
             WM_SHELL_NAVIGATION_FAILED => unsafe { self.navigation_failed() },
@@ -1188,7 +1227,7 @@ impl WindowState {
                 unsafe { self.new_tab(ShellLocation::Path(target)); }
             },
             WM_OPEN_REQUEST => if lp.0 != 0 { unsafe { self.open_requested(*Box::from_raw(lp.0 as *mut crate::instance::OpenRequest)); } },
-            WM_FAST_SEARCH => self.poll_fast_search(),
+            WM_FAST_SEARCH => self.poll_pane_searches(),
             WM_DIAGNOSTIC=>if lp.0!=0{let request=unsafe{Box::from_raw(lp.0 as *mut crate::instance::DiagnosticRequest)};let _=self.write_diagnostics(&request);},
             crate::routing_control::WM_RESULT => if lp.0!=0{self.show_message(unsafe{*Box::from_raw(lp.0 as *mut String)});},
             message if message>=0xC000&&message==zsdesk_windows::shell::file_transfer::result_message()=>{
@@ -1233,6 +1272,7 @@ impl DropHandler for ChromeDrop {
         let Some(bookmarks) = self.zone(point).filter(|_| self.accepted.get()) else { return DROPEFFECT_NONE };
         let message = if bookmarks { WM_BOOKMARK_PATH_DROPPED } else { WM_OPEN_TAB_PATH };
         for path in hdrop_paths(data).into_iter().take(32) {
+            if !bookmarks {hover_preview::post_tab_path(HWND(self.hwnd as *mut _),0,path);continue;}
             let payload = Box::into_raw(Box::new(path));
             if unsafe { PostMessageW(Some(HWND(self.hwnd as *mut _)), message, WPARAM(0), LPARAM(payload as isize)) }.is_err() {
                 unsafe { drop(Box::from_raw(payload)); }
@@ -1304,6 +1344,13 @@ fn accelerator_table() -> Vec<ACCEL> {
 }
 
 unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, id: usize, parent: usize) -> LRESULT {
+    if id==ID_ADDRESS {
+        if msg==WM_GETDLGCODE && wp.0==VK_RETURN.0 as usize {
+            return LRESULT(unsafe{DefSubclassProc(hwnd,msg,wp,lp)}.0 | DLGC_WANTMESSAGE as isize);
+        }
+        if address_input::handle(hwnd,msg,wp) {return LRESULT(0);}
+        if msg==WM_NCDESTROY {address_input::end(hwnd);}
+    }
     // EDIT focus notifications can arrive while the parent state is borrowed
     // by Shell. Queue the transition directly so reentrancy cannot lose it.
     if msg==WM_KILLFOCUS && id==ID_ADDRESS {post(HWND(parent as *mut _),WM_ACTION,ACTION_END_ADDRESS_EDIT,0);}
@@ -1321,7 +1368,7 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             (_, k) if k == VK_TAB.0 as usize => ACTION_FOCUS_VIEW,
             (ID_SEARCH, _) if enter => ACTION_SEARCH,
             (ID_SEARCH, _) => ACTION_CLOSE_SEARCH,
-            (ID_ADDRESS, _) if enter => ACTION_COMMIT_ADDRESS,
+            (ID_ADDRESS, _) if enter => return LRESULT(0),
             (ID_ADDRESS, _) => ACTION_CANCEL_ADDRESS,
             (_, _) if enter => ACTION_COMMIT_RENAME,
             _ => ACTION_CANCEL_RENAME,

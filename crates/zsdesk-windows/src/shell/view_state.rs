@@ -8,6 +8,25 @@ use windows::core::{BOOL, GUID, HRESULT, Interface};
 use zsdesk_core::model::explorer::{ShellViewState, ViewPropertyKey, ViewSortColumn, ViewColumn, ViewGrouping};
 use super::ExplorerBrowserHost;
 
+/// View-only settings for an isolated background menu; no selection or paths.
+pub fn capture_view_layout(shell:&IShellView)->Option<ShellViewState> {
+    let view:IFolderView2=shell.cast().ok()?;
+    let mut mode=FOLDERVIEWMODE(0);let mut icon_size=0;
+    unsafe{view.GetViewModeAndIconSize(&mut mode,&mut icon_size).ok()?;}
+    Some(ShellViewState{mode:mode.0,icon_size,
+        sort_columns:read_sort_columns(&view).unwrap_or_default().into_iter().map(|column|ViewSortColumn{key:encode_key(column.propkey),ascending:column.direction==SORT_ASCENDING}).collect(),
+        grouping:read_grouping(&view).map(|(key,ascending)|ViewGrouping{key:(key!=NULL_KEY).then(||encode_key(key)),ascending}),
+        ..Default::default()})
+}
+/// Restores menu-controlled layout without clearing selection or moving focus.
+pub fn restore_view_layout(shell:&IShellView,state:&ShellViewState) {
+    let Ok(view)=shell.cast::<IFolderView2>()else{return;};
+    if (1..=8).contains(&state.mode)&&(8..=512).contains(&state.icon_size) {
+        let _=unsafe{view.SetViewModeAndIconSize(FOLDERVIEWMODE(state.mode),state.icon_size)};
+    }
+    restore_layout(shell,&view,state);
+}
+
 impl ExplorerBrowserHost {
     pub fn select_children(&self,names:&[std::ffi::OsString])->windows::core::Result<()> {
         use std::os::windows::ffi::OsStrExt;

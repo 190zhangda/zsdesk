@@ -33,6 +33,7 @@ fn expression(raw:&str,controls:&SearchControls)->String{
 
 impl WindowState{
     pub(super) unsafe fn sync_search_tab_edit(&mut self) {
+        if self.background_pane { return; }
         let id = self.session.active_tab().id;
         if self.search_panel.edit_tab == Some(id) { return; }
         let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_SEARCH) };

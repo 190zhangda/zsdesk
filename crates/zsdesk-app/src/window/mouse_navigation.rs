@@ -6,7 +6,7 @@ use windows::Win32::System::SystemServices::{APPCOMMAND_BROWSER_BACKWARD, APPCOM
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Source { SideButton, AppCommand }
 #[derive(Clone, Copy)]
-struct LastNavigation { owner: isize, back: bool, source: Source, tick: u64 }
+struct LastNavigation { owner: isize, pane:usize, back: bool, source: Source, tick: u64 }
 thread_local! { static LAST: Cell<Option<LastNavigation>> = const { Cell::new(None) }; }
 
 fn owned(owner: HWND, target: HWND) -> bool {
@@ -22,16 +22,20 @@ fn editing_or_modal(target: HWND) -> bool {
 
 fn navigate(owner: HWND, target: HWND, back: bool, source: Source) {
     if editing_or_modal(target) { return; }
+    let pointer=unsafe{GetWindowLongPtrW(owner,GWLP_USERDATA)}as *const Slot;
+    if pointer.is_null(){return;}
+    let identity=unsafe{&*pointer}.try_borrow().ok().and_then(|slot|slot.as_ref().and_then(|state|state.source_for_input(target).and_then(|source|state.identity_for_source(source))));
+    let Some(identity)=identity else{return;};let pane=identity.source;
     let tick = unsafe { GetTickCount64() };
     // Some mouse drivers deliver both native button input and an app command.
     // Only suppress a matching pair of different forms, never repeated clicks.
     let duplicate = LAST.with(|last| {
-        let duplicate = last.get().is_some_and(|previous| previous.owner == owner.0 as isize && previous.back == back
+        let duplicate = last.get().is_some_and(|previous| previous.owner == owner.0 as isize && previous.pane==pane && previous.back == back
             && previous.source != source && tick.saturating_sub(previous.tick) <= 150);
-        last.set(if duplicate { None } else { Some(LastNavigation { owner: owner.0 as isize, back, source, tick }) });
+        last.set(if duplicate { None } else { Some(LastNavigation { owner: owner.0 as isize, pane, back, source, tick }) });
         duplicate
     });
-    if !duplicate { post(owner, WM_ACTION, if back { Command::Back } else { Command::Forward }.id() as usize, 0); }
+    if !duplicate { pane_input::post(owner,identity,pane_input::Intent::Action(if back { Command::Back } else { Command::Forward }.id()as usize)); }
 }
 
 /// Called for queued input targeting the main window or any native child.

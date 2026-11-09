@@ -11,6 +11,7 @@ use windows::{core::{HRESULT, Interface, PWSTR}, Win32::{
 }};
 use zsdesk_core::model::explorer::PreviewProviderPreference;
 use super::{preview_process::PreviewProcess as QuickPreview, Slot};
+use super::preview_process::selection::ViewSnapshot;
 
 const TIMER:usize=5;
 const READY:u32=WM_APP+45;
@@ -19,7 +20,7 @@ const MAX_AGE:Duration=Duration::from_millis(800);
 const UIA_BUDGET:Duration=Duration::from_millis(500);
 const MAX_VISIBLE:usize=256;
 
-struct Context { view:HWND, bounds:RECT, tab:u64, provider:PreviewProviderPreference, dark:bool }
+struct Context { view:HWND, bounds:RECT, tab:u64, provider:PreviewProviderPreference, dark:bool, snapshot:ViewSnapshot }
 #[derive(Clone,Copy)]
 struct Request { generation:u64, view:isize, bounds:RECT, point:POINT, created:Instant }
 struct Hit { name:String, _automation_id:String, bounds:RECT }
@@ -144,8 +145,7 @@ impl HoverPreview {
             if let Some(reply)=reply.filter(|reply|reply.generation==self.generation) {
                 let Some(hit)=reply.hit.filter(|hit|contains(hit.bounds,point)) else {self.reset(preview);return ours;};
                 if self.candidate.is_none_or(|(request,_)|request.created.elapsed()>MAX_AGE) {self.reset(preview);return ours;}
-                let shell=slot.try_borrow().ok().and_then(|slot|slot.as_ref().and_then(|state|
-                    state.browser.as_ref().and_then(|browser|unsafe {browser.current_view().ok()})));
+                let shell=context.snapshot.view(slot);
                 // All provider calls have finished. Resolve only real Shell items
                 // on the STA, never by turning an automation ID into an index.
                 let path=shell.as_ref().filter(|shell|unsafe {shell.GetWindow()}.ok()==Some(context.view))
@@ -182,17 +182,29 @@ fn busy(owner:HWND)->bool {
 }
 fn context(slot:&Slot,owner:HWND)->Option<Context> {
     if busy(owner) {return None;}
-    let slot=slot.try_borrow().ok()?;let state=slot.as_ref()?;
-    if state.pending.is_some() || state.queued.is_some() || state.tab_drag.is_some() || state.splitter_drag.is_some()
-        || state.address_editing || state.rename_index.is_some() {return None;}
-    let view=state.browser.as_ref()?.view_window()?;let mut bounds=RECT::default();
+    input_context(slot,owner)
+}
+fn input_context(slot:&Slot,owner:HWND)->Option<Context> {
+    {
+        let slot=slot.try_borrow().ok()?;let state=slot.as_ref()?;
+        if state.tab_drag.is_some() || state.splitter_drag.is_some()
+            || state.address_editing || state.rename_index.is_some() {return None;}
+    }
+    let snapshot=ViewSnapshot::capture(slot)?;
+    if snapshot.owner()!=owner{return None;}
+    // Navigation maintains this handle. Mouse movement does not need to enter
+    // Shell just to obtain its bounds; a missing/destroyed view is not a hit.
+    let view=snapshot.window();let mut bounds=RECT::default();
+    if !unsafe{IsWindow(Some(view))}.as_bool(){return None;}
     unsafe {GetWindowRect(view,&mut bounds)}.ok()?;
-    Some(Context{view,bounds,tab:state.session.active_tab().id,provider:state.session.ui.preview_provider,dark:state.dark})
+    if !snapshot.current(slot,false){return None;}
+    Some(Context{view,bounds,tab:snapshot.tab(),provider:snapshot.provider,dark:snapshot.dark,snapshot})
 }
 fn context_matches(slot:&Slot,owner:HWND,expected:&Context)->bool {
-    context(slot,owner)
-        .is_some_and(|actual|actual.view==expected.view && actual.tab==expected.tab && actual.bounds==expected.bounds
-            && actual.provider==expected.provider && actual.dark==expected.dark)
+    if busy(owner)||!expected.snapshot.current(slot,false){return false;}
+    let mut bounds=RECT::default();
+    if unsafe{GetWindowRect(expected.view,&mut bounds)}.is_err()||bounds!=expected.bounds{return false;}
+    ViewSnapshot::capture(slot).is_some_and(|actual|actual.provider==expected.provider&&actual.dark==expected.dark)
 }
 
 fn worker_main(owner:isize,shared:Arc<Shared>,message:u32) {
@@ -296,41 +308,49 @@ fn resolve_item(shell:&IShellView,name:&str,folder_only:bool)->Option<PathBuf> {
 }
 
 const MIDDLE_READY:u32=WM_APP+46;
-pub(super) struct MiddleClick{owner:HWND,worker:Option<Worker>,down:Option<POINT>,pending:Option<Context>,generation:u64}
+pub(super) struct MiddleClick{owner:HWND,worker:Option<Worker>,down:Option<POINT>,pending:Option<(Context,Instant)>,generation:u64}
 impl MiddleClick{
     pub(super) fn new(owner:HWND)->Self{Self{owner,worker:None,down:None,pending:None,generation:0}}
     pub(super) fn process(&mut self,msg:&MSG,slot:&Slot)->bool{
-        if matches!(msg.message,WM_LBUTTONDOWN|WM_RBUTTONDOWN|WM_KEYDOWN|WM_SYSKEYDOWN){
+        if matches!(msg.message,WM_LBUTTONDOWN|WM_RBUTTONDOWN|WM_KEYDOWN|WM_SYSKEYDOWN|WM_CANCELMODE|WM_CAPTURECHANGED)
+            || [super::WM_SHELL_NAVIGATED,super::WM_SHELL_NAVIGATION_FAILED,super::WM_LAYOUT,WM_DPICHANGED].contains(&msg.message){
             self.generation=self.generation.wrapping_add(1);self.pending=None;self.down=None;
             if let Some(worker)=&self.worker{worker.cancel(self.generation);}
         }
         if msg.hwnd==self.owner&&msg.message==MIDDLE_READY{
             let Some(reply)=self.worker.as_ref().and_then(Worker::take)else{return true;};
-            let Some(context)=self.pending.take()else{return true;};
-            if reply.generation!=self.generation||!context_matches(slot,self.owner,&context){return true;}
+            let Some((context,created))=self.pending.take()else{return true;};
+            if created.elapsed()>MAX_AGE||reply.generation!=self.generation||!context_matches(slot,self.owner,&context){return true;}
             let Some(hit)=reply.hit else{return true;};
-            let shell=slot.try_borrow().ok().and_then(|slot|slot.as_ref().and_then(|state|state.browser.as_ref().and_then(|browser|unsafe{browser.current_view()}.ok())));
+            let shell=context.snapshot.view(slot);
             if let Some(path)=shell.as_ref().filter(|shell|unsafe{shell.GetWindow()}.ok()==Some(context.view)).and_then(|shell|resolve_item(shell,&hit.name,true)){
-                let location=Box::into_raw(Box::new(zsdesk_core::model::explorer::ShellLocation::Path(path)));
-                if unsafe{PostMessageW(Some(self.owner),super::WM_OPEN_TAB_PATH,WPARAM(0),LPARAM(location as isize))}.is_err(){unsafe{drop(Box::from_raw(location));}}
+                // GetItem/GetDisplayName may re-enter the owner or complete a
+                // navigation. Never post a path resolved from that old view.
+                if !context_matches(slot,self.owner,&context){return true;}
+                super::pane_input::post(self.owner,context.snapshot.input_identity(),super::pane_input::Intent::OpenFolder(path));
             }
             return true;
         }
         if !matches!(msg.message,WM_MBUTTONDOWN|WM_MBUTTONUP){return false;}
         let mut point=POINT::default();if unsafe{GetCursorPos(&mut point)}.is_err(){return false;}
-        let context=slot.try_borrow().ok().and_then(|slot|{
-            let state=slot.as_ref()?;if state.pending.is_some()||state.address_editing||state.rename_index.is_some(){return None;}
-            let view=state.browser.as_ref()?.view_window()?;let mut bounds=RECT::default();unsafe{GetWindowRect(view,&mut bounds)}.ok()?;
-            if !contains(bounds,point){return None;}
-            Some(Context{view,bounds,tab:state.session.active_tab().id,provider:state.session.ui.preview_provider,dark:state.dark})
-        });
+        let context=input_context(slot,self.owner).filter(|context|contains(context.bounds,point));
         let Some(context)=context else{self.down=None;return false;};
         if msg.message==WM_MBUTTONDOWN{self.down=Some(point);return true;}
         if !self.down.take().is_some_and(|start|near(start,point)){return true;}
+        if self.worker.as_ref().is_some_and(Worker::finished){self.worker=None;}
         if self.worker.is_none(){self.worker=Worker::new(self.owner,MIDDLE_READY);}
         self.generation=self.generation.wrapping_add(1);
-        if let Some(worker)=&self.worker{worker.request(Request{generation:self.generation,view:context.view.0 as isize,bounds:context.bounds,point,created:Instant::now()});self.pending=Some(context);}
+        if let Some(worker)=&self.worker{let created=Instant::now();worker.request(Request{generation:self.generation,view:context.view.0 as isize,bounds:context.bounds,point,created});self.pending=Some((context,created));}
         true
+    }
+}
+
+/// WM_OPEN_TAB_PATH is shared with ChromeDrop and its receiver owns a PathBuf,
+/// not a ShellLocation enum. Keep the allocation type identical on all paths.
+pub(super) fn post_tab_path(owner:HWND,source:usize,path:PathBuf){
+    let pointer=Box::into_raw(Box::new(path));
+    if unsafe{PostMessageW(Some(owner),super::WM_OPEN_TAB_PATH,WPARAM(source),LPARAM(pointer as isize))}.is_err(){
+        unsafe{drop(Box::from_raw(pointer));}
     }
 }
 
@@ -358,5 +378,18 @@ mod tests {
         assert!(shared.mailbox.lock().unwrap().request.is_none());
         worker.stop();worker.request(Request{generation:4,..request});
         assert!(shared.mailbox.lock().unwrap().request.is_none());
+    }
+
+    #[test]
+    fn native_middle_click_posts_the_path_payload_expected_by_the_receiver(){
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let owner=unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),windows::core::w!("STATIC"),windows::core::w!("middle payload"),WS_POPUP,0,0,10,10,None,None,None,None)}.unwrap();
+        let expected=PathBuf::from(r"E:\中文 空格\folder");post_tab_path(owner,17,expected.clone());
+        let mut message=MSG::default();
+        assert!(unsafe{PeekMessageW(&mut message,Some(owner),super::super::WM_OPEN_TAB_PATH,super::super::WM_OPEN_TAB_PATH,PM_REMOVE)}.as_bool());
+        let received=unsafe{Box::from_raw(message.lParam.0 as*mut PathBuf)};
+        assert_eq!(*received,expected);drop(received);
+        assert_eq!(message.wParam.0,17);
+        let _=unsafe{DestroyWindow(owner)};
     }
 }

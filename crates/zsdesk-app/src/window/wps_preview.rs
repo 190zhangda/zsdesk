@@ -3,6 +3,9 @@ use std::{path::{Path,PathBuf},time::{Duration,Instant},mem::ManuallyDrop};
 use anyhow::{bail,Context,Result};
 use windows::{core::{GUID,PCWSTR,BSTR},Win32::System::{Com::*,Variant::*}};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_UNAWARE, SetThreadDpiAwarenessContext};
+#[path="wps_render_process.rs"]
+mod render_process;
+pub(super) use render_process::run_worker_if_requested;
 
 // WPS ET's hidden automation exporter uses the caller's DPI context when
 // importing OOXML metrics. Per-monitor callers can produce compressed rows
@@ -41,6 +44,10 @@ fn dispatch(value:VARIANT)->Result<IDispatch>{
 }
 fn count(object:&IDispatch)->Result<i32>{Ok(i32::try_from(&get(object,"Count")?)?)}
 fn number(object:&IDispatch,name:&str)->Option<i32>{get(object,name).ok().and_then(|v|i32::try_from(&v).ok())}
+fn busy(error:&anyhow::Error)->bool{
+    error.chain().filter_map(|cause|cause.downcast_ref::<windows::core::Error>())
+        .any(|error|matches!(error.code().0 as u32,0x80010001|0x8001010a|0x8001010b|0x800ac472))
+}
 fn missing()->VARIANT{
     VARIANT{Anonymous:VARIANT_0{Anonymous:ManuallyDrop::new(VARIANT_0_0{vt:VT_ERROR,
         Anonymous:VARIANT_0_0_0{scode:0x80020004u32 as i32},..Default::default()})}}
@@ -62,28 +69,78 @@ struct Application {
     app:IDispatch, documents:Option<IDispatch>, document:Option<IDispatch>,
     initial:i32, family:Family, original_alerts:Option<VARIANT>, original_security:Option<VARIANT>,
     report:PathBuf,
+    opening:Option<PathBuf>,
 }
 impl Drop for Application{
     fn drop(&mut self){
-        let mut document_closed=self.document.is_none();
+        // Some automation servers create the document and then reject Open's
+        // return dispatch. Recover only that exact path in our initially empty
+        // collection, so the error path still owns its Close operation.
+        if self.document.is_none() && self.initial==0 {
+            if let (Some(path),Some(documents))=(&self.opening,&self.documents){
+                if let Ok(total)=count(documents){for index in 1..=total.min(32){
+                    let item=invoke(documents,"Item",DISPATCH_PROPERTYGET,vec![index.into()]).and_then(dispatch);
+                    if let Ok(item)=item {
+                        let matching=get(&item,"FullName").ok().and_then(|value|BSTR::try_from(&value).ok())
+                            .is_some_and(|name|name.to_string().replace('/',"\\").eq_ignore_ascii_case(&path.to_string_lossy().replace('/',"\\")));
+                        if matching {self.document=Some(item);break;}
+                    }
+                }}
+            }
+        }
+        let mut document_closed=self.document.is_none() && (self.opening.is_none()
+            ||self.documents.as_ref().is_some_and(|docs|count(docs).ok()==Some(self.initial)));
         if let Some(doc)=self.document.take(){
-            document_closed=if matches!(self.family,Family::Slides){call(&doc,"Close",vec![])}else{call(&doc,"Close",vec![false.into()])}.is_ok();
+            loop{
+                let closed=if matches!(self.family,Family::Slides){call(&doc,"Close",vec![])}else{call(&doc,"Close",vec![false.into()])};
+                document_closed=closed.is_ok();
+                if document_closed{break;}
+                if self.documents.as_ref().is_some_and(|docs|count(docs).ok()==Some(0)){document_closed=true;break;}
+                // Only the dedicated guardian may wait for WPS to finish a
+                // rejected/busy Close. A visible or unknown instance is left
+                // intact; no unrelated document is closed to make it quit.
+                if !closed.as_ref().is_err_and(busy)||!render_process::guarded()||self.initial!=0
+                    ||get(&self.app,"Visible").ok().and_then(|v|bool::try_from(&v).ok())!=Some(false)
+                    ||self.documents.as_ref().and_then(|docs|count(docs).ok()).is_none(){break;}
+                let _=std::fs::write(&self.report,b"{\"state\":\"closing_owned_document\",\"document_closed\":false}");
+                std::thread::sleep(Duration::from_millis(250));
+            }
             drop(doc);
         }
         let empty=self.documents.as_ref().is_some_and(|docs|count(docs).ok()==Some(0));
         self.documents=None;
-        let no_windows=get(&self.app,"Windows").and_then(dispatch).and_then(|windows|count(&windows)).ok()==Some(0);
-        let hidden=get(&self.app,"Visible").ok().and_then(|v|bool::try_from(&v).ok())==Some(false);
+        let mut no_windows=get(&self.app,"Windows").and_then(dispatch).and_then(|windows|count(&windows)).ok()==Some(0);
+        let mut hidden=get(&self.app,"Visible").ok().and_then(|v|bool::try_from(&v).ok())==Some(false);
         // WPS Word exposes background status; the other applications export synchronously.
-        let idle=number(&self.app,"BackgroundSavingStatus").unwrap_or(0)==0 && number(&self.app,"BackgroundPrintingStatus").unwrap_or(0)==0;
+        let mut idle=number(&self.app,"BackgroundSavingStatus").unwrap_or(0)==0 && number(&self.app,"BackgroundPrintingStatus").unwrap_or(0)==0;
+        while render_process::guarded()&&self.initial==0&&empty&&no_windows&&hidden&&!idle{
+            let _=std::fs::write(&self.report,b"{\"state\":\"waiting_for_background_work\",\"document_closed\":true}");
+            std::thread::sleep(Duration::from_millis(250));
+            no_windows=get(&self.app,"Windows").and_then(dispatch).and_then(|windows|count(&windows)).ok()==Some(0);
+            hidden=get(&self.app,"Visible").ok().and_then(|v|bool::try_from(&v).ok())==Some(false);
+            idle=number(&self.app,"BackgroundSavingStatus").unwrap_or(0)==0&&number(&self.app,"BackgroundPrintingStatus").unwrap_or(0)==0;
+        }
         let mut quit_succeeded=false;
         if self.initial==0 && empty && no_windows && hidden && idle {
-            quit_succeeded=if matches!(self.family,Family::Word){call(&self.app,"Quit",vec![0i32.into()])}else{call(&self.app,"Quit",vec![])}.is_ok();
-        }else{
+            loop{
+                let quit=if matches!(self.family,Family::Word){call(&self.app,"Quit",vec![0i32.into()])}else{call(&self.app,"Quit",vec![])};
+                quit_succeeded=quit.is_ok();
+                if quit_succeeded||!quit.as_ref().is_err_and(busy)||!render_process::guarded(){break;}
+                let collection=match self.family{Family::Word=>"Documents",Family::Sheet=>"Workbooks",Family::Slides=>"Presentations"};
+                let still_empty=get(&self.app,collection).and_then(dispatch).and_then(|docs|count(&docs)).ok()==Some(0);
+                no_windows=get(&self.app,"Windows").and_then(dispatch).and_then(|windows|count(&windows)).ok()==Some(0);
+                hidden=get(&self.app,"Visible").ok().and_then(|v|bool::try_from(&v).ok())==Some(false);
+                idle=number(&self.app,"BackgroundSavingStatus").unwrap_or(0)==0&&number(&self.app,"BackgroundPrintingStatus").unwrap_or(0)==0;
+                if !still_empty||!no_windows||!hidden||!idle{break;}
+                let _=std::fs::write(&self.report,b"{\"state\":\"quitting_owned_application\",\"document_closed\":true}");
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+        if !quit_succeeded {
             if let Some(value)=self.original_alerts.take(){let _=set(&self.app,"DisplayAlerts",value);}
             if let Some(value)=self.original_security.take(){let _=set(&self.app,"AutomationSecurity",value);}
         }
-        let report=serde_json::json!({"initial_documents":self.initial,"document_closed":document_closed,"no_documents":empty,"no_windows":no_windows,"hidden":hidden,"idle":idle,"quit_call_succeeded":quit_succeeded});
+        let report=serde_json::json!({"state":if document_closed{"closed_owned_document"}else{"session_retained"},"initial_documents":self.initial,"document_closed":document_closed,"no_documents":empty,"no_windows":no_windows,"hidden":hidden,"idle":idle,"quit_call_succeeded":quit_succeeded});
         if let Ok(bytes)=serde_json::to_vec(&report){let _=std::fs::write(&self.report,bytes);}
     }
 }
@@ -92,6 +149,11 @@ pub(super) struct RenderedDocument{pub pdf:PathBuf}
 impl Drop for RenderedDocument{fn drop(&mut self){let _=std::fs::remove_file(&self.pdf);}}
 
 pub(super) fn render(path:&Path,workspace:&Path)->Result<RenderedDocument>{
+    if std::env::var_os("ZSDESK_PREVIEW_WORKSPACE").is_some(){return render_process::render(path,workspace);}
+    render_owned(path,workspace)
+}
+
+fn render_owned(path:&Path,workspace:&Path)->Result<RenderedDocument>{
     let _dpi=OfficeDpiScope::enter();
     let family=family(path).context("不支持此 WPS 文档类型")?;
     let (progid,collection)=match family{Family::Word=>("KWPS.Application","Documents"),Family::Sheet=>("KET.Application","Workbooks"),Family::Slides=>("KWPP.Application","Presentations")};
@@ -99,13 +161,15 @@ pub(super) fn render(path:&Path,workspace:&Path)->Result<RenderedDocument>{
     let app:IDispatch=unsafe{CoCreateInstance(&clsid,None,CLSCTX_LOCAL_SERVER|CLSCTX_ACTIVATE_32_BIT_SERVER)}
         .or_else(|_|unsafe{CoCreateInstance(&clsid,None,CLSCTX_LOCAL_SERVER)})
         .context("无法启动 WPS 只读渲染组件")?;
-    let mut owned=Application{app,documents:None,document:None,initial:-1,family,original_alerts:None,original_security:None,report:workspace.join("wps-lifecycle.json")};
+    let mut owned=Application{app,documents:None,document:None,initial:-1,family,original_alerts:None,original_security:None,report:workspace.join("wps-lifecycle.json"),opening:None};
     let docs=dispatch(get(&owned.app,collection)?)?;
     owned.initial=count(&docs)?;owned.documents=Some(docs);
     if owned.initial!=0 {bail!("WPS 正在使用已有文档，未改变该实例；请使用已安装的预览插件或稍后重试");}
     owned.original_alerts=get(&owned.app,"DisplayAlerts").ok();
     owned.original_security=get(&owned.app,"AutomationSecurity").ok();
-    if bool::try_from(&get(&owned.app,"Visible")?)? {set(&owned.app,"Visible",false.into())?;}
+    // CoCreateInstance may return an existing empty WPS instance. A visible
+    // instance is not ours to hide or quit, even when it has no documents.
+    if bool::try_from(&get(&owned.app,"Visible")?)? {bail!("WPS 正在显示窗口，未改变该实例");}
     set(&owned.app,"DisplayAlerts",if matches!(family,Family::Slides){1i32.into()}else{0i32.into()})?;
     set(&owned.app,"AutomationSecurity",3i32.into()).context("WPS 不支持禁用文档宏，已停止预览")?;
     let filename=VARIANT::from(BSTR::from(path.as_os_str().to_string_lossy().as_ref()));
@@ -114,8 +178,10 @@ pub(super) fn render(path:&Path,workspace:&Path)->Result<RenderedDocument>{
         Family::Sheet=>vec![filename,0i32.into(),true.into()],
         Family::Slides=>vec![filename,true.into(),false.into(),false.into()],
     };
+    owned.opening=Some(path.into());
     owned.document=Some(dispatch(call(owned.documents.as_ref().unwrap(),"Open",args)?)?);
     if !bool::try_from(&get(owned.document.as_ref().unwrap(),"ReadOnly")?)?{bail!("WPS 未以只读方式打开文档");}
+    if render_process::cancelled(workspace){bail!("文档预览已取消");}
     if matches!(family,Family::Sheet){
         // Materialize hidden-workbook print metrics before exporting. These
         // reads retain the workbook's own column widths, font and page setup.
@@ -130,6 +196,7 @@ pub(super) fn render(path:&Path,workspace:&Path)->Result<RenderedDocument>{
     // A preview workspace is created uniquely by the parent and is never a document directory.
     if pdf.exists(){std::fs::remove_file(&pdf)?;}
     let target=VARIANT::from(BSTR::from(pdf.as_os_str().to_string_lossy().as_ref()));
+    if render_process::cancelled(workspace){bail!("文档预览已取消");}
     let doc=owned.document.as_ref().unwrap();
     match family{
         Family::Word=>{call(doc,"ExportAsFixedFormat",vec![target,17i32.into()])?;}
@@ -143,6 +210,9 @@ pub(super) fn render(path:&Path,workspace:&Path)->Result<RenderedDocument>{
         std::thread::sleep(Duration::from_millis(20));
     }
     drop(owned);
+    if let Ok(bytes)=std::fs::read(workspace.join("wps-lifecycle.json")){
+        if serde_json::from_slice::<serde_json::Value>(&bytes).ok().is_some_and(|report|report["document_closed"]!=true){bail!("WPS 文档关闭未完成，保留现有会话");}
+    }
     if std::fs::metadata(&pdf).map_or(true,|m|m.len()<5){bail!("WPS 未生成有效预览");}
     Ok(RenderedDocument{pdf})
 }

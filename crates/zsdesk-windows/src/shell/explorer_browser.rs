@@ -43,9 +43,18 @@ use super::{
         location_from_pidl, shell_item, selected_shell_item, is_folder, location_from_shell_item,
     },
 };
+#[path="view_background.rs"]
+mod view_background;
 
 const S_FALSE: HRESULT = HRESULT(1);
 const E_NOINTERFACE: HRESULT = HRESULT(0x8000_4002u32 as i32);
+
+/// The application captures its tab/navigation identity before any Shell query
+/// can reenter its message loop. The returned closure owns no borrowed UI state.
+pub type FolderOpenCallback=Box<dyn FnOnce(ShellLocation)>;
+pub type FolderOpenCapture=fn(HWND,usize,HWND)->Option<FolderOpenCallback>;
+thread_local!{static FOLDER_OPEN_CAPTURE:Cell<Option<FolderOpenCapture>>=const{Cell::new(None)};}
+pub fn set_folder_open_capture(capture:Option<FolderOpenCapture>){FOLDER_OPEN_CAPTURE.with(|slot|slot.set(capture));}
 
 /// Optional Shell panes shown next to the file list.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -105,6 +114,8 @@ pub struct ExplorerBrowserHost {
     advise_cookie: u32,
     destroyed: Cell<bool>,
     owner: isize,
+    source: usize,
+    background: Rc<Cell<view_background::Colors>>,
     streamed_results_used: Cell<bool>,
     results_active: Rc<Cell<bool>>,
     results_location: Rc<RefCell<Option<ShellLocation>>>,
@@ -118,7 +129,11 @@ impl ExplorerBrowserHost {
     /// # Safety
     /// The same STA and parent-window lifetime requirements as `create` apply.
     pub unsafe fn create_transient(parent: HWND, rect: RECT, modern: bool, panes: Panes) -> Result<Self> {
-        let host = unsafe { Self::create(parent, rect, modern, panes)? };
+        unsafe { Self::create_transient_with_source(parent, rect, modern, panes, 0) }
+    }
+
+    pub unsafe fn create_transient_with_source(parent: HWND, rect: RECT, modern: bool, panes: Panes, source: usize) -> Result<Self> {
+        let host = unsafe { Self::create_with_source(parent, rect, modern, panes, source)? };
         let options = unsafe { host.browser.GetOptions()? };
         unsafe { host.browser.SetOptions(options | EBO_NOPERSISTVIEWSTATE)?; }
         Ok(host)
@@ -131,6 +146,12 @@ impl ExplorerBrowserHost {
     /// COM must be initialized as STA on the current UI thread. `parent` must
     /// be a valid window owned by that thread and outlive this host.
     pub unsafe fn create(parent: HWND, rect: RECT, modern: bool, panes: Panes) -> Result<Self> {
+        unsafe { Self::create_with_source(parent, rect, modern, panes, 0) }
+    }
+
+    /// Tags every asynchronous callback so sibling panes cannot consume each
+    /// other's navigation or selection changes. Zero preserves the old API.
+    pub unsafe fn create_with_source(parent: HWND, rect: RECT, modern: bool, panes: Panes, source: usize) -> Result<Self> {
         let browser: IExplorerBrowser = unsafe {
             CoCreateInstance(
                 &windows::Win32::UI::Shell::ExplorerBrowser,
@@ -147,8 +168,11 @@ impl ExplorerBrowserHost {
         let selection_revision = Rc::new(Cell::new(0u64));
         let results_active = Rc::new(Cell::new(false));
         let results_location = Rc::new(RefCell::new(None));
+        let background=Rc::new(Cell::new(view_background::Colors{
+            background:if crate::theme::system_dark_mode(){0x202020}else{0xffffff},high_contrast:crate::theme::high_contrast()}));
         let site: IServiceProvider = BrowserSite {
             hwnd: parent.0 as isize,
+            source,
             browser: Rc::downgrade(&browser),
             modern: modern.clone(),
             panes: panes.clone(),
@@ -160,12 +184,18 @@ impl ExplorerBrowserHost {
         unsafe { object_with_site.SetSite(&site)? };
 
         unsafe {
-            browser.SetOptions(EBO_SHOWFRAMES | EBO_ALWAYSNAVIGATE | EBO_NOBORDER)?;
+            // The application supplies its own navigation, commands and status
+            // row. A wrapper frame would add another native status row to each
+            // pane. Retain frames only for an explicitly requested native pane.
+            let frames=if panes.get().details||panes.get().preview {EBO_SHOWFRAMES}else{windows::Win32::UI::Shell::EXPLORER_BROWSER_OPTIONS(0)};
+            browser.SetOptions(frames | EBO_ALWAYSNAVIGATE | EBO_NOBORDER)?;
             browser.Initialize(parent, &rect, None)?;
         }
 
         let events: IExplorerBrowserEvents = BrowserEvents {
             hwnd: parent.0 as isize,
+            source,
+            background:background.clone(),
             browser: Rc::downgrade(&browser),
             modern: modern.clone(),
             selection_revision: selection_revision.clone(),
@@ -186,6 +216,8 @@ impl ExplorerBrowserHost {
             advise_cookie,
             destroyed: Cell::new(false),
             owner: parent.0 as isize,
+            source,
+            background,
             streamed_results_used: Cell::new(false),
             results_active,
             results_location,
@@ -242,7 +274,7 @@ impl ExplorerBrowserHost {
             let results = self.results_folder()?;
             self.remove_all_search_results(&results)?;
             if let Some(location) = self.results_location.borrow().clone() {
-                post_location(self.owner, WM_SHELL_NAVIGATED, location);
+                post_location(self.owner, self.source, WM_SHELL_NAVIGATED, location);
             }
             return Ok(());
         }
@@ -572,6 +604,12 @@ mod search_path_tests {
 
 impl ExplorerBrowserHost {
     pub fn panes(&self) -> Panes { self.panes.get() }
+    /// Sets only the erasure surface; the native Shell remains responsible for
+    /// item colors, selection backgrounds, accessibility and control painting.
+    pub fn set_content_background(&self,_dark:bool,colorref:u32){
+        self.background.set(view_background::Colors{background:colorref,high_contrast:crate::theme::high_contrast()});
+        if let Ok(view)=unsafe{self.current_view()}{view_background::install(&view,self.background.clone());}
+    }
     /// Changes presentation without rebuilding the file view or losing its
     /// selection. The native XAML runtime is retained once per UI thread.
     pub fn set_modern_menu(&self, modern: bool) {
@@ -595,6 +633,10 @@ impl Drop for ExplorerBrowserHost {
 }
 
 impl ExplorerBrowserHost {
+    /// Clones the interface without entering Shell. Callers may release their
+    /// UI-state borrow before querying a view that can dispatch COM callbacks.
+    pub fn browser_handle(&self) -> IExplorerBrowser { self.browser.as_ref().clone() }
+
     pub unsafe fn current_view(&self) -> Result<IShellView> {
         unsafe { self.browser.GetCurrentView() }
     }
@@ -611,6 +653,7 @@ impl ExplorerBrowserHost {
 #[implement(IServiceProvider, ICommDlgBrowser2, IExplorerPaneVisibility)]
 struct BrowserSite {
     hwnd: isize,
+    source: usize,
     browser: Weak<IExplorerBrowser>,
     modern: Rc<Cell<bool>>,
     panes: Rc<Cell<Panes>>,
@@ -632,7 +675,7 @@ impl IServiceProvider_Impl for BrowserSite_Impl {
         unsafe { *ppvobject = std::ptr::null_mut(); }
         if unsafe { *guidservice } != ICommDlgBrowser::IID && unsafe { *guidservice } != IExplorerPaneVisibility::IID {
             #[cfg(all(target_arch = "x86_64", target_env = "msvc"))]
-            if let Some(browser) = self.browser.upgrade().filter(|_|self.modern.get()) {
+            if let Some(browser) = self.browser.upgrade().filter(|_|self.modern.get() && !super::menu::view_menu_is_delegated()) {
                 return unsafe { zs_menu_query(browser.as_raw(), guidservice, riid, ppvobject) }.ok();
             }
             return Err(Error::from_hresult(E_NOINTERFACE));
@@ -662,10 +705,15 @@ impl IExplorerPaneVisibility_Impl for BrowserSite_Impl {
 impl ICommDlgBrowser_Impl for BrowserSite_Impl {
     fn OnDefaultCommand(&self, view:Ref<IShellView>)->Result<()> {
         let Some(view)=view.as_ref() else{return Err(Error::from_hresult(E_NOINTERFACE));};
+        let capture=FOLDER_OPEN_CAPTURE.with(Cell::get);
+        let callback=if let Some(capture)=capture {
+            let window=unsafe{view.GetWindow()?};
+            match capture(HWND(self.hwnd as *mut _),self.source,window){Some(callback)=>Some(callback),None=>return Ok(())}
+        }else{None};
         let Ok(item)=(unsafe {selected_shell_item(view)}) else{return Err(Error::from_hresult(S_FALSE));};
         if !unsafe {is_folder(&item)} {return Err(Error::from_hresult(S_FALSE));}
         let Some(location)=(unsafe {location_from_shell_item(&item)}) else{return Err(Error::from_hresult(S_FALSE));};
-        post_location(self.hwnd,WM_SHELL_FOLDER_INVOKED,location);
+        if let Some(callback)=callback{callback(location);}else{post_location(self.hwnd,self.source,WM_SHELL_FOLDER_INVOKED,location);}
         Ok(())
     }
     fn OnStateChange(&self,_:Ref<IShellView>,change:u32)->Result<()>{
@@ -677,7 +725,11 @@ impl ICommDlgBrowser_Impl for BrowserSite_Impl {
         // CDBOSC_SELCHANGE: coalesce bursts (select-all fires once per item).
         if change==windows::Win32::UI::Shell::CDBOSC_SELCHANGE && !self.selection_pending.replace(true) {
             let pending=self.selection_pending.clone();
-            let _ = unsafe { PostMessageW(Some(HWND(self.hwnd as *mut _)), WM_SHELL_SELECTION_CHANGED, WPARAM(0), LPARAM(Rc::into_raw(pending) as isize)) };
+            let pointer = Rc::into_raw(pending);
+            if unsafe { PostMessageW(Some(HWND(self.hwnd as *mut _)), WM_SHELL_SELECTION_CHANGED, WPARAM(self.source), LPARAM(pointer as isize)) }.is_err() {
+                unsafe { drop(Rc::from_raw(pointer)); }
+                self.selection_pending.set(false);
+            }
         }
         Ok(())
     }
@@ -695,6 +747,8 @@ impl ICommDlgBrowser2_Impl for BrowserSite_Impl {
 #[implement(IExplorerBrowserEvents)]
 struct BrowserEvents {
     hwnd: isize,
+    source: usize,
+    background: Rc<Cell<view_background::Colors>>,
     browser: Weak<IExplorerBrowser>,
     modern: Rc<Cell<bool>>,
     selection_revision: Rc<Cell<u64>>,
@@ -714,6 +768,11 @@ impl IExplorerBrowserEvents_Impl for BrowserEvents_Impl {
     fn OnViewCreated(&self, shell_view: Ref<IShellView>) -> Result<()> {
         self.selection_revision.set(self.selection_revision.get().wrapping_add(1));
         if let Some(view) = shell_view.as_ref() {
+            view_background::install(view,self.background.clone());
+            if let Ok(folder)=view.cast::<IFolderView2>(){
+                use windows::Win32::UI::Shell::{FWF_NOHEADERINALLVIEWS,FWF_NOCOLUMNHEADER};
+                let _=unsafe{folder.SetCurrentFolderFlags((FWF_NOHEADERINALLVIEWS|FWF_NOCOLUMNHEADER).0 as u32,FWF_NOHEADERINALLVIEWS.0 as u32)};
+            }
             unsafe { super::menu::attach_view_menu(view, self.modern.clone()); }
             if self.results_active.get() { configure_results_columns(view); }
         }
@@ -732,7 +791,7 @@ impl IExplorerBrowserEvents_Impl for BrowserEvents_Impl {
         }
         let logical = if self.results_active.get() { self.results_location.borrow().clone() } else { None };
         if let Some(location) = logical.or_else(|| unsafe { location_from_pidl(pidl_folder) }) {
-            post_location(self.hwnd, WM_SHELL_NAVIGATED, location);
+            post_location(self.hwnd, self.source, WM_SHELL_NAVIGATED, location);
         }
         Ok(())
     }
@@ -742,7 +801,7 @@ impl IExplorerBrowserEvents_Impl for BrowserEvents_Impl {
         _pidl_folder: *const windows::Win32::UI::Shell::Common::ITEMIDLIST,
     ) -> Result<()> {
         self.results_active.set(false);
-        let _ = unsafe { PostMessageW(Some(HWND(self.hwnd as *mut _)), WM_SHELL_NAVIGATION_FAILED, WPARAM(0), LPARAM(0)) };
+        let _ = unsafe { PostMessageW(Some(HWND(self.hwnd as *mut _)), WM_SHELL_NAVIGATION_FAILED, WPARAM(self.source), LPARAM(0)) };
         Ok(())
     }
 }
@@ -764,9 +823,9 @@ fn configure_results_columns(view: &IShellView) {
     let _ = unsafe { columns.SetColumns(&keys) };
 }
 
-fn post_location(hwnd: isize, message: u32, location: ShellLocation) {
+fn post_location(hwnd: isize, source: usize, message: u32, location: ShellLocation) {
     let pointer = Box::into_raw(Box::new(location));
-    if unsafe { PostMessageW(Some(HWND(hwnd as *mut _)), message, WPARAM(0), LPARAM(pointer as isize)) }.is_err() {
+    if unsafe { PostMessageW(Some(HWND(hwnd as *mut _)), message, WPARAM(source), LPARAM(pointer as isize)) }.is_err() {
         unsafe { drop(Box::from_raw(pointer)); }
     }
 }

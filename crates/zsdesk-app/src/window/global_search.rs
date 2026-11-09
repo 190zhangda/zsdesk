@@ -126,9 +126,9 @@ impl WindowState{
         let _=unsafe{KillTimer(Some(self.hwnd),TIMER_FAST_SEARCH)};
     }
     pub(super) fn reset_browser_host(&mut self)->windows::core::Result<()>{
+        self.folder_sizes.cancel();
         self.cancel_fast_search();self.browser=None;self.browser_role=BrowserRole::Fresh;
-        let panes=Panes{preview:false,details:self.session.ui.show_details};
-        let browser=unsafe{ExplorerBrowserHost::create(self.hwnd,win_rect(self.layout.browser),self.modern,panes)?};
+        let browser=self.create_browser()?;
         browser.set_context_menu_options(crate::context_preferences::native(&self.session.ui.context_menu));
         self.browser=Some(browser);self.theme_children();Ok(())
     }

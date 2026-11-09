@@ -42,20 +42,27 @@ impl WindowState {
     }
     /// Mouse wheel coordinates are screen coordinates even for child HWNDs.
     pub(super) fn wheel_zoom(&mut self, message: &MSG) -> bool {
-        if message.message != WM_MOUSEWHEEL || message.wParam.0 & 8 == 0 || self.pending.is_some() { return false; }
+        if message.message != WM_MOUSEWHEEL || (message.wParam.0 & 8 == 0 && unsafe{GetKeyState(VK_CONTROL.0 as i32)}>=0) || self.pending.is_some() { return false; }
         if text_input_window(message.hwnd) { return false; }
         let Some(view) = self.browser.as_ref().and_then(|browser| browser.view_window()) else { return false; };
         let mut bounds = RECT::default();
         if unsafe { GetWindowRect(view, &mut bounds) }.is_err() { return false; }
         let p = POINT { x: x_lparam(message.lParam.0), y: y_lparam(message.lParam.0) };
         if p.x < bounds.left || p.x >= bounds.right || p.y < bounds.top || p.y >= bounds.bottom { return false; }
-        self.wheel_remainder += ((message.wParam.0 >> 16) as i16) as i32;
+        self.apply_wheel_delta(((message.wParam.0 >> 16) as i16) as i32);
+        true
+    }
+    pub(super) fn apply_wheel_delta(&mut self,delta:i32) {
+        if self.pending.is_some() {return;}
+        self.wheel_remainder = self.wheel_remainder.saturating_add(delta);
         let steps = (self.wheel_remainder / 120).clamp(-16, 16);
         self.wheel_remainder %= 120;
-        for _ in 0..steps.unsigned_abs() {
-            post(self.hwnd, WM_ACTION, if steps > 0 { Command::ZoomIn } else { Command::ZoomOut }.id() as usize, 0);
+        if steps!=0 {
+            if let Some((_,mut size))=self.browser.as_ref().and_then(|b|b.view_mode()) {
+                for _ in 0..steps.unsigned_abs(){size=next_icon_size(size,steps>0);}
+                self.set_view_dimensions(windows::Win32::UI::Shell::FVM_ICON.0,size);
+            }
         }
-        true
     }
     pub(super) fn cycle_focus(&mut self, previous: bool) {
         let focus = unsafe { GetFocus() };

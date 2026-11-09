@@ -24,9 +24,32 @@ use zsdesk_ui::{chrome::scale, menus::{entry, menu, submenu, MenuItemSpec, MenuS
 use zsdesk_windows::{desktop::{self, ShellEntry}, gfx::{Gfx, TextStyle}, shell::{icons::{IconLoader, IconRequest}, menu::HistoryAction, notify::ChangeNotify, pidl}};
 
 use super::fence::{FenceHit, FenceWin, Interaction, RenameTarget, SelectionChange, TabMeta};
+#[cfg(test)]#[path="layer_regression.rs"]mod layer_regression;
 
 /// Hovering a dragged file over another tab switches to it after this delay.
 const TAB_HOVER_SWITCH: Duration = Duration::from_millis(600);
+
+fn zoom_steps(remainder: &mut i32, delta: i32) -> i32 {
+    *remainder = remainder.saturating_add(delta);
+    let steps = (*remainder / 120).clamp(-16, 16);
+    *remainder %= 120;
+    steps
+}
+fn zoom_icon_size(current: IconSize, steps: i32) -> IconSize {
+    let index = match current { IconSize::Small => 0i32, IconSize::Medium => 1, IconSize::Large => 2 };
+    match (index + steps).clamp(0, 2) { 0 => IconSize::Small, 2 => IconSize::Large, _ => IconSize::Medium }
+}
+fn desktop_item_position(origin:Bounds,width:i32,height:i32,occupied:&[Bounds])->Bounds {
+    let candidate=Bounds::new(origin.x.clamp(0,(width-origin.w).max(0)),origin.y.clamp(0,(height-origin.h).max(0)),origin.w,origin.h);
+    let free=|cell:Bounds|occupied.iter().all(|other|cell.right()<=other.x||cell.x>=other.right()||cell.bottom()<=other.y||cell.y>=other.bottom());
+    if free(candidate) { return candidate; }
+    for x in (0..=(width-origin.w).max(0)).step_by(origin.w.max(1) as usize) {
+        for y in (0..=(height-origin.h).max(0)).step_by(origin.h.max(1) as usize) {
+            let cell=Bounds::new(x,y,origin.w,origin.h); if free(cell) { return cell; }
+        }
+    }
+    candidate
+}
 
 pub const WM_TRAY: u32 = WM_APP + 10;
 pub const WM_DESKTOP_CHANGED: u32 = WM_APP + 11;
@@ -50,6 +73,7 @@ pub enum After {
     FolderSystemMenu { fence: u64, point: POINT },
     TrayMenu(POINT),
     Drag { fence: u64 },
+    ReturnToDesktop { fence: u64, point: POINT },
     Open { fence: u64, index: usize, explorer: bool },
     Verb { fence: u64, verb: &'static str, background: bool },
     History { fence: u64, action: HistoryAction },
@@ -85,7 +109,7 @@ pub(super) fn fence_startup_command(executable:&Path,config:&Path)->Option<Strin
 }
 
 fn pending_collection_allowed(config: &DesktopConfig, known: &HashSet<String>, key: &str) -> bool {
-    !known.contains(key) && !config.fences.iter().any(|fence| fence.is_desktop()
+    !known.contains(key) && !config.is_released_key(key) && !config.fences.iter().any(|fence| fence.is_desktop()
         && fence.members.iter().any(|member| member.eq_ignore_ascii_case(key)))
 }
 
@@ -146,6 +170,12 @@ fn window_precedes(upper: HWND, lower: HWND) -> bool {
     false
 }
 
+fn is_cloaked(hwnd:HWND)->bool {
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute,DWMWA_CLOAKED};
+    let mut cloaked=0u32;
+    unsafe{DwmGetWindowAttribute(hwnd,DWMWA_CLOAKED,(&mut cloaked as *mut u32).cast(),std::mem::size_of::<u32>()as u32)}.is_ok()&&cloaked!=0
+}
+
 pub struct DesktopHost {
     pub hwnd: HWND,
     pub config_path: PathBuf,
@@ -160,6 +190,7 @@ pub struct DesktopHost {
     icon_content_active: bool,
     shutting_down: bool,
     desktop_anchor: Option<DesktopAnchor>,
+    desktop_exposed: bool,
     loader: IconLoader,
     desktop_notify: Option<ChangeNotify>,
     guard: Option<std::process::Child>,
@@ -172,6 +203,7 @@ pub struct DesktopHost {
     drop_delegate: Option<(u64, usize, IDropTarget)>,
     drop_data: Option<IDataObject>,
     pub internal_drag: Option<(u64, Vec<String>)>,
+    pub(super) menu_input_started: Option<(u64,Instant)>,
     tray: bool,
     pub(super) tray_version4:bool,
     /// Fence whose title bar receives the fence being moved (merge as a tab).
@@ -185,8 +217,8 @@ impl DesktopHost {
         let loader = IconLoader::spawn(hwnd, WM_ICON_READY);
         let taskbar_created = unsafe { RegisterWindowMessageW(windows::core::w!("TaskbarCreated")) };
         let mut host = Self { hwnd, config_path, explorer_config, config, fences: Vec::new(), desktop_entries: Vec::new(), gfx,
-            icons: HashMap::new(), icon_clock: 0, next_icon_request: 1, icon_content_active: false, shutting_down: false, desktop_anchor: None,
-            loader, desktop_notify: None, guard: None, pending: Vec::new(), known: HashSet::new(),
+            icons: HashMap::new(), icon_clock: 0, next_icon_request: 1, icon_content_active: false, shutting_down: false, desktop_anchor: None, desktop_exposed:false,
+            loader, desktop_notify: None, guard: None, pending: Vec::new(), known: HashSet::new(), menu_input_started:None,
             taskbar_created, palette: FencePalette::new(Mode::Dark, 55), drop_delegate: None, drop_data: None, internal_drag: None, tray: false,tray_version4:false,
             merge_target: None, tab_hover: None };
         host.update_palette();
@@ -223,14 +255,15 @@ impl DesktopHost {
         self.desktop_notify = None;
         self.save_now();
         if self.config.settings.organize && self.config.settings.icons_hidden_by_zsdesk {
-            desktop::set_icons_visible(true);
-            self.config.settings.icons_hidden_by_zsdesk = false;
+            self.config.settings.icons_hidden_by_zsdesk = !desktop::set_icons_visible(true);
             self.save_now();
         }
         for fence in &mut self.fences { fence.drop = None; fence.notify = None; if !fence.hwnd.0.is_null() { let _ = unsafe { DestroyWindow(fence.hwnd) }; } }
         self.fences.clear();
         self.remove_tray();
-        if let Some(mut guard) = self.guard.take() { let _ = guard.kill(); let _ = guard.wait(); }
+        if !self.config.settings.icons_hidden_by_zsdesk {
+            if let Some(mut guard) = self.guard.take() { let _ = guard.kill(); let _ = guard.wait(); }
+        }
     }
 
     pub fn accept_icon_notification(&self, token: usize) -> bool {
@@ -335,7 +368,9 @@ impl DesktopHost {
         if !self.start_guard() { return false; }
         self.config.settings.icons_hidden_by_zsdesk = true;
         self.save_now();
-        desktop::set_icons_visible(false);
+        if desktop::set_icons_visible(false) {
+            self.config.settings.icons_hidden_by_zsdesk=false;self.save_now();return false;
+        }
         true
     }
 
@@ -386,7 +421,9 @@ impl DesktopHost {
     /// Leaves organize mode: icons return to Explorer, desktop fences are stashed.
     pub fn restore_desktop(&mut self) {
         if !self.config.settings.organize { return; }
-        desktop::set_icons_visible(true);
+        if !desktop::set_icons_visible(true) {
+            self.notify_error("系统桌面图标尚未恢复，已保留桌面格子和恢复进程，请稍后重试。");return;
+        }
         self.config.settings.organize = false;
         self.config.settings.icons_hidden_by_zsdesk = false;
         let (desktop_fences, rest): (Vec<Fence>, Vec<Fence>) = std::mem::take(&mut self.config.fences).into_iter().partition(|f| f.is_desktop());
@@ -394,7 +431,7 @@ impl DesktopHost {
         self.config.stash = desktop_fences;
         self.save_now();
         self.sync_windows();
-        if let Some(mut guard) = self.guard.take() { let _ = guard.kill(); }
+        if let Some(mut guard) = self.guard.take() { let _ = guard.kill(); let _=guard.wait(); }
     }
 
     pub fn new_desktop_fence(&mut self, at: Option<POINT>) {
@@ -488,11 +525,13 @@ impl DesktopHost {
         self.config.settings.hidden = !self.config.settings.hidden;
         let show = if self.config.settings.hidden { SW_HIDE } else { SW_SHOWNOACTIVATE };
         for f in &self.fences {
+            if f.standalone { continue; }
             if !self.config.settings.hidden && self.config.fence(f.id).is_some_and(Fence::is_hidden_tab) { continue; }
             let _ = unsafe { ShowWindow(f.hwnd, show) };
             if !self.config.settings.hidden && f.peek { unsafe { SetTimer(Some(f.hwnd), TIMER_PEEK, 250, None); } }
         }
-        if self.config.settings.hidden { self.release_hidden_graphics(); } else { self.render_all(); }
+        if self.config.settings.hidden { self.release_hidden_graphics(); }
+        self.render_all();
         self.schedule_save();
     }
 
@@ -508,14 +547,25 @@ impl DesktopHost {
 
     /// Creates missing fence windows and destroys windows of removed fences.
     pub fn sync_windows(&mut self) {
-        let ids: HashSet<u64> = self.config.fences.iter().map(|f| f.id).collect();
+        let ids: HashSet<u64> = self.config.fences.iter().chain(self.config.released_items.iter().filter(|_| self.config.settings.organize)).map(|f| f.id).collect();
         self.fences.retain_mut(|w| {
             let keep = ids.contains(&w.id) && unsafe { IsWindow(Some(w.hwnd)) }.as_bool();
             if !keep { w.drop = None; w.notify = None; if !w.hwnd.0.is_null() { let _ = unsafe { DestroyWindow(w.hwnd) }; } }
             keep
         });
-        let missing: Vec<u64> = self.config.fences.iter().map(|f| f.id).filter(|id| !self.fences.iter().any(|w| w.id == *id)).collect();
-        for id in missing { self.create_window(id); }
+        let missing: Vec<u64> = ids.into_iter().filter(|id| !self.fences.iter().any(|w| w.id == *id)).collect();
+        let mut failures=Vec::new();
+        for id in missing { if let Err(error)=self.create_window(id,false) {failures.push((id,error));break;} }
+        if !failures.is_empty() {
+            // A failed custom window must never leave its desktop items
+            // suppressed behind FWF_NOICONS. Native icons are the recovery
+            // surface, and the saved grouping is retained in the stash.
+            let hidden_desktop=self.config.settings.organize&&failures.iter().any(|(id,_)|
+                self.config.fence(*id).is_some_and(Fence::is_desktop));
+            if hidden_desktop {self.restore_desktop();}
+            self.notify_error(&format!("无法显示部分桌面项目：{}{}",failures[0].1,
+                if hidden_desktop&&!self.config.settings.organize{"；已恢复系统桌面图标，原分组布局仍保留。"}else{""}));
+        }
         for i in 0..self.config.fences.len() {
             let id = self.config.fences[i].id;
             if self.config.fences[i].is_desktop() { continue; }
@@ -526,15 +576,15 @@ impl DesktopHost {
 
     /// Shows each group's active tab at the group position and hides the others.
     fn apply_visibility(&mut self) {
-        if self.config.settings.hidden { return; }
         for i in 0..self.fences.len() {
+            if self.config.settings.hidden && !self.fences[i].standalone { continue; }
             let id = self.fences[i].id;
             let Some(fence) = self.config.fence(id).cloned() else { continue };
             let hwnd = self.fences[i].hwnd;
             let shown = unsafe { IsWindowVisible(hwnd) }.as_bool();
             if !fence.is_hidden_tab() && !shown {
                 self.fences[i].peek = false;
-                let r = to_screen(&fence.placement, fence.collapsed);
+                let r = if self.fences[i].standalone { item_screen_rect(&fence.placement) } else { to_screen(&fence.placement, fence.collapsed) };
                 let _ = unsafe { SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE) };
                 self.fences[i].dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
                 self.render(id);
@@ -732,18 +782,29 @@ impl DesktopHost {
             .map(|f| entry(&f.title.replace('&', "&&"), &format!("switch-tab-{}", f.id), true, Some(f.id) == active)).collect())
     }
 
-    fn create_window(&mut self, id: u64) {
-        let Some(fence) = self.config.fence(id) else { return };
-        let rect = to_screen(&fence.placement, fence.collapsed);
+    fn create_window(&mut self, id: u64, require_item:bool) -> Result<(),String> {
+        let Some(fence) = self.config.fence(id) else { return Err("桌面项目配置不存在".into()) };
+        let rect = if self.config.is_released(id) { item_screen_rect(&fence.placement) } else { to_screen(&fence.placement, fence.collapsed) };
         let class: Vec<u16> = FENCE_CLASS.encode_utf16().chain(Some(0)).collect();
         let title: Vec<u16> = fence.title.encode_utf16().chain(Some(0)).collect();
         let owner = desktop::progman();
         let instance = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None) }.ok().map(|m| windows::Win32::Foundation::HINSTANCE(m.0));
-        let Ok(hwnd) = (unsafe { CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW, PCWSTR(class.as_ptr()), PCWSTR(title.as_ptr()), WS_POPUP,
-            rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, owner, None, instance, None) }) else { return };
+        let hwnd = unsafe { CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW, PCWSTR(class.as_ptr()), PCWSTR(title.as_ptr()), WS_POPUP,
+            rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, owner, None, instance, None) }.map_err(|error|error.to_string())?;
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, id as isize); }
         let mut win = FenceWin::new(id);
         win.hwnd = hwnd;
+        win.standalone = self.config.is_released(id);
+        if win.standalone { win.entries = fence.members.iter().filter_map(|key| desktop::entry_from_parsing_name(key)).collect(); }
+        if win.standalone {
+            if win.entries.len()!=1 {
+                let _=unsafe{DestroyWindow(hwnd)};
+                return if require_item {Err("桌面项目已移动或不可用".into())}else{Ok(())};
+            }
+            if let Err(error)=unsafe { SetPropW(hwnd, windows::core::w!("ZSDesk.DesktopItem"), Some(windows::Win32::Foundation::HANDLE(1usize as *mut _))) } {
+                let _=unsafe{DestroyWindow(hwnd)};return Err(error.to_string());
+            }
+        }
         super::fence::apply_glass(hwnd);
         win.dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
         // The suggested rectangle used the monitor DPI; recompute if the window got another one.
@@ -751,13 +812,22 @@ impl DesktopHost {
         win.drop = unsafe { zsdesk_windows::ole::DropRegistration::register(hwnd, handler) }.ok();
         self.fences.push(win);
         super::set_z(hwnd, HWND_BOTTOM);
-        if !self.config.settings.hidden && !fence_hidden_tab(&self.config, id) { let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) }; }
-        self.render(id);
+        if !self.render(id) {
+            if let Some(index)=self.win_index(id) {let mut failed=self.fences.remove(index);failed.drop=None;failed.notify=None;}
+            let _=unsafe{DestroyWindow(hwnd)};return Err("桌面图标绘制资源不足".into());
+        }
+        if (!self.config.settings.hidden || self.config.is_released(id)) && !fence_hidden_tab(&self.config, id) { let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) }; }
+        Ok(())
     }
 
     /// Places every fence directly above `desktop` (the raised "显示桌面" WorkerW
     /// or Progman), skipping topmost windows so fences never cover applications.
     pub fn raise_above(&mut self, desktop: HWND) {
+        self.desktop_exposed=true;
+        self.place_above_desktop(desktop);
+    }
+
+    fn place_above_desktop(&mut self, desktop: HWND) {
         let Some(mut anchor) = DesktopAnchor::capture(desktop) else { return };
         // Progman may receive activation while a previously raised WorkerW
         // still covers it. Keep the higher verified desktop window as anchor.
@@ -765,7 +835,6 @@ impl DesktopHost {
             if window_precedes(previous.hwnd, anchor.hwnd) { anchor = previous; }
         }
         self.desktop_anchor = Some(anchor);
-        if self.config.settings.hidden { return; }
         let desktop = anchor.hwnd;
         let mut after = unsafe { GetWindow(desktop, GW_HWNDPREV) }.unwrap_or_default();
         while !after.0.is_null() && (unsafe { GetWindowLongPtrW(after, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0 != 0 || self.fences.iter().any(|f| f.hwnd == after)) {
@@ -776,45 +845,60 @@ impl DesktopHost {
     }
 
     pub fn lower_all(&mut self, foreground: HWND) {
-        if self.config.settings.hidden || !unsafe { IsWindow(Some(foreground)) }.as_bool() { return; }
-        let Some(anchor) = self.desktop_anchor.filter(|anchor| anchor.valid()) else {
-            self.desktop_anchor = None;
-            for fence in &self.fences { super::set_z(fence.hwnd, HWND_BOTTOM); }
-            return;
-        };
-        // Preserve the desktop layer after an application gains foreground.
-        // HWND_BOTTOM would put owned fences behind a still-raised WorkerW.
-        if window_precedes(foreground, anchor.hwnd) { self.raise_above(anchor.hwnd); return; }
-        // During a desktop transition the anchor can still be above the app.
-        // Keep application priority, and never join the topmost window band.
-        let after = if unsafe { GetWindowLongPtrW(foreground, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0 != 0 {
-            HWND_NOTOPMOST
-        } else { foreground };
+        let anchor=self.desktop_anchor.filter(|anchor|anchor.valid())
+            .or_else(||desktop::progman().and_then(DesktopAnchor::capture));
+        self.desktop_anchor=anchor;
+        let class=super::class_name(foreground);
+        let transient=foreground.0.is_null() || matches!(class.as_str(),"WorkerW"|"Progman"|"#32768")
+            || self.fences.iter().any(|fence|fence.hwnd==foreground)
+            || unsafe{GetWindowLongPtrW(foreground,GWL_EXSTYLE)}as u32 & WS_EX_TOPMOST.0!=0;
+        // Only a stable, explicit desktop activation grants the exposed layer.
+        // A screenshot/menu overlay may temporarily cover that desktop, but it
+        // must never turn a background desktop into the exposed desktop.
+        if self.desktop_exposed&&transient {
+            if let Some(anchor)=anchor {self.place_above_desktop(anchor.hwnd);return;}
+        }
+        self.desktop_exposed=false;
+        // Follow the bottom of the whole normal application band, not the
+        // current foreground HWND. HWND_NOTOPMOST inserts at the *front* of
+        // that band and made fences cover applications after overlay dismissal.
+        let mut after=None;let mut current=unsafe{GetTopWindow(None)}.unwrap_or_default();let mut seen=HashSet::new();
+        while !current.0.is_null()&&seen.len()<4096&&seen.insert(current.0 as usize) {
+            let class=super::class_name(current);
+            let mut rect=RECT::default();
+            if current!=self.hwnd && !self.fences.iter().any(|fence|fence.hwnd==current)
+                && !matches!(class.as_str(),"WorkerW"|"Progman")
+                && unsafe{IsWindowVisible(current)}.as_bool() && !unsafe{IsIconic(current)}.as_bool() && !is_cloaked(current)
+                && unsafe{GetWindowLongPtrW(current,GWL_EXSTYLE)}as u32 & WS_EX_TOPMOST.0==0
+                && unsafe{GetWindowRect(current,&mut rect)}.is_ok() && rect.right>rect.left && rect.bottom>rect.top {after=Some(current);}
+            current=unsafe{GetWindow(current,GW_HWNDNEXT)}.unwrap_or_default();
+        }
+        if after.is_none(){if let Some(anchor)=anchor{self.place_above_desktop(anchor.hwnd);return;}}
+        let after=after.unwrap_or(HWND_BOTTOM);
         for fence in &self.fences { super::set_z(fence.hwnd, after); }
     }
 
     /// Owner activation and popup menus can reorder Progman's owned windows
     /// without a foreground event from another application.
     pub fn repair_layer(&mut self) {
-        if self.config.settings.hidden { return; }
         let anchor = self.desktop_anchor.filter(|value| value.valid())
             .or_else(|| desktop::progman().and_then(DesktopAnchor::capture));
-        let Some(anchor) = anchor else { return };
         let foreground = unsafe { GetForegroundWindow() };
         let class = super::class_name(foreground);
-        if !foreground.0.is_null() && !class.starts_with("ZSDesk.")
-            && !matches!(class.as_str(), "WorkerW" | "Progman" | "#32768") {
-            self.lower_all(foreground);
-        } else {
-            self.raise_above(anchor.hwnd);
+        self.desktop_anchor=anchor;
+        if matches!(class.as_str(),"WorkerW"|"Progman") {
+            // Screenshot and task-switching windows can briefly activate the
+            // shell while closing. Wait for the foreground to settle first.
+            super::schedule_desktop_raise(self.hwnd);
         }
+        self.lower_all(foreground);
     }
 
     pub fn place_all(&mut self) {
         for i in 0..self.fences.len() {
             let id = self.fences[i].id;
             let Some(fence) = self.config.fence(id) else { continue };
-            let r = to_screen(&fence.placement, self.fences[i].collapsed(fence));
+            let r = if self.fences[i].standalone { item_screen_rect(&fence.placement) } else { to_screen(&fence.placement, self.fences[i].collapsed(fence)) };
             let _ = unsafe { SetWindowPos(self.fences[i].hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE) };
             self.fences[i].dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(self.fences[i].hwnd) }.max(96);
         }
@@ -824,17 +908,16 @@ impl DesktopHost {
     pub fn win_index(&self, id: u64) -> Option<usize> { self.fences.iter().position(|w| w.id == id) }
 
     pub fn render_all(&mut self) {
-        if self.config.settings.hidden { self.release_hidden_graphics(); return; }
         let ids: Vec<u64> = self.fences.iter().map(|w| w.id).collect();
         for id in ids { self.render(id); }
     }
 
-    pub fn render(&mut self, id: u64) {
-        if self.shutting_down { return; }
-        if self.config.settings.hidden { self.release_hidden_graphics(); return; }
-        let Some(index) = self.win_index(id) else { return };
-        let Some(fence) = self.config.fence(id).cloned() else { return };
-        if fence.is_hidden_tab() { self.fences[index].surface = None; return; }
+    pub fn render(&mut self, id: u64) -> bool {
+        if self.shutting_down { return false; }
+        if self.config.settings.hidden && !self.config.is_released(id) { return true; }
+        let Some(index) = self.win_index(id) else { return false };
+        let Some(fence) = self.config.fence(id).cloned() else { return false };
+        if fence.is_hidden_tab() { self.fences[index].surface = None; return true; }
         let tabs = self.tab_metas(id, self.fences[index].dpi);
         let mut win = std::mem::replace(&mut self.fences[index], FenceWin::new(id));
         win.tabs = tabs;
@@ -844,7 +927,7 @@ impl DesktopHost {
         self.icon_clock = self.icon_clock.wrapping_add(1);
         let tick = self.icon_clock;
         let (gfx, icons, loader, next_request) = (&self.gfx, &mut self.icons, &self.loader, &mut self.next_icon_request);
-        win.render(gfx, &fence, &palette, show_counts, |entry, px| {
+        let presented=win.render(gfx, &fence, &palette, show_counts, |entry, px| {
             let key = (entry.key.clone(), px);
             let signature = (entry.size, entry.modified);
             let slot = icons.entry(key).or_insert_with(|| IconSlot::new(signature, tick));
@@ -863,6 +946,7 @@ impl DesktopHost {
         });
         self.fences[index] = win;
         self.prune_icon_cache();
+        presented
     }
 
     pub fn icons_ready(&mut self) {
@@ -895,8 +979,8 @@ impl DesktopHost {
 
     fn visible_icon_keys(&self) -> HashSet<IconKey> {
         let mut keys = HashSet::new();
-        if self.config.settings.hidden { return keys; }
         for win in &self.fences {
+            if self.config.settings.hidden && !win.standalone { continue; }
             let Some(fence) = self.config.fence(win.id) else { continue };
             if win.collapsed(fence) || fence.is_hidden_tab() { continue; }
             let geometry = win.geometry(fence);
@@ -911,7 +995,7 @@ impl DesktopHost {
     }
 
     fn prune_icon_cache(&mut self) {
-        let active = !self.config.settings.hidden && self.fences.iter().any(|w| self.config.fence(w.id).is_some_and(|f| !w.collapsed(f) && !f.is_hidden_tab()));
+        let active = self.fences.iter().any(|w| (!self.config.settings.hidden || w.standalone) && self.config.fence(w.id).is_some_and(|f| !w.collapsed(f) && !f.is_hidden_tab()));
         if !active {
             self.icons.clear();
             self.loader.retain_requests(&HashSet::new());
@@ -926,6 +1010,12 @@ impl DesktopHost {
     }
 
     fn release_hidden_graphics(&mut self) {
+        if self.fences.iter().any(|window| window.standalone) {
+            for window in self.fences.iter_mut().filter(|window|!window.standalone) {
+                window.surface=None; let _=unsafe { KillTimer(Some(window.hwnd),TIMER_PEEK) };
+            }
+            self.prune_icon_cache(); return;
+        }
         self.icons.clear();
         self.loader.retain_requests(&HashSet::new());
         self.gfx.release_device_resources();
@@ -983,7 +1073,7 @@ impl DesktopHost {
     fn refresh_desktop_entries(&mut self) {
         self.desktop_entries = desktop::enumerate_desktop();
         let mut known: HashSet<String> = self.desktop_entries.iter().map(|e| e.key.to_lowercase()).collect();
-        for key in self.config.fences.iter().filter(|f| f.is_desktop()).flat_map(|f| &f.members) {
+        for key in self.config.fences.iter().chain(&self.config.released_items).filter(|f| f.is_desktop()).flat_map(|f| &f.members) {
             if known.contains(&key.to_lowercase()) { continue; }
             if let Some(entry) = desktop::entry_from_parsing_name(key) {
                 if let Some(existing) = self.desktop_entries.iter_mut().find(|e| e.pidl == entry.pidl) {
@@ -1018,7 +1108,7 @@ impl DesktopHost {
             for (fence, key) in assignments { self.config.assign(fence, &[key], None); self.schedule_save(); }
         }
         let infos: Vec<ItemInfo> = self.desktop_entries.iter().map(item_info).collect();
-        let groups = distribute(&self.config.fences, &infos);
+        let groups = self.config.distributed_items(&infos);
         for (fence, indices) in self.config.fences.iter().zip(groups) {
             if !fence.is_desktop() { continue; }
             if let Some(win) = self.fences.iter_mut().find(|w| w.id == fence.id) {
@@ -1029,8 +1119,88 @@ impl DesktopHost {
                 win.clamp_scroll(fence);
             }
         }
-        let ids: Vec<u64> = self.config.fences.iter().filter(|f| f.is_desktop()).map(|f| f.id).collect();
+        for item in &self.config.released_items {
+            if let Some(win) = self.fences.iter_mut().find(|win| win.id == item.id) {
+                let entries: Vec<_> = self.desktop_entries.iter().filter(|entry| item.members.iter().any(|key| key.eq_ignore_ascii_case(&entry.key))).cloned().collect();
+                win.entries = entries;
+                win.selection.retain(|key| win.entries.iter().any(|entry| entry.key == *key));
+                win.focus = win.focus.filter(|index| *index < win.entries.len());
+            }
+        }
+        let ids: Vec<u64> = self.config.fences.iter().chain(&self.config.released_items).filter(|f| f.is_desktop()).map(|f| f.id).collect();
         for id in ids { self.render(id); }
+    }
+
+    /// Publish only items that already exist. This changes visual membership,
+    /// never deletes, copies or moves filesystem objects.
+    pub(super) fn release_desktop_keys(&mut self, keys: &[String], point: POINT) -> Result<usize,String> {
+        if !self.config.settings.organize {
+            return if desktop::icons_visible(){Ok(keys.len())}else{Err("系统桌面图标当前不可见，未完成移回桌面。".into())};
+        }
+        let original=self.config.clone();
+        let original_ids:HashSet<u64>=self.fences.iter().map(|window|window.id).collect();
+        let monitor = monitor_from_point(point);
+        let width = 96;
+        let height = 104;
+        let work_width=unscale(monitor.work.right-monitor.work.left,monitor.dpi);
+        let work_height=unscale(monitor.work.bottom-monitor.work.top,monitor.dpi);
+        let origin=Bounds::new(unscale(point.x-monitor.work.left,monitor.dpi),unscale(point.y-monitor.work.top,monitor.dpi),width,height);
+        let mut occupied:Vec<Bounds>=self.config.fences.iter().chain(&self.config.released_items)
+            .filter(|item|item.placement.monitor==monitor.name && !item.is_hidden_tab()
+                && !item.members.iter().any(|member|keys.iter().any(|key|member.eq_ignore_ascii_case(key))))
+            .map(|item|Bounds::new(item.placement.x,item.placement.y,item.placement.width,if item.collapsed{TITLE_H}else{item.placement.height})).collect();
+        let mut planned=Vec::new();let mut unique=HashSet::new();
+        for key in keys {
+            if !unique.insert(key.to_lowercase()){continue;}
+            if desktop::entry_from_parsing_name(key).is_none() {
+                self.config=original;self.refresh_desktop();
+                let unseen=keys.iter().any(|key|!self.fences.iter().any(|window|
+                    unsafe{IsWindowVisible(window.hwnd)}.as_bool()&&window.entries.iter().any(|entry|entry.key.eq_ignore_ascii_case(key))));
+                if unseen&&self.config.settings.icons_hidden_by_zsdesk {self.restore_desktop();}
+                return Err("所选项目已移动或不可用，未更改分组。".into());
+            }
+            let position=desktop_item_position(origin,work_width,work_height,&occupied);
+            let placement = Placement { monitor: monitor.name.clone(), x:position.x, y:position.y,width,height };
+            planned.push(self.config.release_item(key.clone(), placement));
+            occupied.push(position);
+        }
+        let publish=(||->Result<(),String>{
+            // All new windows must allocate and present successfully before
+            // membership is saved or the old groups are repainted.
+            for &id in &planned {
+                if self.win_index(id).is_none(){self.create_window(id,true)?;}
+            }
+            self.place_all();self.refresh_desktop();
+            for &id in &planned {
+                let Some(index)=self.win_index(id)else{return Err("桌面图标窗口未能创建".into());};
+                if self.fences[index].entries.len()!=1 || !self.render(id)
+                    || !unsafe{IsWindowVisible(self.fences[index].hwnd)}.as_bool() {
+                    return Err("桌面图标未能显示，分组调整已撤回。".into());
+                }
+            }
+            self.config.normalize();
+            save_config(&self.config_path,&self.config).map_err(|error|format!("无法保存桌面布局：{error}"))?;
+            Ok(())
+        })();
+        if let Err(error)=publish {
+            self.config=original;
+            self.fences.retain_mut(|window|{
+                if original_ids.contains(&window.id){return true;}
+                window.drop=None;window.notify=None;
+                if !window.hwnd.0.is_null(){let _=unsafe{DestroyWindow(window.hwnd)};}
+                false
+            });
+            self.place_all();self.refresh_desktop();
+            // A moved file may not have existed in the old desktop snapshot.
+            // If neither a surviving group nor a loose icon represents it,
+            // restore the native recovery surface rather than hide the file.
+            let unseen=keys.iter().any(|key|!self.fences.iter().any(|window|
+                unsafe{IsWindowVisible(window.hwnd)}.as_bool()&&window.entries.iter().any(|entry|entry.key.eq_ignore_ascii_case(key))));
+            if unseen&&self.config.settings.icons_hidden_by_zsdesk {self.restore_desktop();}
+            return Err(error);
+        }
+        let _=unsafe{KillTimer(Some(self.hwnd),TIMER_SAVE)};
+        self.repair_layer();Ok(planned.len())
     }
 
     pub fn refresh_folder(&mut self, id: u64) {
@@ -1247,6 +1417,10 @@ impl DesktopHost {
         let Some(index) = self.win_index(id) else { return After::Nothing };
         let Some(fence) = self.config.fence(id).cloned() else { return After::Nothing };
         self.commit_rename_if_any(id);
+        if self.config.is_released(id) && self.fences[index].selection.is_empty() && unsafe { GetKeyState(VK_CONTROL.0 as i32) } >= 0 {
+            let others:Vec<u64>=self.fences.iter_mut().filter(|window|window.standalone&&window.id!=id).map(|window|{window.selection.clear();window.focus=None;window.id}).collect();
+            for other in others { self.render(other); }
+        }
         let win = &mut self.fences[index];
         let g = win.geometry(&fence);
         let hit = g.hit(point.x, point.y, win.dpi, fence.locked, win.collapsed(&fence));
@@ -1313,6 +1487,8 @@ impl DesktopHost {
         let Some(index) = self.win_index(id) else { return After::Nothing };
         let win = &mut self.fences[index];
         let interaction = win.interaction.take();
+        let collapse_desktop_selection=win.standalone&&matches!(&interaction,Some(Interaction::Press{..}))
+            &&unsafe{GetKeyState(VK_CONTROL.0 as i32)}>=0&&unsafe{GetKeyState(VK_SHIFT.0 as i32)}>=0;
         if unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() } == win.hwnd {
             let _ = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture() };
         }
@@ -1348,6 +1524,11 @@ impl DesktopHost {
             _ => {}
         }
         let _ = point;
+        if collapse_desktop_selection {
+            let others:Vec<_>=self.fences.iter_mut().filter(|window|window.standalone&&window.id!=id)
+                .map(|window|{window.selection.clear();window.focus=None;window.id}).collect();
+            for other in others { self.render(other); }
+        }
         self.render(id);
         After::Nothing
     }
@@ -1362,8 +1543,21 @@ impl DesktopHost {
     }
 
     pub fn right_click(&mut self, id: u64, point: POINT) -> After {
+        self.menu_input_started=Some((id,Instant::now()));
         let Some(index) = self.win_index(id) else { return After::Nothing };
         let Some(fence) = self.config.fence(id).cloned() else { return After::Nothing };
+        let clear_others={
+            let window=&self.fences[index];
+            match window.geometry(&fence).hit(point.x,point.y,window.dpi,true,window.collapsed(&fence)) {
+                FenceHit::Item(item)=>window.standalone&&!window.selection.contains(&window.entries[item].key),
+                _=>false,
+            }
+        };
+        if clear_others {
+            let changed:Vec<_>=self.fences.iter_mut().filter(|window|window.standalone&&window.id!=id&&!window.selection.is_empty())
+                .map(|window|{window.selection.clear();window.focus=None;window.id}).collect();
+            for other in changed {self.render(other);}
+        }
         let win = &mut self.fences[index];
         let g = win.geometry(&fence);
         let mut screen = point;
@@ -1382,6 +1576,7 @@ impl DesktopHost {
                 if tab != id { self.switch_tab(tab); }
                 After::FenceMenu { fence: tab, point: screen }
             }
+            _ if win.standalone => After::Nothing,
             _ => After::FenceMenu { fence: id, point: screen },
         }
     }
@@ -1393,6 +1588,22 @@ impl DesktopHost {
         let g = win.geometry(&fence);
         let mut client = screen;
         let _ = unsafe { windows::Win32::Graphics::Gdi::ScreenToClient(win.hwnd, &mut client) };
+        if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 && g.content.contains(client.x, client.y) && win.rename.is_none() {
+            let steps = zoom_steps(&mut win.zoom_remainder, delta);
+            if steps == 0 { return; }
+            let anchor = g.cells.iter().position(|cell| cell.cell.contains(client.x, client.y)).or(win.focus);
+            let next = zoom_icon_size(fence.icon_size, steps);
+            if let Some(model) = self.config.fence_mut(id) { model.icon_size = next; model.view = FenceView::Icons; }
+            if let Some(model) = self.config.fence(id) {
+                let changed = win.geometry(model);
+                if let Some(cell) = anchor.and_then(|index| changed.cells.get(index)) {
+                    win.scroll = (win.scroll + cell.cell.y - client.y).max(0);
+                }
+                win.clamp_scroll(model);
+            }
+            self.schedule_save(); self.render(id); return;
+        }
+        win.zoom_remainder = 0;
         if win.tabbed() && client.y >= 0 && client.y < g.title.height {
             if delta != 0 { self.cycle_tab(id, if delta < 0 { 1 } else { -1 }); }
             return;
@@ -1404,15 +1615,35 @@ impl DesktopHost {
 
     pub fn key(&mut self, id: u64, key: u16) -> After {
         use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        let input_started=Instant::now();
         let Some(index) = self.win_index(id) else { return After::Nothing };
         let Some(fence) = self.config.fence(id).cloned() else { return After::Nothing };
         let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
         let alt = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
+        if !ctrl&&!alt&&(key==VK_APPS.0 || (key==VK_F10.0&&shift)) {
+            self.menu_input_started=Some((id,input_started));
+            let window=&self.fences[index];let geometry=window.geometry(&fence);
+            let cell=window.focus.and_then(|item|geometry.cells.get(item)).map(|cell|cell.cell).unwrap_or(geometry.content);
+            let mut point=POINT{x:cell.x+cell.width.min(32)/2,y:cell.y+cell.height.min(32)/2};
+            let _=unsafe{windows::Win32::Graphics::Gdi::ClientToScreen(window.hwnd,&mut point)};
+            return if window.selection.is_empty(){After::FenceMenu{fence:id,point}}else{After::ItemMenu{fence:id,point}};
+        }
+        if self.config.is_released(id)&&key==VK_ESCAPE.0 {
+            let changed:Vec<_>=self.fences.iter_mut().filter(|window|window.standalone&&!window.selection.is_empty())
+                .map(|window|{window.selection.clear();window.focus=None;window.id}).collect();
+            for other in changed {self.render(other);}return After::Nothing;
+        }
         if let Some(action) = history_shortcut(key, ctrl, shift, alt) {
             return After::History { fence: id, action };
         }
         if ctrl && key == VK_TAB.0 { self.cycle_tab(id, if shift { -1 } else { 1 }); return After::Nothing; }
+        if self.config.is_released(id) && ctrl && !alt && key==VK_A.0 {
+            let ids:Vec<u64>=self.fences.iter_mut().filter(|window|window.standalone).map(|window|{
+                window.change_selection(if shift{SelectionChange::Invert}else{SelectionChange::All});window.id
+            }).collect();
+            for id in ids { self.render(id); } return After::Nothing;
+        }
         let win = &mut self.fences[index];
         let count = win.entries.len();
         let k = VIRTUAL_KEY(key);
@@ -1800,6 +2031,7 @@ impl DesktopHost {
                 if let Some(target) = id[8..].parse::<u64>().ok() {
                     let keys = self.selected_keys(fid);
                     self.config.assign(target, &keys, None);
+                    self.sync_windows();
                     self.schedule_save();
                     self.refresh_desktop();
                 }
@@ -1807,9 +2039,12 @@ impl DesktopHost {
             "unassign" => {
                 let keys = self.selected_keys(fid);
                 for f in &mut self.config.fences { f.members.retain(|m| !keys.contains(m)); }
+                self.config.released_items.retain(|item| !item.members.iter().any(|key|keys.contains(key)));
+                self.sync_windows();
                 self.schedule_save();
                 self.refresh_desktop();
             }
+            "return-desktop" => return After::ReturnToDesktop { fence: fid, point },
             "open-in-fence" => if let Some(path) = self.focused_entry(fid).and_then(|e| e.path.clone()) { self.browse_into(fid, path); },
             "open-in-zsdesk" => if let Some(e) = self.focused_entry(fid).cloned() { self.open_entry_in_explorer(&e); },
             _ => {}
@@ -1821,6 +2056,9 @@ impl DesktopHost {
         let Some(fence) = self.config.fence(id) else { return Vec::new() };
         let mut items = Vec::new();
         let focused = self.focused_entry(id);
+        if !self.config.is_released(id) {
+            items.push(entry("移回桌面", "return-desktop", !self.selected_keys(id).is_empty(), false));
+        }
         if focused.is_some_and(|e| e.is_container() && e.path.is_some()) {
             if !fence.is_desktop() { items.push(entry("在格子中打开", "open-in-fence", true, false)); }
             items.push(entry(if crate::edition::DESKTOP_ONLY{"在系统资源管理器中打开"}else{"在 ZSDesk 中打开"}, "open-in-zsdesk", true, false));
@@ -1849,11 +2087,18 @@ impl DesktopHost {
     }
 
     pub fn selected_keys(&self, id: u64) -> Vec<String> {
+        if self.config.is_released(id) { return self.fences.iter().filter(|window|window.standalone).flat_map(|window|window.selected_entries().into_iter().map(|entry|entry.key.clone())).collect(); }
         self.win_index(id).map(|i| self.fences[i].entries.iter().filter(|e| self.fences[i].selection.contains(&e.key)).map(|e| e.key.clone()).collect()).unwrap_or_default()
     }
 
     pub fn selected_pidls(&self, id: u64) -> Vec<Vec<u8>> {
+        if self.config.is_released(id) { return self.fences.iter().filter(|window|window.standalone).flat_map(|window|window.selected_entries().into_iter().map(|entry|entry.pidl.clone())).collect(); }
         self.win_index(id).map(|i| self.fences[i].selected_entries().into_iter().map(|e| e.pidl.clone()).collect()).unwrap_or_default()
+    }
+
+    pub(super) fn selected_entries_owned(&self,id:u64)->Vec<ShellEntry> {
+        if self.config.is_released(id) { self.fences.iter().filter(|window|window.standalone).flat_map(|window|window.selected_entries().into_iter().cloned()).collect() }
+        else { self.win_index(id).map(|index|self.fences[index].selected_entries().into_iter().cloned().collect()).unwrap_or_default() }
     }
 
     pub fn focused_entry(&self, id: u64) -> Option<&ShellEntry> {
@@ -1920,6 +2165,9 @@ impl DesktopHost {
                 return Some(DropSpot { hover: i, tab: None, into: id, target: desktop::item_drop_target(win.hwnd, &entry.pidl).ok(), own: false });
             }
         }
+        // A loose file is not a fence-sized destination. Only actual folder
+        // or application drop targets above may accept a drop onto its icon.
+        if win.standalone { return None; }
         let tab = match hit { FenceHit::Tab(i) if win.tabs[i].id != id => Some(i), _ => None };
         let into = tab.map_or(id, |i| win.tabs[i].id);
         let into_fence = self.config.fence(into)?;
@@ -2114,11 +2362,15 @@ fn unscale(v: i32, dpi: u32) -> i32 { ((v as i64 * 96 + dpi as i64 / 2) / dpi as
 
 /// Placement (DIP relative to a monitor work area) → screen rectangle.
 pub fn to_screen(p: &Placement, collapsed: bool) -> RECT {
+    screen_rect(p, collapsed, false)
+}
+pub(super) fn item_screen_rect(p: &Placement) -> RECT { screen_rect(p, false, true) }
+fn screen_rect(p: &Placement, collapsed: bool, item: bool) -> RECT {
     let list = monitors();
     let m = list.iter().find(|m| m.name == p.monitor).cloned().unwrap_or_else(primary_monitor);
     let s = |v: i32| scale(v, m.dpi);
-    let w = s(p.width.max(MIN_FENCE_W)).min(m.work.right - m.work.left);
-    let h = if collapsed { s(TITLE_H) } else { s(p.height.max(MIN_FENCE_H)).min(m.work.bottom - m.work.top) };
+    let w = s(p.width.max(if item { 72 } else { MIN_FENCE_W })).min(m.work.right - m.work.left);
+    let h = if collapsed { s(TITLE_H) } else { s(p.height.max(if item { 84 } else { MIN_FENCE_H })).min(m.work.bottom - m.work.top) };
     let x = (m.work.left + s(p.x)).clamp(m.work.left, (m.work.right - w).max(m.work.left));
     let y = (m.work.top + s(p.y)).clamp(m.work.top, (m.work.bottom - h).max(m.work.top));
     RECT { left: x, top: y, right: x + w, bottom: y + h }
@@ -2150,6 +2402,27 @@ pub fn save_config(path: &Path, config: &DesktopConfig) -> std::io::Result<()> {
 mod shortcut_tests {
     use super::*;
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_C, VK_Y, VK_Z};
+    #[test]
+    fn fence_control_wheel_accumulates_and_clamps_icon_zoom() {
+        let mut remainder=0;
+        assert_eq!(zoom_steps(&mut remainder,60),0);
+        assert_eq!(zoom_steps(&mut remainder,60),1);
+        assert_eq!(zoom_icon_size(IconSize::Medium,1),IconSize::Large);
+        assert_eq!(zoom_icon_size(IconSize::Large,16),IconSize::Large);
+        assert_eq!(zoom_steps(&mut remainder,-240),-2);
+        assert_eq!(zoom_icon_size(IconSize::Large,-2),IconSize::Small);
+        assert_eq!(zoom_icon_size(IconSize::Small,-16),IconSize::Small);
+    }
+    #[test]
+    fn loose_desktop_icon_placement_avoids_fences_and_stays_on_monitor() {
+        let origin=Bounds::new(100,100,96,104);
+        let occupied=vec![Bounds::new(0,0,192,208)];
+        let cell=desktop_item_position(origin,800,600,&occupied);
+        assert!(cell.x>=192||cell.y>=208);
+        assert!(cell.x>=0&&cell.y>=0&&cell.right()<=800&&cell.bottom()<=600);
+        let outside=desktop_item_position(Bounds::new(-500,900,96,104),800,600,&[]);
+        assert_eq!((outside.x,outside.y),(0,496));
+    }
     #[test]
     fn fence_startup_command_binds_the_exact_profile() {
         let exe=Path::new(r"C:\Apps\ZSDesk Theme\ZSDesk.exe");
@@ -2217,5 +2490,78 @@ mod memory_tests {
         let mut icons: HashMap<_,_> = (0..500u64).map(|i| ((i.to_string(),48),IconSlot::new((None,None),i))).collect();
         trim_cold_icons(&mut icons,&HashSet::new());
         assert_eq!(icons.len(),MAX_COLD_ICONS);
+    }
+}
+
+#[cfg(test)]
+mod desktop_publish_tests {
+    use super::*;
+    use anyhow::{Context,ensure};
+    use std::{ffi::c_void,fs,thread};
+    #[link(name="user32")]unsafe extern "system" {
+        fn CreateDesktopW(name:*const u16,device:*const u16,mode:*const c_void,flags:u32,access:u32,attributes:*const c_void)->*mut c_void;
+        fn SetThreadDesktop(desktop:*mut c_void)->i32;
+        fn CloseDesktop(desktop:*mut c_void)->i32;
+    }
+    struct Apartment;
+    impl Drop for Apartment {fn drop(&mut self){unsafe{windows::Win32::System::Ole::OleUninitialize();}}}
+    struct FixtureHost(DesktopHost);
+    impl Drop for FixtureHost {fn drop(&mut self){
+        self.0.loader.shutdown();
+        for window in &mut self.0.fences {window.drop=None;window.notify=None;let _=unsafe{DestroyWindow(window.hwnd)};}
+        self.0.fences.clear();let _=unsafe{DestroyWindow(self.0.hwnd)};
+    }}
+    fn run(root:&Path)->anyhow::Result<serde_json::Value>{
+        unsafe{windows::Win32::System::Ole::OleInitialize(None)?;}let _apartment=Apartment;
+        let instance=unsafe{windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?};
+        let class:Vec<u16>=FENCE_CLASS.encode_utf16().chain(Some(0)).collect();
+        unsafe{RegisterClassW(&WNDCLASSW{lpfnWndProc:Some(super::super::fence_proc),hInstance:windows::Win32::Foundation::HINSTANCE(instance.0),lpszClassName:PCWSTR(class.as_ptr()),..Default::default()});}
+        let hwnd=unsafe{CreateWindowExW(WS_EX_NOACTIVATE,windows::core::w!("STATIC"),PCWSTR::null(),WS_POPUP,0,0,1,1,None,None,None,None)}?;
+        let files=root.join("files");fs::create_dir_all(&files)?;
+        let keys:Vec<String>=(0..3).map(|index|files.join(format!("fixture-{index}.txt")).to_string_lossy().into_owned()).collect();
+        for key in &keys {fs::write(key,b"desktop-publish-fixture")?;}
+        let mut config=DesktopConfig::default();config.settings.organize=true;config.settings.icons_hidden_by_zsdesk=false;config.settings.hide_tray=true;
+        let mut group=Fence::new(1,"Owned fixture",FenceSource::Desktop,Placement{x:20,y:20,width:320,height:240,..Default::default()});
+        group.members=keys.clone();group.catch_all=true;config.fences.push(group);config.next_id=2;
+        let mut fixture=FixtureHost(DesktopHost::new(hwnd,root.join("profile/desktop-fences.json"),root.join("profile/explorer-session.json"),config,Gfx::new("Segoe UI")?));
+        let host=&mut fixture.0;
+        host.create_window(1,false).map_err(anyhow::Error::msg)?;host.refresh_desktop();
+        ensure!(host.release_desktop_keys(&keys[..2],POINT{x:500,y:300}).map_err(anyhow::Error::msg)?==2,"two loose icons were not published");
+        let ids:Vec<_>=host.config.released_items.iter().map(|item|item.id).collect();
+        ensure!(ids.len()==2,"released membership missing");
+        for &id in &ids {let index=host.win_index(id).context("published window")?;let key=host.fences[index].entries[0].key.clone();host.fences[index].selection.insert(key);}
+        let first=host.win_index(ids[0]).unwrap();let window=&host.fences[first];let geometry=window.geometry(host.config.fence(ids[0]).unwrap());
+        let point=POINT{x:geometry.cells[0].icon.x+4,y:geometry.cells[0].icon.y+4};
+        host.mouse_down(ids[0],point,false);
+        let action=host.mouse_move(ids[0],POINT{x:point.x+40,y:point.y});
+        ensure!(matches!(action,After::Drag{..})&&host.selected_entries_owned(ids[0]).len()==2,"drag collapsed a multi-selection");
+        let _=unsafe{windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture()};
+        let window=&host.fences[host.win_index(ids[0]).unwrap()];let mut screen=point;
+        unsafe{windows::Win32::Graphics::Gdi::ClientToScreen(window.hwnd,&mut screen)}.ok()?;
+        ensure!(host.drop_target_at(ids[0],screen).is_none(),"ordinary loose file accepted a fence-membership drop");
+        let before=host.config.clone();let windows=host.fences.len();let blocker=root.join("not-a-directory");fs::write(&blocker,b"blocker")?;
+        host.config_path=blocker.join("desktop-fences.json");
+        ensure!(host.release_desktop_keys(&keys[2..],POINT{x:700,y:300}).is_err(),"failed save was reported as successful release");
+        ensure!(host.config==before&&host.fences.len()==windows,"failed publish did not restore configuration and windows");
+        let group=host.fences.iter().find(|window|window.id==1).context("original group")?;
+        ensure!(group.entries.iter().any(|entry|entry.key.eq_ignore_ascii_case(&keys[2])),"rollback hid original grouped item");
+        for key in &keys {ensure!(fs::read(key)?==b"desktop-publish-fixture","visual transaction changed a file");}
+        Ok(serde_json::json!({"published_icons_visible":true,"multi_selection_drag_preserved":true,"ordinary_file_rejects_membership_drop":true,
+            "failed_save_rolls_back_windows_and_membership":true,"files_unchanged":true,"real_desktop_modified":false}))
+    }
+    #[test]
+    #[ignore="Native loose-icon transaction and selection test on private desktop; requires ZSDESK_NATIVE_TEST_OUTPUT"]
+    fn native_released_icons_publish_transaction_preserves_files_and_selection()->anyhow::Result<()> {
+        let root=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("isolated output")?).join("desktop-publish");
+        ensure!(root.is_absolute(),"absolute output required");fs::create_dir_all(&root)?;
+        let name:Vec<u16>=format!("ZSDesk.Publish.{}",std::process::id()).encode_utf16().chain(Some(0)).collect();
+        let desktop=unsafe{CreateDesktopW(name.as_ptr(),std::ptr::null(),std::ptr::null(),0,0x000f00ff,std::ptr::null())};
+        ensure!(!desktop.is_null(),"private desktop creation failed");let raw=desktop as usize;let output=root.clone();
+        let result=thread::spawn(move||->anyhow::Result<serde_json::Value>{ensure!(unsafe{SetThreadDesktop(raw as*mut c_void)}!=0,"private desktop attach failed");run(&output)})
+            .join().map_err(|_|anyhow::anyhow!("desktop transaction test panicked")).and_then(|result|result);
+        let closed=unsafe{CloseDesktop(desktop)}!=0;
+        let report=serde_json::json!({"state":if result.is_ok()&&closed{"passed"}else{"failed"},"checks":result.as_ref().map_err(|error|format!("{error:#}")),"desktop_closed":closed});
+        fs::write(root.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;
+        result?;ensure!(closed,"private desktop did not close");Ok(())
     }
 }

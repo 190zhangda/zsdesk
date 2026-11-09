@@ -228,9 +228,13 @@ pub struct ChromeLayout {
     pub tree: Rect,
     pub splitter: Rect,
     pub browser: Rect,
+    pub other_browser: Rect,
+    pub pane_splitter: Rect,
+    pub pane_headers: [Rect; 2],
     pub status: Rect,
     pub status_details: Rect,
     pub status_tiles: Rect,
+    pub status_dual_pane: Rect,
     /// Bottom of the top chrome (start of the content area).
     pub top: i32,
 }
@@ -257,8 +261,11 @@ pub enum Hit {
     BookmarkOverflow,
     BookmarksBar,
     Splitter,
+    PaneSplitter,
+    PaneHeader(usize),
     StatusDetails,
     StatusTiles,
+    StatusDualPane,
     Status,
 }
 
@@ -414,6 +421,7 @@ impl ChromeLayout {
         let toggle = Rect::clamped(0, status_y + (status_h - s(22)) / 2, s(28), s(22));
         layout.status_tiles = Rect { x: width - s(8) - toggle.width, ..toggle };
         layout.status_details = Rect { x: layout.status_tiles.x - s(2) - toggle.width, ..toggle };
+        layout.status_dual_pane = Rect { x: layout.status_details.x - s(2) - toggle.width, ..toggle };
         let content_h = (status_y - layout.top).max(0);
         if input.show_tree && width > s(MIN_TREE_W) * 2 {
             let tree_w = input.tree_width.clamp(s(MIN_TREE_W), (width / 2).max(s(MIN_TREE_W)));
@@ -441,7 +449,7 @@ impl ChromeLayout {
             layout.new_tab=Rect::clamped(x+s(6),(layout.tab_panel.bottom()-row-s(4)).max(layout.tab_panel.y),panel_width-s(12),row);
             for rect in [&mut layout.nav_row,&mut layout.back,&mut layout.forward,&mut layout.up,&mut layout.refresh,&mut layout.address,&mut layout.search,
                 &mut layout.command_row,&mut layout.bookmarks_row,&mut layout.bookmark_overflow,&mut layout.tree,&mut layout.splitter,&mut layout.browser,
-                &mut layout.status,&mut layout.status_details,&mut layout.status_tiles]{rect.x+=content_offset;}
+                &mut layout.status,&mut layout.status_details,&mut layout.status_tiles,&mut layout.status_dual_pane]{rect.x+=content_offset;}
             for (_,rect) in &mut layout.commands{rect.x+=content_offset;}
             for rect in layout.bookmarks.iter_mut().chain(layout.separators.iter_mut()){rect.x+=content_offset;}
             layout.search_panel.translate_x(content_offset);
@@ -481,9 +489,14 @@ impl ChromeLayout {
             return Hit::BookmarksBar;
         }
         if self.splitter.contains(x, y) { return Hit::Splitter; }
+        if self.pane_splitter.contains(x, y) { return Hit::PaneSplitter; }
+        for (index, rect) in self.pane_headers.iter().enumerate() {
+            if rect.contains(x, y) { return Hit::PaneHeader(index); }
+        }
         if !self.status.is_empty() && self.status.contains(x, y) {
             if self.status_details.contains(x, y) { return Hit::StatusDetails; }
             if self.status_tiles.contains(x, y) { return Hit::StatusTiles; }
+            if self.status_dual_pane.contains(x, y) { return Hit::StatusDualPane; }
             return Hit::Status;
         }
         Hit::None

@@ -18,11 +18,60 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <cstdint>
+#include <strsafe.h>
 #include "MenuSelectionSnapshot.h"
 #include "MenuCommandBridge.h"
 #include "MenuCommandDispatch.h"
 #include "MixedItemMenu.h"
 #include "MenuModelFilter.h"
+
+// Installed only by an isolated menu worker. Record a last-chance fault without
+// attempting to continue in a process whose native extension state is corrupt.
+static HANDLE gFaultReport=INVALID_HANDLE_VALUE;
+static LPTOP_LEVEL_EXCEPTION_FILTER gPreviousFaultFilter=nullptr;
+static volatile LONG gFaultReporting=0;
+static LONG WINAPI ReportMenuFault(EXCEPTION_POINTERS* pointers) noexcept {
+    if(InterlockedCompareExchange(&gFaultReporting,1,0)!=0)return EXCEPTION_CONTINUE_SEARCH;
+    if(gFaultReport!=INVALID_HANDLE_VALUE&&pointers&&pointers->ExceptionRecord){
+        const auto record=pointers->ExceptionRecord;
+        HMODULE module=nullptr;
+        const bool known=GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(record->ExceptionAddress),&module)!=FALSE;
+        wchar_t fullName[1024]{};char name[768]="unavailable",escaped[1536]{};
+        const DWORD length=known?GetModuleFileNameW(module,fullName,static_cast<DWORD>(std::size(fullName))):0;
+        if(length&&length<std::size(fullName)){
+            const wchar_t* base=fullName;
+            for(const wchar_t* current=fullName;*current;++current)if(*current==L'\\'||*current==L'/')base=current+1;
+            if(!WideCharToMultiByte(CP_UTF8,0,base,-1,name,static_cast<int>(std::size(name)),nullptr,nullptr))
+                StringCchCopyA(name,std::size(name),"unavailable");
+        }
+        size_t next=0;
+        for(size_t index=0;name[index]&&next+2<std::size(escaped);++index){
+            const unsigned char value=static_cast<unsigned char>(name[index]);
+            if(value=='"'||value=='\\')escaped[next++]='\\';
+            escaped[next++]=value<32?'?':static_cast<char>(value);
+        }
+        char json[2048]{};
+        const auto address=reinterpret_cast<ULONG_PTR>(record->ExceptionAddress);
+        const auto offset=known?address-reinterpret_cast<ULONG_PTR>(module):0;
+        if(SUCCEEDED(StringCchPrintfA(json,std::size(json),
+                "{\"exception_code\":\"0x%08lX\",\"address\":\"0x%llX\",\"module\":\"%s\",\"module_known\":%s,\"module_offset\":\"0x%llX\"}\n",
+                record->ExceptionCode,static_cast<unsigned long long>(address),escaped,known?"true":"false",static_cast<unsigned long long>(offset)))){
+            DWORD written=0;WriteFile(gFaultReport,json,static_cast<DWORD>(strlen(json)),&written,nullptr);FlushFileBuffers(gFaultReport);
+        }
+    }
+    const auto previous=gPreviousFaultFilter;
+    if(previous&&previous!=ReportMenuFault)previous(pointers);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+extern "C" HRESULT zs_menu_install_fault_report(PCWSTR path) noexcept {
+    if(!path||!*path)return E_INVALIDARG;
+    if(gFaultReport!=INVALID_HANDLE_VALUE)return S_OK;
+    HANDLE file=CreateFileW(path,GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_DELETE,nullptr,CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,nullptr);
+    if(file==INVALID_HANDLE_VALUE)return HRESULT_FROM_WIN32(GetLastError());
+    gFaultReport=file;gPreviousFaultFilter=SetUnhandledExceptionFilter(ReportMenuFault);return S_OK;
+}
 
 extern "C" HRESULT zs_menu_for_mixed_items(HWND owner,UINT count,PCIDLIST_ABSOLUTE const* pidls,IContextMenu** out) noexcept {
     try{return mixed_menu::Create(owner,count,pidls,out);}
@@ -276,6 +325,7 @@ class Session final : public IServiceProvider, public IOleWindow, public NativeC
     void** originalPresenterTable_=nullptr;
     void* presenterTable_[11]{};
     bool standalone_=false;
+    bool cancelRequested_=false;
     menu_dispatch::Completion standaloneCompletion_;
     menu_dispatch::Result standaloneResult_;
     std::vector<UINT> standaloneApplications_;
@@ -307,6 +357,13 @@ public:
     DWORD Thread()const{return thread_;}
     bool OwnsPresenter(Presenter* presenter)const{return presenter==presenter_&&!retiring_;}
     bool IsOpen()const{return !retiring_&&presenter_&&presenter_->IsContextMenuOpen();}
+    bool Cancelled()const{return cancelRequested_;}
+    HRESULT Dismiss(){
+        if(retiring_||!presenter_)return S_FALSE;
+        cancelRequested_=true;
+        Microsoft::WRL::ComPtr<Presenter> keep(presenter_);
+        keep->DismissContextMenu(L"Request cancelled");return S_OK;
+    }
     void ConfigureStandalone(HWND owner,HMENU extra,POINT point,const UINT* applications,UINT applicationCount,
             uint32_t intercept,menu_dispatch::BeforeInvoke before,void* beforeContext){
         standalone_=true;standaloneCompletion_={};standaloneResult_={};standalonePoint_=point;standaloneOwner_=owner;
@@ -319,7 +376,7 @@ public:
     }
     bool StandaloneDone()const{return standaloneCompletion_.done||retiring_;}
     menu_dispatch::Completion::Wait StandaloneWait(bool ownerAlive,bool quitting,bool open,ULONGLONG now){
-        return standaloneCompletion_.Poll(ownerAlive&&!retiring_,quitting,open,now);
+        return standaloneCompletion_.Poll(ownerAlive&&!retiring_,quitting||cancelRequested_,open,now);
     }
     menu_dispatch::Result StandaloneResult()const{return standaloneResult_;}
     POINT StandalonePoint()const{return standalonePoint_;}
@@ -632,6 +689,11 @@ extern "C" void zs_menu_set_original_callback(OriginalMenuCallback callback) noe
 // command on the right owner window.
 extern "C" BOOL zs_menu_is_open(HWND owner) noexcept {
     return active&&active->CommandWindow()==owner&&active->IsOpen();
+}
+extern "C" HRESULT zs_menu_dismiss_active(HWND owner) noexcept {
+    if(!active||active->CommandWindow()!=owner||active->Thread()!=GetCurrentThreadId())return S_FALSE;
+    struct Hold{Session* value;explicit Hold(Session* session):value(session){value->AddRef();}~Hold(){value->Release();}} keep(active);
+    try{return keep.value->Dismiss();}catch(...){return E_UNEXPECTED;}
 }
 extern "C" uint64_t zs_menu_command_messages() noexcept {return gCommandMessages;}
 struct ZsMenuDiagnostics {
