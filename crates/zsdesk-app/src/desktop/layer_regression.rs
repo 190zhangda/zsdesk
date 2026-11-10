@@ -49,6 +49,18 @@ fn exercise(root:&PathBuf)->Result<serde_json::Value>{
     let overlay=show(None,w!("ZSDesk.Layer.Overlay"),WS_EX_TOPMOST|WS_EX_NOACTIVATE,instance,&mut windows)?;
     host.lower_all(overlay);ensure!(host.desktop_exposed&&window_precedes(overlay,fence)&&window_precedes(fence,desktop),"capture from exposed desktop changed the desktop band");
     host.lower_all(second);ensure!(!host.desktop_exposed&&window_precedes(first,fence)&&window_precedes(second,fence),"switching back to an application retained raised fences");
+    // A visible desktop-class window between applications that does not cover
+    // them (a leftover Show Desktop surface, a small Shell helper) is not the
+    // desktop on screen. Activating it, directly or as a retained anchor when
+    // the real desktop is clicked, must not show the fences over `first`.
+    let helper=show(None,w!("WorkerW"),WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,instance,&mut windows)?;
+    let _=unsafe{SetWindowPos(helper,None,30,30,120,40,SWP_NOZORDER|SWP_NOACTIVATE)};
+    crate::desktop::set_z(desktop,HWND_BOTTOM);crate::desktop::set_z(second,HWND_TOP);crate::desktop::set_z(helper,second);crate::desktop::set_z(first,helper);
+    ensure!(window_precedes(second,helper)&&window_precedes(helper,first)&&window_precedes(first,desktop),"helper fixture order");
+    host.raise_above(helper);
+    ensure!(!host.desktop_exposed&&window_precedes(first,fence)&&window_precedes(second,fence),"a non-covering desktop helper raised fences over an application");
+    host.raise_above(desktop);
+    ensure!(window_precedes(first,fence)&&window_precedes(second,fence)&&window_precedes(fence,desktop),"a retained non-covering anchor raised fences over an application");
     host.fences.clear();host.loader.shutdown();host.gfx.release_device_resources();
     Ok(serde_json::json!({"topmost_overlay_cannot_raise_background_fences":true,"cancel_without_foreground_is_safe":true,
         "all_normal_apps_remain_above_fences":true,"show_desktop_preserved":true,"capture_on_exposed_desktop_preserved":true,

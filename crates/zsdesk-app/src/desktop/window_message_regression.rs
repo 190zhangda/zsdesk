@@ -113,12 +113,14 @@ fn management(host:&OwnedHost)->Result<serde_json::Value>{
         MenuItemSpec::Submenu{menu,..}=>ids(menu,out),_=>{}
     }}}
     let mut commands=Vec::new();ids(&spec,&mut commands);
-    for id in ["folder-system-menu","rename","delete","lock","collapse","new-folder-fence","new-tab-folder","icons-large","theme-dark","autostart","select-none"]{
+    for id in ["paste","folder-system-menu","rename","delete","lock","collapse","new-folder-fence","new-tab-folder","icons-large","theme-dark","autostart","select-none"]{
         ensure!(commands.iter().any(|command|command==id),"management command missing: {id}");
     }
     ensure!(spec.items.iter().any(|item|matches!(item,MenuItemSpec::Submenu{label,..}if label=="所选项目")),"selected-item management submenu missing");
     let deferred=with_host(|state|state.menu_command(Some(1),"folder-system-menu",point)).context("background command routing")?;
     ensure!(matches!(deferred,After::FolderSystemMenu{fence:1,..}),"folder system menu did not use its explicit route");
+    let pasted=with_host(|state|state.menu_command(Some(1),"paste",point)).context("paste command routing")?;
+    ensure!(matches!(pasted,After::Verb{fence:1,verb:"paste",background:true}),"fence paste did not use the background paste route");
     MANAGEMENT_INDEX.with(|value|value.set(None));MANAGEMENT_ENTERED.with(|value|value.set(false));
     let before=zsdesk_windows::shell::menu_diagnostics();
     unsafe{windows::Win32::UI::Shell::SetWindowSubclass(owner,Some(management_probe),MANAGEMENT_SUBCLASS,0)}.ok()?;

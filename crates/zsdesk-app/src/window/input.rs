@@ -30,6 +30,7 @@ impl WindowState {
         match command {
             Command::NewTab => unsafe { self.new_tab(ShellLocation::ThisPc) },
             Command::CloseTab => unsafe { self.close_tab(self.session.active_tab) },
+            Command::CloseOtherTabs => if self.session.tabs.len() > 1 { unsafe { self.close_group(self.session.active_tab, false) } },
             Command::ReopenTab => unsafe { self.reopen_tab() },
             Command::NextTab | Command::PreviousTab => {
                 let delta = if command == Command::NextTab { 1 } else { -1 };

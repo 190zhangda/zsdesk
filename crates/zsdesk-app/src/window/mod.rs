@@ -1365,7 +1365,7 @@ pub(super) fn colorref(c: zsdesk_ui::theme::Color) -> u32 {
 fn accelerator_table() -> Vec<ACCEL> {
     let mut table: Vec<(ACCEL_VIRT_FLAGS, VIRTUAL_KEY, Command)> = vec![
         (FCONTROL | FVIRTKEY, VK_T, Command::NewTab), (FCONTROL | FVIRTKEY, VK_W, Command::CloseTab),
-        (FCONTROL | FVIRTKEY, VK_F4, Command::CloseTab),
+        (FCONTROL | FVIRTKEY, VK_F4, Command::CloseTab), (FCONTROL | FALT | FVIRTKEY, VK_W, Command::CloseOtherTabs),
         (FCONTROL | FSHIFT | FVIRTKEY, VK_T, Command::ReopenTab), (FCONTROL | FVIRTKEY, VK_TAB, Command::NextTab),
         (FCONTROL | FSHIFT | FVIRTKEY, VK_TAB, Command::PreviousTab), (FALT | FVIRTKEY, VK_LEFT, Command::Back),
         (FALT | FVIRTKEY, VK_RIGHT, Command::Forward), (FALT | FVIRTKEY, VK_UP, Command::Up),

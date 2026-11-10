@@ -172,6 +172,19 @@ fn window_precedes(upper: HWND, lower: HWND) -> bool {
     false
 }
 
+fn virtual_screen()->RECT {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics,SM_XVIRTUALSCREEN,SM_YVIRTUALSCREEN,SM_CXVIRTUALSCREEN,SM_CYVIRTUALSCREEN};
+    let (x,y)=unsafe{(GetSystemMetrics(SM_XVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN))};
+    RECT{left:x,top:y,right:x+unsafe{GetSystemMetrics(SM_CXVIRTUALSCREEN)},bottom:y+unsafe{GetSystemMetrics(SM_CYVIRTUALSCREEN)}}
+}
+fn intersect(a:RECT,b:RECT)->Option<RECT> {
+    let rect=RECT{left:a.left.max(b.left),top:a.top.max(b.top),right:a.right.min(b.right),bottom:a.bottom.min(b.bottom)};
+    (rect.right>rect.left&&rect.bottom>rect.top).then_some(rect)
+}
+fn contains(outer:RECT,inner:RECT)->bool {
+    outer.left<=inner.left&&outer.top<=inner.top&&outer.right>=inner.right&&outer.bottom>=inner.bottom
+}
+
 fn is_cloaked(hwnd:HWND)->bool {
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute,DWMWA_CLOAKED};
     let mut cloaked=0u32;
@@ -839,11 +852,21 @@ impl DesktopHost {
     fn place_above_desktop(&mut self, desktop: HWND) {
         let Some(mut anchor) = DesktopAnchor::capture(desktop) else { return };
         // Progman may receive activation while a previously raised WorkerW
-        // still covers it. Keep the higher verified desktop window as anchor.
+        // still covers it. Keep the higher verified desktop window as anchor,
+        // but only while it still hides the applications beneath it.
         if let Some(previous) = self.desktop_anchor.filter(|value| value.valid()) {
-            if window_precedes(previous.hwnd, anchor.hwnd) { anchor = previous; }
+            if window_precedes(previous.hwnd, anchor.hwnd) && self.covers_applications_below(previous.hwnd) { anchor = previous; }
         }
         self.desktop_anchor = Some(anchor);
+        // A desktop-class window in the middle of the application band that
+        // leaves applications beneath it visible (a leftover Show Desktop
+        // surface, a small Shell helper) is not the desktop on screen. Fences
+        // above it would cover those applications.
+        if !self.covers_applications_below(anchor.hwnd) {
+            self.desktop_exposed = false;
+            self.place_below_applications(Some(anchor));
+            return;
+        }
         let desktop = anchor.hwnd;
         let mut after = unsafe { GetWindow(desktop, GW_HWNDPREV) }.unwrap_or_default();
         while !after.0.is_null() && (unsafe { GetWindowLongPtrW(after, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0 != 0 || self.fences.iter().any(|f| f.hwnd == after)) {
@@ -868,18 +891,43 @@ impl DesktopHost {
             if let Some(anchor)=anchor {self.place_above_desktop(anchor.hwnd);return;}
         }
         self.desktop_exposed=false;
-        // Follow the bottom of the whole normal application band, not the
-        // current foreground HWND. HWND_NOTOPMOST inserts at the *front* of
-        // that band and made fences cover applications after overlay dismissal.
+        self.place_below_applications(anchor);
+    }
+
+    /// A visible, on-screen, non-topmost window of another application.
+    fn application_window(&self, window: HWND) -> Option<RECT> {
+        let mut rect=RECT::default();
+        (window!=self.hwnd && !self.fences.iter().any(|fence|fence.hwnd==window)
+            && !matches!(super::class_name(window).as_str(),"WorkerW"|"Progman")
+            && unsafe{IsWindowVisible(window)}.as_bool() && !unsafe{IsIconic(window)}.as_bool() && !is_cloaked(window)
+            && unsafe{GetWindowLongPtrW(window,GWL_EXSTYLE)}as u32 & WS_EX_TOPMOST.0==0
+            && unsafe{GetWindowRect(window,&mut rect)}.is_ok() && rect.right>rect.left && rect.bottom>rect.top).then_some(rect)
+    }
+
+    /// Whether `desktop` hides every application window below it, so fences
+    /// placed directly above it cannot appear over an application.
+    fn covers_applications_below(&self, desktop: HWND) -> bool {
+        let mut cover=RECT::default();
+        if unsafe{GetWindowRect(desktop,&mut cover)}.is_err() { return false; }
+        let screen=virtual_screen();
+        let mut current=unsafe{GetWindow(desktop,GW_HWNDNEXT)}.unwrap_or_default();let mut seen=HashSet::new();
+        while !current.0.is_null()&&seen.len()<4096&&seen.insert(current.0 as usize) {
+            // Maximized frames extend past the monitor; only the visible part counts.
+            if let Some(rect)=self.application_window(current).and_then(|rect|intersect(rect,screen)) {
+                if !contains(cover,rect) { return false; }
+            }
+            current=unsafe{GetWindow(current,GW_HWNDNEXT)}.unwrap_or_default();
+        }
+        true
+    }
+
+    /// Follow the bottom of the whole normal application band, not the
+    /// current foreground HWND. HWND_NOTOPMOST inserts at the *front* of
+    /// that band and made fences cover applications after overlay dismissal.
+    fn place_below_applications(&mut self, anchor: Option<DesktopAnchor>) {
         let mut after=None;let mut current=unsafe{GetTopWindow(None)}.unwrap_or_default();let mut seen=HashSet::new();
         while !current.0.is_null()&&seen.len()<4096&&seen.insert(current.0 as usize) {
-            let class=super::class_name(current);
-            let mut rect=RECT::default();
-            if current!=self.hwnd && !self.fences.iter().any(|fence|fence.hwnd==current)
-                && !matches!(class.as_str(),"WorkerW"|"Progman")
-                && unsafe{IsWindowVisible(current)}.as_bool() && !unsafe{IsIconic(current)}.as_bool() && !is_cloaked(current)
-                && unsafe{GetWindowLongPtrW(current,GWL_EXSTYLE)}as u32 & WS_EX_TOPMOST.0==0
-                && unsafe{GetWindowRect(current,&mut rect)}.is_ok() && rect.right>rect.left && rect.bottom>rect.top {after=Some(current);}
+            if self.application_window(current).is_some() {after=Some(current);}
             current=unsafe{GetWindow(current,GW_HWNDNEXT)}.unwrap_or_default();
         }
         if after.is_none(){if let Some(anchor)=anchor{self.place_above_desktop(anchor.hwnd);return;}}
@@ -1861,6 +1909,9 @@ impl DesktopHost {
         let s = &self.config.settings;
         let tabbed = self.config.tab_ids(id).len() > 1;
         let mut items = Vec::new();
+        // The folder's Shell background menu has no DefView, so it lacks Paste;
+        // keep the fence's own Ctrl+V reachable with the mouse.
+        items.push(entry("粘贴\tCtrl+V", "paste", self.target_folder(id).is_some(), false));
         items.push(entry("文件夹系统菜单…", "folder-system-menu", self.target_folder(id).is_some(), false));
         let selected=self.win_index(id).is_some_and(|index|!self.fences[index].selection.is_empty());
         if selected{items.push(submenu("所选项目",self.item_menu_items(id)));}
@@ -1948,7 +1999,9 @@ impl DesktopHost {
             entry("文件夹格子内打开子文件夹", "browse-inside", true, s.browse_inside),
             entry("鼠标悬停展开折叠的格子", "hover-expand", true, s.hover_expand),
             entry("隐藏托盘图标", "hide-tray", true, s.hide_tray),
-            entry("开机自动启动", "autostart", true, autostart),
+            // Only the fences: the file manager window has its own login switch
+            // in its settings menu, so the two can be chosen independently.
+            entry("登录 Windows 时启动桌面格子", "autostart", true, autostart),
             MenuItemSpec::Separator,
             entry(if crate::edition::DESKTOP_ONLY{"打开系统资源管理器"}else{"打开 ZSDesk 文件管理器"}, "open-zsdesk", true, false),
             entry("退出桌面格子", "quit", true, false),
@@ -1970,6 +2023,7 @@ impl DesktopHost {
         let fid = fence_id.unwrap_or(0);
         match id {
             "folder-system-menu" if self.target_folder(fid).is_some()=>return After::FolderSystemMenu{fence:fid,point},
+            "paste" if self.target_folder(fid).is_some()=>return After::Verb{fence:fid,verb:"paste",background:true},
             "new-fence" => self.new_desktop_fence(Some(point)),
             "new-folder-fence" => return After::PickFolder { replace: None },
             "change-folder" => return After::PickFolder { replace: Some(fid) },

@@ -26,7 +26,7 @@ use windows::{
                 HMENU, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_DRAWITEM, WM_INITMENUPOPUP,
                 WM_MEASUREITEM, WM_MENUCHAR, TPM_LEFTALIGN, TPM_TOPALIGN, TRACK_POPUP_MENU_FLAGS,
                 GetMenuStringW, GetMenuState, DeleteMenu, MF_BYPOSITION, MF_BYCOMMAND, MF_DISABLED, MF_GRAYED, MF_SEPARATOR,
-                WM_CONTEXTMENU, WM_NCDESTROY, GetCursorPos, GetWindowRect,
+                WM_CONTEXTMENU, WM_NCDESTROY, GetCursorPos, GetWindowRect, SetForegroundWindow,
             },
             Input::KeyboardAndMouse::{GetKeyState, VK_SHIFT, VK_CONTROL},
         },
@@ -115,6 +115,12 @@ fn decode_native_result(result: NativeMenuResult, applications: &[u32]) -> Resul
         5 => Some(MenuOutcome::ShellInvoked), 6 => None, 7 => Some(MenuOutcome::NativeHandled),
         _ => return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000ffffu32 as i32))),
     })
+}
+/// Mixed fence menus carry application IDs that only the public
+/// TrackPopupMenu contract preserves; Shift-extended menus are classic, as in
+/// Explorer.
+fn uses_modern_presenter(modern: bool, extended: bool, application_count: usize, background: bool, has_folder: bool) -> bool {
+    modern && !extended && application_count == 0 && (!background || has_folder)
 }
 fn can_fall_back_before_presentation(status: windows::core::HRESULT, result: NativeMenuResult) -> bool {
     status.is_err() && result.phase == 0
@@ -372,12 +378,15 @@ pub fn forward_menu_message(msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT>
 pub struct ShellMenu {
     menu: IContextMenu,
     hmenu: HMENU,
+    /// Populated for Shift+right-click. Explorer answers that gesture with the
+    /// classic menu directly; the Windows 11 presenter is never involved.
+    extended: Cell<bool>,
 }
 
 impl ShellMenu {
     pub fn new(menu: IContextMenu) -> Result<Self> {
         let hmenu = unsafe { CreatePopupMenu()? };
-        Ok(Self { menu, hmenu })
+        Ok(Self { menu, hmenu, extended: Cell::new(false) })
     }
 
     /// A snapshot of absolute identities, including mixed-folder selections.
@@ -411,6 +420,7 @@ impl ShellMenu {
         let mut flags = CMF_NORMAL | CMF_EXPLORE | CMF_ASYNCVERBSTATE;
         if rename { flags |= CMF_CANRENAME; }
         if extended { flags |= CMF_EXTENDEDVERBS; }
+        self.extended.set(extended);
         unsafe { self.menu.QueryContextMenu(self.hmenu, 0, SHELL_FIRST, SHELL_LAST, flags) }.ok()
     }
 
@@ -472,7 +482,7 @@ impl ShellMenu {
         // IContextMenu. Keep those IDs and that exact interface together through
         // TrackPopupMenu/InvokeCommand; the private Win11 presenter can rebuild
         // the command model and cannot preserve this public dispatch contract.
-        if context_menu_options().modern && application_count == 0 && (!background || folder.is_some()) {
+        if uses_modern_presenter(context_menu_options().modern, self.extended.get(), application_count, background, folder.is_some()) {
             if let Ok(count) = u32::try_from(pidls.len()) {
                 self.filter(self.hmenu, &context_menu_options());
                 let identifiers: Vec<*const ITEMIDLIST> = pidls.iter().map(|pidl| pidl.as_ptr().cast()).collect();
@@ -486,6 +496,10 @@ impl ShellMenu {
                 drop(active);
                 if result.is_ok() {
                     if let Some(action) = decode_native_result(outcome, &applications)? { return Ok(action); }
+                    // "Show more options": the closing XAML popup took the
+                    // foreground, and TrackPopupMenuEx needs its owner in front
+                    // for the classic menu to open and to dismiss normally.
+                    unsafe { let _ = SetForegroundWindow(owner); }
                 } else if !can_fall_back_before_presentation(result, outcome) {
                     // After presentation or invocation has started, retrying a
                     // second menu could execute a user's file operation twice.
@@ -745,6 +759,15 @@ mod presenter_tests {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+    #[test]
+    fn shift_extended_menus_never_use_the_windows11_presenter() {
+        assert!(uses_modern_presenter(true, false, 0, false, false));
+        assert!(!uses_modern_presenter(true, true, 0, false, false), "Shift+right-click must open the classic menu directly");
+        assert!(!uses_modern_presenter(true, true, 0, true, true));
+        assert!(!uses_modern_presenter(false, false, 0, false, false));
+        assert!(!uses_modern_presenter(true, false, 2, false, false), "application IDs need the public menu contract");
+        assert!(!uses_modern_presenter(true, false, 0, true, false), "a background without a folder item has no presenter target");
+    }
     #[test]
     fn missing_or_disabled_history_commands_are_not_invoked() {
         for command in [None, Some(HistoryCommand { id: 17, enabled: false })] {

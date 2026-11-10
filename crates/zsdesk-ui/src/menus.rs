@@ -20,7 +20,7 @@ pub fn tab_menu(count: usize, index: usize, can_restore: bool,locked:bool) -> Me
         entry(if locked{"解锁此标签页"}else{"锁定此标签页"},"lock",true,locked),
         MenuItemSpec::Separator,
         entry("关闭此标签页\tCtrl+W", "close", !locked, false),
-        entry("关闭其他标签页", "close-others", count > 1, false),
+        entry("关闭其他标签页\tCtrl+Alt+W", "close-others", count > 1, false),
         entry("关闭右侧标签页", "close-right", index + 1 < count, false),
         entry("重新打开关闭的标签页\tCtrl+Shift+T", "restore", can_restore, false),
     ])
