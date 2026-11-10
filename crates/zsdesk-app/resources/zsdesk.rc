@@ -12,8 +12,8 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "ZSdesk\0"
       VALUE "ProductName", "ZSdesk\0"
-      VALUE "FileVersion", "0.3.7\0"
-      VALUE "ProductVersion", "0.3.7\0"
+      VALUE "FileVersion", "0.3.8\0"
+      VALUE "ProductVersion", "0.3.8\0"
       VALUE "OriginalFilename", "ZSDesk.exe\0"
     END
   END
