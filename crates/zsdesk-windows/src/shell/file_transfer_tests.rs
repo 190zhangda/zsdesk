@@ -24,6 +24,22 @@ use windows::Win32::{Foundation::{HINSTANCE,LRESULT},System::LibraryLoader::GetM
     let mut bad=bytes;bad[..4].copy_from_slice(&u32::MAX.to_le_bytes());assert!(parse_hdrop(&bad).is_err());
     let mut relative=vec![0u8;20];relative[..4].copy_from_slice(&20u32.to_le_bytes());relative.extend(b"relative.txt\0\0");assert!(parse_hdrop(&relative).is_err());
 }
+#[test]fn zip_contents_leave_the_direct_path_to_the_shell_verb(){
+    // Items inside a zip have no filesystem path, and the zip itself is a file:
+    // both must fail the direct path so the caller uses the folder's Shell verb.
+    let _=unsafe{windows::Win32::System::Com::CoInitializeEx(None,windows::Win32::System::Com::COINIT_APARTMENTTHREADED)};
+    let root=std::env::temp_dir().join(format!("zsdesk-zip-direct-{}",std::process::id()));fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("inner.txt"),b"zip").unwrap();let zip=root.join("archive.zip");
+    let made=std::process::Command::new("powershell").args(["-NoProfile","-Command","Compress-Archive -LiteralPath $args[0] -DestinationPath $args[1]"])
+        .arg(root.join("inner.txt")).arg(&zip).status().is_ok_and(|status|status.success());
+    if made{
+        let inner:Result<IShellItem>=unsafe{SHCreateItemFromParsingName(PCWSTR(wide(&zip.join("inner.txt")).as_ptr()),None)};
+        if let Ok(inner)=inner{assert!(item_path(&inner).is_err(),"a zip entry reported a filesystem path");}
+        let hwnd=HWND::default();
+        assert!(paste(hwnd,&zip).is_err(),"the direct paste accepted a zip file as its folder");
+    }
+    let _=fs::remove_dir_all(&root);
+}
 #[test]fn hdrop_parser_rejects_excess_items_in_a_single_pass(){
     let mut bytes=vec![0u8;20];bytes[..4].copy_from_slice(&20u32.to_le_bytes());
     for _ in 0..=MAX_ITEMS{bytes.extend(b"E:\\a\0");}bytes.push(0);

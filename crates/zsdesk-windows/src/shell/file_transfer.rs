@@ -183,7 +183,8 @@ fn parse_hdrop(bytes:&[u8])->Result<Vec<PathBuf>>{
 #[derive(Clone,Copy,Debug)]pub enum Operation{Copy,Move,Delete{permanent:bool},NewFolder}
 #[derive(Clone,Debug)]struct Request{owner:isize,thread:u32,paths:Vec<PathBuf>,destination:Option<PathBuf>,operation:Operation,clipboard:Option<u32>}
 pub fn paste(owner:HWND,destination:&Path)->Result<()>{
-    if !destination.is_absolute(){return Err(invalid("目标文件夹无效"));}
+    // An opened .zip reports its own file path; only its Shell folder can paste into it.
+    if !destination.is_absolute()||!destination.is_dir(){return Err(invalid("目标文件夹无效"));}
     let (paths,effect,sequence)=clipboard_files()?;let moving=effect&2!=0;
     submit(owner,paths,Some(destination.into()),if moving{Operation::Move}else{Operation::Copy},moving.then_some(sequence))
 }

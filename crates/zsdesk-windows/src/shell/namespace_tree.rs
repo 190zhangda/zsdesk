@@ -167,7 +167,9 @@ impl NamespaceTreeHost {
             title: "快速访问".into(),
         };
         let quick_access_added = unsafe { shell_item(&quick_access) }.is_ok_and(|item| {
-            unsafe { tree.AppendRoot(&item, enum_flags, root_style(InitialRoot::QuickAccess,initial), &filter) }.is_ok()
+            // Quick access is where the user's folders live now that This PC
+            // shows drives only; keep its pinned folders visible at startup.
+            unsafe { tree.AppendRoot(&item, enum_flags, (NSTCRS_VISIBLE.0 | NSTCRS_EXPANDED.0) as u32, &filter) }.is_ok()
         });
         if !quick_access_added {
             for folder in [&FOLDERID_Desktop, &FOLDERID_Downloads, &FOLDERID_Documents,
@@ -582,7 +584,8 @@ impl IShellItemFilter_Impl for FolderFilter_Impl {
     fn IncludeItem(&self, item: Ref<IShellItem>) -> Result<()> {
         let Some(item) = item.as_ref() else { return Err(Error::from_hresult(S_FALSE)) };
         let stream=unsafe { item.GetAttributes(SFGAO_STREAM) }.is_ok_and(|attrs|attrs.0 & SFGAO_STREAM.0 != 0);
-        if stream { Err(Error::from_hresult(S_FALSE)) } else { Ok(()) }
+        // Quick access already lists the user's folders; This PC keeps its drives.
+        if stream || super::shell_item::hidden_in_this_pc(item) { Err(Error::from_hresult(S_FALSE)) } else { Ok(()) }
     }
     fn GetEnumFlagsForItem(&self, _item: Ref<IShellItem>) -> Result<u32> { Ok(navigation_enum_flags()) }
 }

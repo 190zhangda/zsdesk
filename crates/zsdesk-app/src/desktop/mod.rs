@@ -762,11 +762,26 @@ fn tab_popup(fence: u64, point: POINT, spec: impl FnOnce(&DesktopHost) -> MenuSp
     let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
 }
 
+/// Appearance and behaviour switches of the tray menu: applied in place while
+/// the menu stays open. Everything else (windows, dialogs, quit) closes it.
+fn tray_toggle(id: &str) -> bool {
+    id.starts_with("theme-") || id.starts_with("opacity-") || matches!(id, "blur" | "browse-inside" | "hover-expand" | "autostart")
+}
+
 fn tray_menu(point: POINT) {
     apply_context_preferences();
     let Some((hwnd, spec)) = with_host(|h| (h.hwnd, h.tray_menu())) else { return };
     let _ = unsafe { SetForegroundWindow(hwnd) };
-    if let Some(id) = popup(hwnd, &spec, point) {
+    let dark = with_host(|host| host.menu_dark()).unwrap_or_else(zsdesk_windows::theme::system_dark_mode);
+    let chosen = crate::flyout_menu::show_persistent(hwnd, &spec, crate::flyout_menu::MenuAnchor::Point { x: point.x, y: point.y }, dark, &mut |id| {
+        if !tray_toggle(id) { return None; }
+        // Toggles never need modal follow-up work; a notice (autostart failure) does.
+        match with_host(|h| h.menu_command(None, id, point))? {
+            After::Nothing => with_host(|h| h.tray_menu()),
+            other => { run_after(other); None }
+        }
+    });
+    if let Some(id) = chosen.filter(|id| !tray_toggle(id)) {
         if let Some(a) = with_host(|h| h.menu_command(None, &id, point)) { run_after(a); }
     }else{with_host(|host|host.restore_tray_focus());}
     let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };

@@ -55,13 +55,18 @@ fn translate_history_then_invoke(translate: impl FnOnce() -> HRESULT, invoke: im
 /// Must run on the view's STA without holding the application state RefCell.
 pub(super) fn execute(view: &IShellView, owner: HWND, action: FileShortcut) -> Result<()> {
     use zsdesk_windows::shell::file_transfer;
-    match action{
-        FileShortcut::Copy=>return file_transfer::copy_view(view,owner,false),
-        FileShortcut::Cut=>return file_transfer::copy_view(view,owner,true),
-        FileShortcut::Paste=>return file_transfer::paste_view(view,owner),
-        FileShortcut::Delete{permanent}=>return file_transfer::delete_view(view,owner,permanent),
-        _=>{},
-    }
+    // The direct path needs filesystem paths on both sides. Items inside a zip
+    // (or another virtual folder), a zip as paste target and a clipboard that
+    // holds only virtual file contents have none: the folder's own Shell verb
+    // handles those, exactly as the toolbar buttons already do.
+    let direct=match action{
+        FileShortcut::Copy=>Some(file_transfer::copy_view(view,owner,false)),
+        FileShortcut::Cut=>Some(file_transfer::copy_view(view,owner,true)),
+        FileShortcut::Paste=>Some(file_transfer::paste_view(view,owner)),
+        FileShortcut::Delete{permanent}=>Some(file_transfer::delete_view(view,owner,permanent)),
+        _=>None,
+    };
+    if direct.is_some_and(|result|result.is_ok()){return Ok(());}
     if action == FileShortcut::InvertSelection { return zsdesk_windows::shell::commands::invert_view_selection(view); }
     if matches!(action, FileShortcut::Undo | FileShortcut::Redo) {
         let menu = ShellMenu::for_view(view, false)?;

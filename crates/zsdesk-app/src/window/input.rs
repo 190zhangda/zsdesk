@@ -218,6 +218,17 @@ impl WindowState {
         self.set_hover(hit, crumb);
     }
 
+    /// Released outside the window, or well away from the tab strip across
+    /// its axis (like browsers): the tab leaves for a new window.
+    fn tab_dragged_out(&self,p:POINT)->bool{
+        let mut client=RECT::default();let _=unsafe{GetClientRect(self.hwnd,&mut client)};
+        let outside=p.x<client.left||p.y<client.top||p.x>=client.right||p.y>=client.bottom;
+        let margin=self.s(48);
+        let away=if self.layout.vertical_tabs{let panel=self.layout.tab_panel;p.x<panel.x-margin||p.x>panel.right()+margin}
+            else{let strip=self.layout.strip;p.y<strip.y-margin||p.y>strip.bottom()+margin};
+        outside||away
+    }
+
     pub(super) fn mouse_down(&mut self, p: POINT) {
         let hit = self.layout.hit(p.x, p.y);
         if hit != Hit::Address { self.end_address_edit(); }
@@ -253,6 +264,7 @@ impl WindowState {
         if self.splitter_drag.take().is_some() { if had_capture { let _ = unsafe { ReleaseCapture() }; } self.save(); self.invalidate(); return; }
         if let Some(drag) = self.tab_drag.take() {
             if had_capture { let _ = unsafe { ReleaseCapture() }; }
+            if drag.moved && self.tab_dragged_out(p) { unsafe { self.tear_off_tab(drag.index); } return; }
             if drag.moved { self.save(); }
             return;
         }
@@ -295,6 +307,13 @@ impl WindowState {
     }
 
     pub(super) fn double_click(&mut self,p:POINT) {
+        if let Hit::Bookmark(slot)=self.layout.hit(p.x,p.y) {
+            if unsafe{self.bookmark_double_click(slot)} {
+                self.bookmark_drag=None;self.pressed=None;
+                if unsafe{GetCapture()}==self.hwnd{let _=unsafe{ReleaseCapture()};}
+                return;
+            }
+        }
         if self.session.ui.double_click_close_tab {
             if let Hit::Tab(index)=self.layout.hit(p.x,p.y) {
                 self.tab_drag=None;self.pressed=None;
@@ -546,8 +565,7 @@ impl WindowState {
         self.launch_default_terminal();
     }
 
-    unsafe fn app_menu(&mut self) {
-        self.sync_search_preferences();
+    fn app_menu_spec(&self)->MenuSpec{
         use zsdesk_windows::integration::{self, Integration};
         let state = menus::AppMenuState {
             forward_unhandled_windows:self.session.ui.forward_unhandled_windows,
@@ -555,11 +573,44 @@ impl WindowState {
             integration: match integration::current() { Integration::Off => 0, Integration::ContextMenu => 1, Integration::Default => 2 },
             modern_menu_unavailable: zsdesk_windows::shell::menu::modern_presenter_supported()==Some(false),
         };
-        let anchor = Some(self.layout.app_menu);
         // The menu shows the effective navigation expansion (system default included).
         let mut menu_ui=self.session.ui.clone();
         menu_ui.navigation_auto_expand=Some(self.navigation_auto_expand());
-        let choice = popup(self.hwnd, &menus::app_menu_with_capabilities(state, &menu_ui, crate::edition::THEMED), anchor);
+        menus::app_menu_with_capabilities(state, &menu_ui, crate::edition::THEMED)
+    }
+
+    /// Applies a checkable preference from ≡ while the menu stays open.
+    /// Actions (dialogs, windows, rebuilds) return false and close the menu.
+    fn apply_menu_toggle(&mut self,id:&str)->bool{
+        if id.starts_with("context-menu-") || id.starts_with("context-action-") {
+            if menus::apply_context_menu_setting(&mut self.session.ui.context_menu,id){
+                self.modern=crate::context_preferences::modern(&self.session.ui.context_menu);
+                let options=crate::context_preferences::native(&self.session.ui.context_menu);
+                zsdesk_windows::shell::menu::set_context_menu_options(options.clone());
+                if let Some(browser)=&self.browser{browser.set_context_menu_options(options);}
+                self.save();
+            }
+            return true;
+        }
+        if id.starts_with("appearance-") { if crate::edition::THEMED { self.apply_appearance_choice(id); } return true; }
+        if id=="integration-forward-unhandled" {
+            self.session.ui.forward_unhandled_windows=!self.session.ui.forward_unhandled_windows;self.save();
+            let _=crate::quick_search::start_if_enabled(&self.config_path);return true;
+        }
+        if !menus::interface_action(id) && menus::apply_interface_setting(&mut self.session.ui.clone(), id) {
+            if id=="navigation-auto-expand" {self.session.ui.navigation_auto_expand=Some(self.navigation_auto_expand());}
+            self.apply_interface_choice(id);
+            return true;
+        }
+        false
+    }
+
+    unsafe fn app_menu(&mut self) {
+        self.sync_search_preferences();
+        let anchor = Some(self.layout.app_menu);
+        let spec=self.app_menu_spec();let hwnd=self.hwnd;
+        // Toggles are applied inside; only an action closes the menu and reaches the match.
+        let choice = popup_persistent(hwnd, &spec, anchor, &mut |id| self.apply_menu_toggle(id).then(||self.app_menu_spec()));
         match choice.as_deref() {
             Some("new-tab") => unsafe { self.new_tab(ShellLocation::ThisPc) },
             Some("new-window")=>self.new_window(),
@@ -598,10 +649,7 @@ impl WindowState {
             Some("integration-forward-unhandled") => {self.session.ui.forward_unhandled_windows=!self.session.ui.forward_unhandled_windows;self.save();let _=crate::quick_search::start_if_enabled(&self.config_path);},
             Some("bookmark") => self.add_current_bookmark(),
             Some("folder-options") => open_folder_options(),
-            Some(id) if menus::apply_interface_setting(&mut self.session.ui.clone(), id) => {
-                if id=="navigation-auto-expand" {self.session.ui.navigation_auto_expand=menu_ui.navigation_auto_expand;}
-                self.apply_interface_choice(id);
-            },
+            Some(id) if menus::apply_interface_setting(&mut self.session.ui.clone(), id) => self.apply_interface_choice(id),
             Some("shortcuts") => {
                 let text = if crate::edition::DESKTOP { SHORTCUTS } else { SHORTCUTS.split("\n\n桌面格子").next().unwrap_or(SHORTCUTS) };
                 let text = wide(text);
@@ -633,6 +681,7 @@ impl WindowState {
     /// Applies an interface preference chosen in ≡ and refreshes what it affects.
     fn apply_interface_choice(&mut self, id: &str) {
         if !menus::apply_interface_setting(&mut self.session.ui,id) { return; }
+        zsdesk_windows::shell::set_open_archives_externally(self.session.ui.archives_open_externally);
         if (id.starts_with("search-backend-")||id.starts_with("search-native-")||id=="everything-folder-sizes")&&!self.persist_search_preferences(){return;}
         if id=="everything-folder-sizes" {self.cancel_folder_sizes();}
         if id=="navigation-recycle-bin" || id=="navigation-network" || id.starts_with("navigation-this-pc-") {self.rebuild_navigation_tree();}
@@ -794,14 +843,22 @@ pub(super) fn set_clipboard_text(owner: HWND, text: &str) {
 /// Shows a ZSUI menu spec as a Windows 11 style flyout. `anchor` (client
 /// rect) places it below a button; otherwise it opens at the cursor.
 pub(super) fn popup(owner: HWND, spec: &MenuSpec, anchor: Option<LayoutRect>) -> Option<String> {
+    crate::flyout_menu::show(owner, spec, screen_anchor(owner, anchor), zsdesk_windows::theme::menus_dark())
+}
+
+fn screen_anchor(owner: HWND, anchor: Option<LayoutRect>) -> crate::flyout_menu::MenuAnchor {
     use crate::flyout_menu::{MenuAnchor, MenuBounds};
-    let anchor = match anchor {
+    match anchor {
         Some(r) => {
             let mut corners = [POINT { x: r.x, y: r.y }, POINT { x: r.right(), y: r.bottom() }];
             for corner in &mut corners { let _ = unsafe { ClientToScreen(owner, corner) }; }
             MenuAnchor::Below(MenuBounds::new(corners[0].x, corners[0].y, corners[1].x, corners[1].y))
         }
         None => { let mut point = POINT::default(); let _ = unsafe { GetCursorPos(&mut point) }; MenuAnchor::Point { x: point.x, y: point.y } }
-    };
-    crate::flyout_menu::show(owner, spec, anchor, zsdesk_windows::theme::menus_dark())
+    }
+}
+
+/// Like [`popup`], but toggles for which `apply` returns a new spec keep it open.
+pub(super) fn popup_persistent(owner: HWND, spec: &MenuSpec, anchor: Option<LayoutRect>, apply: &mut dyn FnMut(&str) -> Option<MenuSpec>) -> Option<String> {
+    crate::flyout_menu::show_persistent(owner, spec, screen_anchor(owner, anchor), zsdesk_windows::theme::menus_dark(), apply)
 }

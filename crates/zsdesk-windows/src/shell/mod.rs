@@ -20,7 +20,7 @@ pub use events::{
     WM_SHELL_NAVIGATION_FAILED, WM_SHELL_SELECTION_CHANGED, WM_TREE_NAVIGATE,
 };
 pub use explorer_browser::{ExplorerBrowserHost, Panes, MenuDiagnostics, menu_diagnostics};
-pub use explorer_browser::{set_folder_open_capture,FolderOpenCapture,FolderOpenCallback};
+pub use explorer_browser::{set_folder_open_capture,FolderOpenCapture,FolderOpenCallback,set_open_archives_externally};
 pub use namespace_tree::{NamespaceTreeHost,NamespaceTreeOptions};
 pub use shell_item::{breadcrumb, child_folders, location_from_shell_item, open_path, shell_item, Crumb};
 pub(crate) use shell_item::take_pwstr as take;

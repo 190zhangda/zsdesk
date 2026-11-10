@@ -218,6 +218,9 @@ fn preview_settings(ui: &ExplorerUi) -> MenuItemSpec {
             entry("WPS 优先", "preview-provider-wps", true, ui.preview_provider == PreviewProviderPreference::Wps),
         ]),
         MenuItemSpec::Separator,
+        entry("压缩包：在 ZSDesk 中浏览", "archive-browse", true, !ui.archives_open_externally),
+        entry("压缩包：用默认解压软件打开", "archive-external", true, ui.archives_open_externally),
+        MenuItemSpec::Separator,
         entry("鼠标手势（按住右键拖动）", "mouse-gestures", true, ui.mouse_gestures),
     ])
 }
@@ -278,6 +281,8 @@ pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
         "tab-placement-left"=>ui.tab_placement=zsdesk_core::model::explorer::TabPlacement::Left,
         "tab-placement-right"=>ui.tab_placement=zsdesk_core::model::explorer::TabPlacement::Right,
         "space-preview" => ui.space_preview = !ui.space_preview,
+        "archive-browse" => ui.archives_open_externally = false,
+        "archive-external" => ui.archives_open_externally = true,
         "preview-provider-system" => ui.preview_provider = PreviewProviderPreference::System,
         "preview-provider-office" => ui.preview_provider = PreviewProviderPreference::Office,
         "preview-provider-wps" => ui.preview_provider = PreviewProviderPreference::Wps,
@@ -562,6 +567,17 @@ mod tests {
         assert_eq!((preferences.backdrop, preferences.color_scheme), (BackdropStyle::Acrylic, ColorScheme::Dark));
         assert!(apply_appearance(&mut preferences, "appearance-backdrop-system"));
         assert_eq!(preferences.color_scheme, ColorScheme::Dark, "material does not reset the color");
+    }
+
+    #[test]
+    fn archive_opening_is_a_radio_choice_that_defaults_to_browsing() {
+        let mut ui = ExplorerUi::default();
+        assert!(!ui.archives_open_externally);
+        assert!(apply_interface_setting(&mut ui, "archive-external") && ui.archives_open_externally);
+        assert!(apply_interface_setting(&mut ui, "archive-browse") && !ui.archives_open_externally);
+        assert!(!interface_action("archive-external"), "the choice stays in the open settings menu");
+        let tabs = tab_menu(3, 0, false, false);
+        assert!(tabs.items.iter().any(|item| matches!(item, MenuItemSpec::Command { label, .. } if label.contains("Ctrl+Alt+W"))));
     }
 
     #[test]

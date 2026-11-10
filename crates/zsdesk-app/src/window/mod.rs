@@ -160,6 +160,7 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
     };
     unsafe { RegisterClassW(&wc) };
     let placement = session.ui.window;
+    let relaunch = relaunch_command(&config_path);
     // The slot outlives the window and every callback that can reach it.
     let mut state = WindowState::new(session, config_path, selection, modern);
     state.secondary_window = secondary_window;
@@ -177,6 +178,11 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
         return Err(error);
     }
     flush_deferred(hwnd,true);
+    // Before the first show, so the taskbar button is created in the pin's group.
+    if let Some((command,icon))=&relaunch{
+        let _=zsdesk_windows::taskbar::set_identity(hwnd,&zsdesk_windows::taskbar::Identity{app_id:crate::edition::application_id(),
+            relaunch_command:command,display_name:"ZSDesk",icon});
+    }
     let accelerators = unsafe { CreateAcceleratorTableW(&accelerator_table())? };
     let _ = unsafe { ShowWindow(hwnd, if placement.is_some_and(|p| p.maximized) { SW_SHOWMAXIMIZED } else { SW_SHOW }) };
     if let Some(settings)=focus_search{post(hwnd,WM_ACTION,if settings{ACTION_SEARCH_SETTINGS}else{Command::FocusSearch.id()as usize},0);}
@@ -446,6 +452,7 @@ impl WindowState {
 
     unsafe fn create(&mut self, hwnd: HWND) -> Result<()> {
         diagnostics::initialize();diagnostics::record("window","create",None);
+        zsdesk_windows::shell::set_open_archives_externally(self.session.ui.archives_open_externally);
         self.hwnd = hwnd;
         self.dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
         listary::initialize(hwnd)?;
@@ -764,6 +771,18 @@ impl WindowState {
         self.save();
         if !self.font.0.is_null() { let _ = unsafe { DeleteObject(self.font.into()) }; self.font = HFONT::default(); }
     }
+}
+
+/// Relaunch command and icon recorded on the window for taskbar pins. A
+/// non-default profile is passed back so a pin reopens the same profile.
+fn relaunch_command(config_path:&std::path::Path)->Option<(String,String)>{
+    let exe=std::env::current_exe().ok()?;let exe=exe.to_string_lossy().into_owned();
+    let default=std::path::absolute(crate::storage::config_path()).ok();
+    let mut command=format!("\"{exe}\"");
+    if default.as_deref()!=Some(config_path){
+        if let Some(profile)=config_path.parent(){command.push_str(&format!(" --profile-dir \"{}\"",profile.display()));}
+    }
+    Some((command,format!("{exe},0")))
 }
 
 fn work_area_offset(hwnd: HWND) -> (i32, i32) {
@@ -1288,7 +1307,7 @@ impl WindowState {
             message if message >= 0xC000 && message == zsdesk_windows::shell::menu::failure_message() => {
                 self.show_message(format!("右键菜单加载失败（0x{:08X}），隐藏设置仍保留。", wp.0 as u32));
             }
-            WM_DESTROY => { crate::runtime::trace("window-destroy");unsafe { self.destroy(); PostQuitMessage(0); }crate::runtime::trace("window-quit-posted"); }
+            WM_DESTROY => { crate::runtime::trace("window-destroy");zsdesk_windows::taskbar::clear_identity(self.hwnd);unsafe { self.destroy(); PostQuitMessage(0); }crate::runtime::trace("window-quit-posted"); }
             _ => return None,
         }
         Some(LRESULT(0))

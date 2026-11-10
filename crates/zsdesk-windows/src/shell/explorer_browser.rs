@@ -180,6 +180,7 @@ impl ExplorerBrowserHost {
         let selection_revision = Rc::new(Cell::new(0u64));
         let results_active = Rc::new(Cell::new(false));
         let results_location = Rc::new(RefCell::new(None));
+        let this_pc = Rc::new(Cell::new(false));
         let background=Rc::new(Cell::new(view_background::Colors{
             background:if crate::theme::system_dark_mode(){0x202020}else{0xffffff},high_contrast:crate::theme::high_contrast()}));
         let site: IServiceProvider = BrowserSite {
@@ -190,6 +191,7 @@ impl ExplorerBrowserHost {
             panes: panes.clone(),
             selection_pending: Rc::new(Cell::new(false)),
             selection_revision: selection_revision.clone(),
+            this_pc: this_pc.clone(),
         }
         .into();
         let object_with_site: IObjectWithSite = browser.cast()?;
@@ -213,6 +215,7 @@ impl ExplorerBrowserHost {
             selection_revision: selection_revision.clone(),
             results_active: results_active.clone(),
             results_location: results_location.clone(),
+            this_pc,
         }
         .into();
         let advise_cookie = unsafe { browser.Advise(&events)? };
@@ -667,6 +670,16 @@ impl ExplorerBrowserHost {
     }
 }
 
+static OPEN_ARCHIVES_EXTERNALLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Process-wide: every file window shares the same preference file.
+pub fn set_open_archives_externally(value: bool) { OPEN_ARCHIVES_EXTERNALLY.store(value, std::sync::atomic::Ordering::Relaxed); }
+/// A browsable archive: a folder that is also a stream (zip, cab).
+pub(crate) unsafe fn is_archive(item: &windows::Win32::UI::Shell::IShellItem) -> bool {
+    use windows::Win32::System::SystemServices::{SFGAO_FOLDER, SFGAO_STREAM};
+    unsafe { item.GetAttributes(SFGAO_FOLDER | SFGAO_STREAM) }
+        .is_ok_and(|attributes| attributes.0 & (SFGAO_FOLDER.0 | SFGAO_STREAM.0) == SFGAO_FOLDER.0 | SFGAO_STREAM.0)
+}
+
 #[implement(IServiceProvider, ICommDlgBrowser2, IExplorerPaneVisibility)]
 struct BrowserSite {
     hwnd: isize,
@@ -676,6 +689,8 @@ struct BrowserSite {
     panes: Rc<Cell<Panes>>,
     selection_pending: Rc<Cell<bool>>,
     selection_revision: Rc<Cell<u64>>,
+    /// The view being created shows This PC; only then are items filtered.
+    this_pc: Rc<Cell<bool>>,
 }
 
 #[allow(non_snake_case)]
@@ -722,6 +737,10 @@ impl IExplorerPaneVisibility_Impl for BrowserSite_Impl {
 impl ICommDlgBrowser_Impl for BrowserSite_Impl {
     fn OnDefaultCommand(&self, view:Ref<IShellView>)->Result<()> {
         let Some(view)=view.as_ref() else{return Err(Error::from_hresult(E_NOINTERFACE));};
+        // A zip/cab is a folder that is also a file. With the user's choice, the
+        // Shell runs its default program instead of browsing it here.
+        if OPEN_ARCHIVES_EXTERNALLY.load(std::sync::atomic::Ordering::Relaxed)
+            && unsafe{selected_shell_item(view)}.is_ok_and(|item|unsafe{is_archive(&item)}) {return Err(Error::from_hresult(S_FALSE));}
         let capture=FOLDER_OPEN_CAPTURE.with(Cell::get);
         let callback=if let Some(capture)=capture {
             let window=unsafe{view.GetWindow()?};
@@ -750,7 +769,17 @@ impl ICommDlgBrowser_Impl for BrowserSite_Impl {
         }
         Ok(())
     }
-    fn IncludeObject(&self,_:Ref<IShellView>,_:*const windows::Win32::UI::Shell::Common::ITEMIDLIST)->Result<()>{Ok(())}
+    fn IncludeObject(&self,view:Ref<IShellView>,child:*const windows::Win32::UI::Shell::Common::ITEMIDLIST)->Result<()>{
+        // This PC shows drives, devices and network locations, like Windows 11;
+        // the user's folders are in Quick access.
+        if !self.this_pc.get()||child.is_null(){return Ok(());}
+        use windows::Win32::UI::Shell::{IFolderView,IShellFolder,IShellItem,SHCreateItemWithParent};
+        let hidden=view.as_ref().and_then(|view|view.cast::<IFolderView>().ok())
+            .and_then(|folder|unsafe{folder.GetFolder::<IShellFolder>()}.ok())
+            .and_then(|folder|unsafe{SHCreateItemWithParent::<_,IShellItem>(None,&folder,child)}.ok())
+            .is_some_and(|item|super::shell_item::is_this_pc_known_folder(&item));
+        if hidden{Err(Error::from_hresult(S_FALSE))}else{Ok(())}
+    }
 }
 #[allow(non_snake_case)]
 impl ICommDlgBrowser2_Impl for BrowserSite_Impl {
@@ -758,7 +787,9 @@ impl ICommDlgBrowser2_Impl for BrowserSite_Impl {
     fn GetDefaultMenuText(&self,_:Ref<IShellView>,_:windows::core::PWSTR,_:i32)->Result<()>{Err(Error::from_hresult(S_FALSE))}
     fn GetViewFlags(&self)->Result<u32>{
         // Keep folder navigation interception without file-dialog "Select".
-        Ok(windows::Win32::UI::Shell::CDB2GVF_NOINCLUDEITEM | windows::Win32::UI::Shell::CDB2GVF_NOSELECTVERB)
+        // Per-item filtering is requested only for the small This PC view.
+        let include=if self.this_pc.get(){0}else{windows::Win32::UI::Shell::CDB2GVF_NOINCLUDEITEM};
+        Ok(include | windows::Win32::UI::Shell::CDB2GVF_NOSELECTVERB)
     }
 }
 #[implement(IExplorerBrowserEvents)]
@@ -771,14 +802,19 @@ struct BrowserEvents {
     selection_revision: Rc<Cell<u64>>,
     results_active: Rc<Cell<bool>>,
     results_location: Rc<RefCell<Option<ShellLocation>>>,
+    this_pc: Rc<Cell<bool>>,
 }
 
 #[allow(non_snake_case)]
 impl IExplorerBrowserEvents_Impl for BrowserEvents_Impl {
     fn OnNavigationPending(
         &self,
-        _pidl_folder: *const windows::Win32::UI::Shell::Common::ITEMIDLIST,
+        pidl_folder: *const windows::Win32::UI::Shell::Common::ITEMIDLIST,
     ) -> Result<()> {
+        // Decided before the new view is created and asks for its view flags.
+        let this_pc=!pidl_folder.is_null()&&unsafe{windows::Win32::UI::Shell::SHCreateItemFromIDList::<windows::Win32::UI::Shell::IShellItem>(pidl_folder)}
+            .is_ok_and(|folder|super::shell_item::is_this_pc_item(&folder));
+        self.this_pc.set(this_pc);
         Ok(())
     }
 

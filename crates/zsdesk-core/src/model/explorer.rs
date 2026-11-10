@@ -343,6 +343,9 @@ pub struct ExplorerUi {
     pub everything_executable: Option<PathBuf>,
     pub space_preview: bool,
     pub hover_preview: bool,
+    /// Double-clicking a .zip/.cab runs its default program instead of
+    /// browsing it as a folder in ZSDesk.
+    pub archives_open_externally: bool,
     pub forward_unhandled_windows: bool,
     pub preview_provider: PreviewProviderPreference,
     pub navigation_auto_expand: Option<bool>,
@@ -377,7 +380,7 @@ impl Default for ExplorerUi {
             search_all_files: true, search_backend: SearchBackendPreference::NativeNtfs, space_preview: true,
             search_include_development:false,search_index_metadata:false,search_pinyin_initials:false,search_idle_seconds:300,
             everything_executable:None,
-            hover_preview: false, preview_provider: PreviewProviderPreference::System,
+            hover_preview: false, archives_open_externally: false, preview_provider: PreviewProviderPreference::System,
             forward_unhandled_windows: true,
             navigation_auto_expand: None,navigation_show_recycle_bin:true,navigation_show_network:true,navigation_expand_this_pc:None,
             appearance: AppearancePreferences::default(),
@@ -498,6 +501,35 @@ impl ExplorerSession {
         let mut item=self.bookmarks.remove(from);item.parent_id=parent_id;
         let at=before.and_then(|before|self.bookmarks.iter().position(|b|b.id==before)).unwrap_or(self.bookmarks.len());
         self.bookmarks.insert(at,item);true
+    }
+
+    /// Every link inside a category, nested categories included, in bar order.
+    pub fn bookmark_folder_links(&self,folder:u64)->Vec<ShellLocation> {
+        let mut result=Vec::new();let mut stack=vec![folder];let mut visited=std::collections::HashSet::new();
+        while let Some(parent)=stack.pop() {
+            if !visited.insert(parent){continue;}
+            let children:Vec<_>=self.bookmarks.iter().filter(|b|b.parent_id==Some(parent)).collect();
+            // Links first, then subcategories, each in their displayed order.
+            result.extend(children.iter().filter(|b|!b.is_folder).map(|b|b.target.clone()));
+            stack.extend(children.iter().filter(|b|b.is_folder).map(|b|b.id).rev());
+        }
+        result
+    }
+
+    /// Stores tabs into `folder` (an existing category) or a new one named
+    /// `name`; locations already linked there are not duplicated.
+    pub fn save_tabs_to_bookmarks(&mut self,folder:Option<u64>,name:&str,parent:Option<u64>,tabs:&[ShellLocation])->u64 {
+        let folder=match folder.filter(|id|self.bookmarks.iter().any(|b|b.id==*id&&b.is_folder)) {
+            Some(id)=>id,
+            None=>{let id=self.take_id();self.bookmarks.push(Bookmark::folder(id,name.into(),parent));id}
+        };
+        for target in tabs {
+            if matches!(target,ShellLocation::Search{..}){continue;}
+            if self.bookmarks.iter().any(|b|!b.is_folder&&b.parent_id==Some(folder)&&&b.target==target){continue;}
+            let id=self.take_id();self.bookmarks.push(Bookmark::link(id,target.title(),target.clone(),Some(folder)));
+        }
+        if let Some(item)=self.bookmarks.iter_mut().find(|b|b.id==folder){item.collapsed=false;}
+        folder
     }
 
     pub fn remove_bookmark(&mut self,id:u64)->bool {
@@ -676,6 +708,24 @@ mod tests {
         assert!(session.remove_bookmark(12));
         assert_eq!(session.bookmarks.iter().find(|b|b.id==13).unwrap().parent_id,Some(11));
         assert_eq!(session.bookmarks.iter().find(|b|b.id==13).unwrap().target.as_path(),Some(Path::new(r"E:\图纸.pdf")));
+    }
+
+    #[test]
+    fn bookmark_categories_open_all_links_and_store_tabs_without_duplicates(){
+        let mut session=ExplorerSession::default();session.next_id=20;
+        let a=ShellLocation::Path(PathBuf::from(r"E:\甲"));let b=ShellLocation::Path(PathBuf::from(r"E:\乙"));let c=ShellLocation::Path(PathBuf::from(r"E:\丙"));
+        session.bookmarks=vec![Bookmark::folder(10,"工程".into(),None),Bookmark::folder(11,"子类".into(),Some(10)),
+            Bookmark::link(12,"甲".into(),a.clone(),Some(10)),Bookmark::link(13,"丙".into(),c.clone(),Some(11)),Bookmark::link(14,"乙".into(),b.clone(),Some(10)),
+            Bookmark::link(15,"外部".into(),ShellLocation::ThisPc,None)];
+        assert_eq!(session.bookmark_folder_links(10),vec![a.clone(),b.clone(),c.clone()]);
+        assert!(session.bookmark_folder_links(15).is_empty());
+        let search=ShellLocation::Search{query:"x".into(),scope:None};
+        let created=session.save_tabs_to_bookmarks(None,"暂存",None,&[a.clone(),search,b.clone(),a.clone()]);
+        assert!(session.bookmarks.iter().any(|x|x.id==created&&x.is_folder&&x.display_name=="暂存"));
+        assert_eq!(session.bookmark_folder_links(created),vec![a.clone(),b.clone()],"search results skipped, duplicates merged");
+        assert_eq!(session.save_tabs_to_bookmarks(Some(10),"忽略",None,&[a.clone(),c.clone()]),10);
+        assert_eq!(session.bookmark_folder_links(10).iter().filter(|x|**x==c).count(),2,"one in 工程, one in 子类");
+        assert_eq!(session.bookmark_folder_links(10).iter().filter(|x|**x==a).count(),1);
     }
 
     #[test]

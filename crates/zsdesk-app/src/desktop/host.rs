@@ -285,15 +285,26 @@ impl DesktopHost {
         !self.shutting_down && self.loader.accepts_notification(token)
     }
 
-    /// Fence, tab and tray menus follow the fence theme.
-    pub fn menu_dark(&self) -> bool {
+    /// The fence skin: only the fence surfaces themselves.
+    pub fn fence_dark(&self) -> bool {
         match self.config.settings.theme {
             FenceTheme::Dark => true, FenceTheme::Light => false, FenceTheme::System => zsdesk_windows::theme::system_dark_mode(),
         }
     }
 
+    /// Menus and the tray belong to the application, not to one fence skin:
+    /// they follow the application's color scheme (the system's unless the
+    /// themed edition chose one), like the file manager's own menus.
+    pub fn menu_dark(&self) -> bool {
+        use zsdesk_core::model::explorer::ColorScheme;
+        let scheme = if crate::edition::THEMED {
+            crate::storage::load(&self.explorer_config).map(|session| session.ui.appearance.color_scheme).unwrap_or(ColorScheme::System)
+        } else { ColorScheme::System };
+        match scheme { ColorScheme::Dark => true, ColorScheme::Light => false, ColorScheme::System => zsdesk_windows::theme::system_dark_mode() }
+    }
+
     pub fn update_palette(&mut self) {
-        let dark = self.menu_dark();
+        let dark = self.fence_dark();
         zsdesk_windows::flyout::refresh_system();
         self.palette = FencePalette::new(if dark { Mode::Dark } else { Mode::Light }, self.config.settings.opacity);
         if let Some(accent) = zsdesk_windows::theme::system_accent(dark) { self.palette = self.palette.with_accent(accent); }

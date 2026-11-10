@@ -41,6 +41,29 @@ pub unsafe fn shell_item(location: &ShellLocation) -> Result<IShellItem> {
     }
 }
 
+/// Whether `folder` is This PC.
+pub(crate) fn is_this_pc_item(folder: &IShellItem) -> bool {
+    unsafe { folder.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) }.ok()
+        .is_some_and(|name| is_this_pc(&unsafe { take_pwstr(name) }))
+}
+
+/// This PC's folder shortcuts (3D Objects, Desktop, Documents, Downloads,
+/// Music, Pictures, Videos). Drives, devices and network locations are kept;
+/// the folders themselves stay reachable from Quick access and the Desktop.
+pub(crate) fn is_this_pc_known_folder(item: &IShellItem) -> bool {
+    use windows::Win32::UI::Shell::{SHGetKnownFolderPath, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads,
+        FOLDERID_Music, FOLDERID_Objects3D, FOLDERID_Pictures, FOLDERID_Videos, KNOWN_FOLDER_FLAG};
+    let Some(path) = (unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }).ok().map(|name| unsafe { take_pwstr(name) }) else { return false };
+    [&FOLDERID_Objects3D, &FOLDERID_Desktop, &FOLDERID_Documents, &FOLDERID_Downloads, &FOLDERID_Music, &FOLDERID_Pictures, &FOLDERID_Videos]
+        .into_iter().any(|folder| unsafe { SHGetKnownFolderPath(folder, KNOWN_FOLDER_FLAG(0), None) }
+            .is_ok_and(|known| unsafe { take_pwstr(known) }.eq_ignore_ascii_case(path.trim_end_matches('\\'))))
+}
+
+/// Tree filter form: the child of This PC that is one of its folder shortcuts.
+pub(crate) fn hidden_in_this_pc(item: &IShellItem) -> bool {
+    unsafe { item.GetParent() }.is_ok_and(|parent| is_this_pc_item(&parent)) && is_this_pc_known_folder(item)
+}
+
 fn normalized_shell_parsing_name(value: &str) -> Cow<'_, str> {
     // Recent Windows builds return the legacy Quick access CLSID as a parsing
     // name, but SHCreateItemFromParsingName accepts it only with the shell:
@@ -243,6 +266,42 @@ fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::{is_this_pc, normalized_shell_parsing_name, parsing_title};
+
+    #[test]
+    fn this_pc_hides_known_folders_but_keeps_drives() {
+        use windows::Win32::UI::Shell::{IEnumShellItems, IShellItem, BHID_EnumItems};
+        let _ = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED) };
+        let this_pc = unsafe { super::shell_item(&zsdesk_core::model::explorer::ShellLocation::ThisPc) }.unwrap();
+        assert!(super::is_this_pc_item(&this_pc));
+        let children: IEnumShellItems = unsafe { this_pc.BindToHandler(None, &BHID_EnumItems) }.unwrap();
+        let (mut hidden, mut drives) = (Vec::new(), Vec::new());
+        loop {
+            let mut item = [None::<IShellItem>]; let mut fetched = 0;
+            if unsafe { children.Next(&mut item, Some(&mut fetched)) }.is_err() || fetched == 0 { break; }
+            let item = item[0].take().unwrap();
+            let path = unsafe { item.GetDisplayName(super::SIGDN_FILESYSPATH) }.ok().map(|name| unsafe { super::take_pwstr(name) });
+            if super::hidden_in_this_pc(&item) { hidden.push(path.clone()); }
+            if path.as_deref().is_some_and(|path| path.len() == 3 && path.ends_with(":\\")) {
+                assert!(!super::hidden_in_this_pc(&item), "drive {path:?} hidden"); drives.push(path);
+            }
+        }
+        assert!(!drives.is_empty(), "This PC listed no drives");
+        assert!(hidden.iter().flatten().any(|path| path.to_ascii_lowercase().ends_with("\\downloads")), "Downloads not recognised: {hidden:?}");
+        // Quick access lists the same folders; they must stay visible there.
+        let quick = unsafe { super::shell_item(&zsdesk_core::model::explorer::ShellLocation::Shell{
+            parsing_name:"shell:::{679F85CB-0220-4080-B29B-5540CC05AAB6}".into(),title:String::new()}) }.unwrap();
+        let children: IEnumShellItems = unsafe { quick.BindToHandler(None, &BHID_EnumItems) }.unwrap();
+        let mut quick_items = 0;
+        loop {
+            let mut item = [None::<IShellItem>]; let mut fetched = 0;
+            if unsafe { children.Next(&mut item, Some(&mut fetched)) }.is_err() || fetched == 0 { break; }
+            let item = item[0].take().unwrap(); quick_items += 1;
+            assert!(!super::hidden_in_this_pc(&item), "a Quick access entry was hidden");
+        }
+        assert!(quick_items > 0, "Quick access listed nothing on this machine");
+        let windows = unsafe { super::shell_item(&zsdesk_core::model::explorer::ShellLocation::Path(std::env::var_os("WINDIR").unwrap().into())) }.unwrap();
+        assert!(!super::is_this_pc_known_folder(&windows), "an ordinary folder was treated as a This PC shortcut");
+    }
 
     #[test]
     fn this_pc_detection_does_not_capture_nested_virtual_folders() {

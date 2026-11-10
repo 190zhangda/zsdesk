@@ -18,4 +18,6 @@ pub mod ole;
 #[cfg(windows)]
 pub mod shell;
 #[cfg(windows)]
+pub mod taskbar;
+#[cfg(windows)]
 pub mod theme;

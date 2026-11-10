@@ -468,6 +468,34 @@ fn mnemonic(levels: &mut Vec<Level>, character: char, gfx: &Gfx, colors: &Palett
 /// clicking elsewhere, Alt, Esc or losing the foreground dismisses it.
 pub fn track(owner: HWND, items: &[FlyoutItem], anchor: Anchor, dark: bool) -> Option<usize> {
     if items.is_empty() || is_open() { return None; }
+    run(owner, items, anchor, dark, &[]).map(|(id, _)| id)
+}
+
+/// Like [`track`], but a choice for which `apply` returns new items (a
+/// setting that was toggled) keeps the menu open: it is shown again at the
+/// same place with the same submenu open and the chosen row highlighted.
+pub fn track_persistent(owner: HWND, items: &[FlyoutItem], anchor: Anchor, dark: bool,
+        apply: &mut dyn FnMut(usize) -> Option<Vec<FlyoutItem>>) -> Option<usize> {
+    if items.is_empty() || is_open() { return None; }
+    let mut current = items.to_vec();
+    let mut path = Vec::new();
+    loop {
+        let (id, chosen) = run(owner, &current, anchor, dark, &path)?;
+        match apply(id) {
+            Some(next) if !next.is_empty() => { current = next; path = chosen; }
+            _ => return Some(id),
+        }
+    }
+}
+
+/// Rows of the open submenus, then the highlighted row of the deepest menu.
+fn open_path(levels: &[Level]) -> Vec<usize> {
+    let mut path: Vec<usize> = levels.iter().filter_map(|level| level.open_child).collect();
+    if let Some(row) = levels.last().and_then(|level| level.highlight) { path.push(row); }
+    path
+}
+
+fn run(owner: HWND, items: &[FlyoutItem], anchor: Anchor, dark: bool, reopen: &[usize]) -> Option<(usize, Vec<usize>)> {
     let gfx = graphics()?;
     let profile = profile();
     let colors = if dark { &profile.dark } else { &profile.light };
@@ -479,6 +507,15 @@ pub fn track(owner: HWND, items: &[FlyoutItem], anchor: Anchor, dark: bool) -> O
     let _reset = Reset;
 
     present(&mut levels[0], &gfx, colors);
+    // Restore the submenus that were open when a setting was toggled.
+    if let Some((&last, parents)) = reopen.split_last() {
+        for &row in parents {
+            let depth = levels.len() - 1;
+            if row >= levels[depth].items.len() || !open_child(&mut levels, depth, row, &gfx, colors, owner) { break; }
+        }
+        let depth = levels.len() - 1;
+        if last < levels[depth].items.len() { set_highlight(&mut levels[depth], Some(last), &gfx, colors); }
+    }
     let root = levels[0].hwnd;
     unsafe {
         SendMessageW(owner, WM_ENTERMENULOOP, Some(WPARAM(1)), Some(LPARAM(0)));
@@ -611,13 +648,14 @@ pub fn track(owner: HWND, items: &[FlyoutItem], anchor: Anchor, dark: bool) -> O
         let _ = KillTimer(Some(root), TIMER);
         if GetCapture() == root { let _ = ReleaseCapture(); }
     }
+    let path = open_path(&levels);
     close_from(&mut levels, 0);
     // Characters typed into the menu belong to it, not to the owner's focus.
     let mut stale = MSG::default();
     while unsafe { PeekMessageW(&mut stale, None, WM_CHAR, WM_DEADCHAR, PM_REMOVE) }.as_bool() {}
     while unsafe { PeekMessageW(&mut stale, None, WM_SYSCHAR, WM_SYSDEADCHAR, PM_REMOVE) }.as_bool() {}
     unsafe { SendMessageW(owner, WM_EXITMENULOOP, Some(WPARAM(1)), Some(LPARAM(0))); }
-    chosen
+    chosen.map(|id| (id, path))
 }
 
 #[cfg(test)]

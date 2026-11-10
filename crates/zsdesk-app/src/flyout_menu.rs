@@ -17,6 +17,26 @@ pub fn show(owner: HWND, spec: &MenuSpec, anchor: Anchor, dark: bool) -> Option<
     flyout::track(owner, &items, anchor, dark).and_then(|index| ids.get(index).cloned())
 }
 
+/// Shows `spec`; a choice for which `apply` returns the updated spec (a
+/// setting it just toggled) keeps the menu and its open submenu on screen.
+/// Returns the choice that closed the menu.
+pub fn show_persistent(owner: HWND, spec: &MenuSpec, anchor: Anchor, dark: bool,
+        apply: &mut dyn FnMut(&str) -> Option<MenuSpec>) -> Option<String> {
+    if zsdesk_windows::theme::high_contrast() { return native(owner, spec, anchor); }
+    let mut first = Vec::new();
+    let items = convert(&spec.items, &mut first);
+    let ids = std::cell::RefCell::new(first);
+    let chosen = flyout::track_persistent(owner, &items, anchor, dark, &mut |index| {
+        let id = ids.borrow().get(index).cloned()?;
+        let next = apply(&id)?;
+        let mut renewed = Vec::new();
+        let items = convert(&next.items, &mut renewed);
+        *ids.borrow_mut() = renewed;
+        Some(items)
+    });
+    chosen.and_then(|index| ids.borrow().get(index).cloned())
+}
+
 fn convert(items: &[MenuItemSpec], ids: &mut Vec<String>) -> Vec<FlyoutItem> {
     let mut result = Vec::with_capacity(items.len());
     for item in items {

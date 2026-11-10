@@ -131,18 +131,28 @@ impl WindowState {
             windows::Win32::Graphics::Gdi::RDW_INVALIDATE|windows::Win32::Graphics::Gdi::RDW_FRAME|windows::Win32::Graphics::Gdi::RDW_ALLCHILDREN)};
     }
     pub(super) fn new_window(&mut self) {
-        let mut arguments=vec!["--new-window".into(),"--profile-dir".into(),self.config_path.parent().unwrap_or(std::path::Path::new(".")).as_os_str().to_owned()];
-        arguments.push(match self.current_location(){ShellLocation::Path(path)=>path.as_os_str().to_owned(),ShellLocation::Shell{parsing_name,..}=>parsing_name.into(),_=>"--this-pc".into()});
-        match crate::runtime::enqueue_local(&self.config_path,arguments){Ok(true)=>return,Err(error)=>{self.show_message(error.to_string());return;},Ok(false)=>{}}
-        let mut command = std::process::Command::new(match std::env::current_exe() { Ok(path)=>path, Err(error)=>{self.show_message(error.to_string());return;} });
-        command.arg("--new-window").arg("--profile-dir").arg(self.config_path.parent().unwrap_or(std::path::Path::new(".")));
-        match self.current_location() {
-            ShellLocation::Path(path) => { command.arg(path); }
-            ShellLocation::ThisPc => { command.arg("--this-pc"); }
-            ShellLocation::Shell { parsing_name, .. } => { command.arg(parsing_name); }
-            _ => { command.arg("--this-pc"); }
-        }
-        if let Err(error)=command.spawn() {self.show_message(format!("无法打开新窗口：{error}"));}
+        let location=self.current_location().clone();
+        self.open_in_new_window(&location);
+    }
+    /// Starts another file window at `location` in the same profile.
+    pub(super) fn open_in_new_window(&mut self,location:&ShellLocation)->bool {
+        let target:std::ffi::OsString=match location{ShellLocation::Path(path)=>path.as_os_str().to_owned(),ShellLocation::Shell{parsing_name,..}=>parsing_name.into(),
+            ShellLocation::Search{scope:Some(scope),..}=>scope.as_os_str().to_owned(),_=>"--this-pc".into()};
+        let profile=self.config_path.parent().unwrap_or(std::path::Path::new(".")).as_os_str().to_owned();
+        let arguments=vec!["--new-window".into(),"--profile-dir".into(),profile.clone(),target.clone()];
+        match crate::runtime::enqueue_local(&self.config_path,arguments){Ok(true)=>return true,Err(error)=>{self.show_message(error.to_string());return false;},Ok(false)=>{}}
+        let mut command = std::process::Command::new(match std::env::current_exe() { Ok(path)=>path, Err(error)=>{self.show_message(error.to_string());return false;} });
+        command.arg("--new-window").arg("--profile-dir").arg(profile).arg(target);
+        match command.spawn(){Ok(_)=>true,Err(error)=>{self.show_message(format!("无法打开新窗口：{error}"));false}}
+    }
+    /// A tab dragged out of the tab strip continues in its own window.
+    pub(super) unsafe fn tear_off_tab(&mut self,index:usize) {
+        let Some(tab)=self.session.tabs.get(index) else{return;};
+        if self.session.tabs.len()<2{self.show_message("只有一个标签页，已保留在当前窗口".into());return;}
+        if tab.locked{self.show_message("已锁定的标签页不能拖出为新窗口".into());return;}
+        let location=tab.current().clone();
+        // Open first: if the new window cannot start, the tab stays here.
+        if self.open_in_new_window(&location){unsafe{self.close_tab(index);}}
     }
 }
 
