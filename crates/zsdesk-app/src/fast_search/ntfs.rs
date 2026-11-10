@@ -193,7 +193,8 @@ impl Volume {
         let descriptor=FILE_ID_DESCRIPTOR{dwSize:size_of::<FILE_ID_DESCRIPTOR>()as u32,Type:FileIdType,Anonymous:FILE_ID_DESCRIPTOR_0{FileId:id as i64}};
         let handle=match unsafe{OpenFileById(self.handle.0,&descriptor,FILE_READ_ATTRIBUTES.0,
             FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,None,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT)}{
-            Ok(handle)=>Handle(handle),Err(error)if matches!(error.code().0 as u32,0x80070002|0x80070003|0x80070490)=>return Ok(None),Err(error)=>return Err(error.into()),
+            // NTFS answers a deleted or recycled identity with ERROR_INVALID_PARAMETER, not "not found".
+            Ok(handle)=>Handle(handle),Err(error)if matches!(error.code().0 as u32,0x80070002|0x80070003|0x80070490|0x80070057)=>return Ok(None),Err(error)=>return Err(error.into()),
         };
         let mut text=vec![0u16;32768];let n=unsafe{GetFinalPathNameByHandleW(handle.0,&mut text,GETFINALPATHNAMEBYHANDLE_FLAGS(0))}as usize;
         ensure!(n>0&&n<text.len(),"无法解析变更文件的当前路径");
@@ -238,6 +239,20 @@ mod tests {
         let journal = Journal { id: 7, first: 50, next: 100, lowest_valid: 60 };
         assert!(journal.contains(7, 60)); assert!(journal.contains(7, 100));
         assert!(!journal.contains(8, 80)); assert!(!journal.contains(7, 59)); assert!(!journal.contains(7, 101));
+    }
+    #[test]
+    fn deleted_file_ids_resolve_to_none() -> Result<()> {
+        let dir = std::fs::canonicalize(std::env::temp_dir())?.join(format!("zsdesk-stale-id-{}", std::process::id()));
+        std::fs::create_dir(&dir)?;
+        let identity = super::super::native_scan::identity(&dir);
+        let reader = super::super::native_scan::volume_root(&dir).and_then(|root| Volume::open_changes(&root).ok());
+        let alive = reader.as_ref().zip(identity.as_ref().ok()).map(|(reader, (_, id, _))| reader.path_for_id(*id));
+        std::fs::remove_dir(&dir)?;
+        // Not an NTFS drive-letter volume: file identities are not used there.
+        let (Some(reader), Ok((_, id, _))) = (reader, identity) else { return Ok(()); };
+        assert!(alive.unwrap()?.is_some());
+        assert!(reader.path_for_id(id)?.is_none(), "a deleted identity must read as gone, not as a failed catchup");
+        Ok(())
     }
     #[test]
     fn ordinary_usn_records_may_omit_names_but_mft_records_may_not(){

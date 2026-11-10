@@ -8,20 +8,23 @@ static CORES:OnceLock<Mutex<HashMap<PathBuf,Weak<Mutex<Store>>>>>=OnceLock::new(
 pub(super) struct Store{
     path:PathBuf,volumes:Option<Vec<VolumeIndex>>,policy:Option<(bool,bool)>,force:bool,dirty:bool,
     last_use:Instant,last_check:Instant,last_save:Instant,failures:Vec<VolumeStatus>,
+    // Roots whose last build failed, with the time and reason, so typing does not re-walk them.
+    backoff:Vec<(PathBuf,Instant,String)>,
     #[cfg(test)]builds:usize,
 }
+const FAILED_BUILD_RETRY:Duration=Duration::from_secs(30);
 pub(super) fn shared(path:&Path)->Core{
     let path=path.with_extension("zsi");let mut cores=CORES.get_or_init(Default::default).lock().unwrap_or_else(|e|e.into_inner());
     if let Some(core)=cores.get(&path).and_then(Weak::upgrade){return core;}
     cores.retain(|_,core|core.strong_count()>0);let core=Arc::new(Mutex::new(Store{path:path.clone(),volumes:None,policy:None,force:false,dirty:false,
-        last_use:Instant::now(),last_check:Instant::now(),last_save:Instant::now(),failures:Vec::new(),#[cfg(test)]builds:0}));cores.insert(path,Arc::downgrade(&core));core
+        last_use:Instant::now(),last_check:Instant::now(),last_save:Instant::now(),failures:Vec::new(),backoff:Vec::new(),#[cfg(test)]builds:0}));cores.insert(path,Arc::downgrade(&core));core
 }
 fn lock<'a>(core:&'a Core,shared:&Shared)->Result<MutexGuard<'a,Store>>{
     loop{ensure!(!shared.cancelled(),"搜索已取消");match core.try_lock(){Ok(value)=>return Ok(value),Err(TryLockError::WouldBlock)=>thread::sleep(Duration::from_millis(10)),
         Err(TryLockError::Poisoned(error))=>{let mut value=error.into_inner();value.volumes=None;value.force=true;return Ok(value);}}}
 }
-pub(super) fn invalidate(core:&Core){if let Ok(mut store)=core.lock(){store.volumes=None;store.force=true;store.dirty=false;}}
-pub(super) fn refresh(core:&Core){if let Ok(mut store)=core.lock(){store.last_check=Instant::now()-Duration::from_secs(3);}}
+pub(super) fn invalidate(core:&Core){if let Ok(mut store)=core.lock(){store.volumes=None;store.force=true;store.dirty=false;store.backoff.clear();}}
+pub(super) fn refresh(core:&Core){if let Ok(mut store)=core.lock(){store.last_check=Instant::now()-Duration::from_secs(3);store.backoff.clear();}}
 pub(super) fn evict_if_idle(core:&Core,seconds:u32){
     let Ok(mut store)=core.try_lock()else{return;};if store.volumes.is_none()||store.last_use.elapsed()<Duration::from_secs(u64::from(seconds)){return;}
     if store.dirty{if let Err(error)=store.save(&||false){crate::window::diagnostics::record("search","native-snapshot-save-failed",None);eprintln!("native snapshot: {error:#}");}}
@@ -53,9 +56,14 @@ impl Store{
                     }}
                 }else if !refresh_fallback{continue;}
             }
+            let failed=|root:PathBuf,warning:String|VolumeStatus{root,backend:BackendKind::DirectoryScan,phase:IndexPhase::Paused,indexed:0,checkpoint:None,warning:Some(warning)};
+            if existing.is_none()&&!self.force{
+                if let Some((_,_,warning))=self.backoff.iter().find(|(path,at,_)|same_root(path,&root)&&at.elapsed()<FAILED_BUILD_RETRY){self.failures.push(failed(root,warning.clone()));continue;}
+            }
             if let Some(at)=existing{volumes.swap_remove(at);}
+            self.backoff.retain(|(path,..)|!same_root(path,&root));
             match build_volume(&root,options,shared,sender){Ok(volume)=>{volumes.push(volume);changed=true;rebuilt=true;#[cfg(test)]{self.builds+=1;}},Err(error)=>{
-                if shared.cancelled(){return Err(error);}self.failures.push(VolumeStatus{root,backend:BackendKind::DirectoryScan,phase:IndexPhase::Paused,indexed:0,checkpoint:None,warning:Some(format!("{error:#}"))});
+                if shared.cancelled(){return Err(error);}let warning=format!("{error:#}");self.backoff.push((root.clone(),Instant::now(),warning.clone()));self.failures.push(failed(root,warning));
             }}
         }
         ensure!(volumes.iter().map(|v|v.index.heap_bytes()).sum::<usize>()<=metadata::MAX_HEAP_BYTES,"自带索引超过内存预算，请启用开发目录排除或关闭属性索引");
@@ -104,27 +112,32 @@ fn build_volume(root:&Path,options:&SearchOptions,shared:&Shared,sender:&SyncSen
     Ok(volume)
 }
 fn synthetic_id(parent:u64,name:&OsStr)->u64{use std::hash::{Hash,Hasher};let mut hash=std::collections::hash_map::DefaultHasher::new();parent.hash(&mut hash);name.hash(&mut hash);hash.finish()}
-fn scan_one(volume:&mut VolumeIndex,parent:u32,bulk:bool,options:&SearchOptions,shared:&Shared)->Result<Vec<u32>>{
-    let path=volume.index.path(&volume.root,parent).context("目录路径已失效")?;
+/// The outer error ends the whole pass: cancellation or an index that cannot take the entry.
+/// The inner error means only this directory could not be listed; its known rows are kept.
+fn scan_one(volume:&mut VolumeIndex,parent:u32,bulk:bool,options:&SearchOptions,shared:&Shared)->Result<Result<Vec<u32>>>{
+    let Some(path)=volume.index.path(&volume.root,parent)else{return Ok(Err(anyhow::anyhow!("目录路径已失效")));};
     let old=if bulk{Vec::new()}else{volume.index.children(parent)};for row in &old{volume.index.flags[*row as usize]|=MARK;}
-    let mut directories=Vec::new();let result=scan::directory(&path,&||shared.cancelled(),|entry|{
+    let mut directories=Vec::new();let mut fatal=None;let result=scan::directory(&path,&||shared.cancelled(),|entry|{
         let bits=flags(entry.attributes,&entry.name,options);let id=if entry.id==0{synthetic_id(volume.index.ids[parent as usize],&entry.name)}else{entry.id};
-        let row=if bulk{volume.index.append(id,parent,&entry.name,bits)?}else{volume.index.upsert_child(id,parent,&entry.name,bits)?};
+        // A second path to an ancestor would recurse forever or be mistaken for a move into itself.
+        if bits&DIRECTORY!=0&&volume.index.aliases_ancestor(parent,id){return Ok(());}
+        let row=match if bulk{volume.index.append(id,parent,&entry.name,bits)}else{volume.index.upsert_child(id,parent,&entry.name,bits)}{
+            Ok(row)=>row,Err(error)=>{fatal=Some(error);bail!("索引写入失败");}};
         volume.index.set_attributes(row,if bits&DIRECTORY==0{Some(entry.size)}else{None},Some(entry.modified));
         if bits&(DIRECTORY|REPARSE|EXCLUDED)==DIRECTORY{directories.push(row);}Ok(())
     });
-    if result.is_err(){for row in old{volume.index.flags[row as usize]&=!MARK;}return result.map(|_|directories);}
+    if fatal.is_some()||result.is_err(){for row in old{volume.index.flags[row as usize]&=!MARK;}
+        if let Some(error)=fatal{return Err(error);}let error=result.unwrap_err();return if shared.cancelled(){Err(error)}else{Ok(Err(error))};}
     for row in old{if volume.index.flags[row as usize]&MARK!=0{volume.index.flags[row as usize]&=!MARK;volume.index.delete(row);}}
-    Ok(directories)
+    Ok(Ok(directories))
 }
+/// The volume itself went away; skipping its directories one by one would keep an empty catalog.
+fn device_lost(error:&anyhow::Error)->bool{error.downcast_ref::<windows::core::Error>().is_some_and(|e|matches!(e.code().0 as u32,0x80070015|0x80070037|0x800701B1|0x8007048F))}
 fn walk(volume:&mut VolumeIndex,start:u32,bulk:bool,options:&SearchOptions,shared:&Shared,sender:&SyncSender<SearchEvent>)->Result<()>{
     let mut pending=vec![start];let mut last=Instant::now();
-    while let Some(parent)=pending.pop(){ensure!(!shared.cancelled(),"索引已取消");match scan_one(volume,parent,bulk,options,shared){
-        Ok(children)=>pending.extend(children),Err(error)=>{
-            let inaccessible=error.downcast_ref::<windows::core::Error>().is_some_and(|e|matches!(e.code().0 as u32,0x80070002|0x80070003|0x80070005|0x80070020|0x80070021))
-                ||error.downcast_ref::<std::io::Error>().is_some_and(|e|matches!(e.kind(),std::io::ErrorKind::PermissionDenied|std::io::ErrorKind::NotFound));
-            if shared.cancelled()||parent==0||!inaccessible{return Err(error);}volume.denied+=1;
-        }
+    while let Some(parent)=pending.pop(){ensure!(!shared.cancelled(),"索引已取消");match scan_one(volume,parent,bulk,options,shared)?{
+        // One unreadable directory, whatever the reason, must not discard the rest of the volume.
+        Ok(children)=>pending.extend(children),Err(error)=>{if parent==0||device_lost(&error){return Err(error);}volume.denied+=1;}
     }
         if last.elapsed()>=Duration::from_millis(200){progress(shared,sender,&volume.root,volume.index.len(),IndexPhase::Scanning,volume.mft);last=Instant::now();}
     }Ok(())
@@ -133,7 +146,7 @@ fn ensure_directory(volume:&mut VolumeIndex,path:&Path,options:&SearchOptions,sh
     let Ok(relative)=path.strip_prefix(&volume.root)else{return Ok(None);};let mut parent=0;let mut current=volume.root.clone();
     for component in relative.components(){ensure!(!shared.cancelled(),"索引已取消");let std::path::Component::Normal(name)=component else{return Ok(None);};current.push(name);
         let (_,id,attributes)=match scan::identity(&current){Ok(value)=>value,Err(_)=>return Ok(None)};let bits=flags(attributes,name,options);
-        if bits&DIRECTORY==0||bits&REPARSE!=0{return Ok(None);}
+        if bits&DIRECTORY==0||bits&REPARSE!=0||volume.index.aliases_ancestor(parent,id){return Ok(None);}
         parent=volume.index.upsert_child(id,parent,name,bits)?;if bits&EXCLUDED!=0{return Ok(None);}
     }Ok(Some(parent))
 }
@@ -151,16 +164,20 @@ fn catch_up(volume:&mut VolumeIndex,options:&SearchOptions,shared:&Shared,sender
         }
         for id in parents{
             ensure!(!shared.cancelled(),"索引已取消");
+            // A change that cannot be resolved or listed costs that one directory, never a volume rebuild.
             let path=match reader.path_for_id(id){Ok(path)=>path,Err(error)=>{
+                if shared.cancelled()||device_lost(&error){return Err(error);}
                 if error.downcast_ref::<windows::core::Error>().is_some_and(|e|matches!(e.code().0 as u32,0x80070005|0x80070020)){
                     for row in volume.index.rows_for_id(id){if row!=0&&volume.index.is_dir(row){volume.index.flags[row as usize]|=BLOCKED;}}
-                    volume.denied+=1;continue;
-                }return Err(error);
+                }
+                volume.denied+=1;continue;
             }};
             let Some(path)=path else{volume.index.delete_id(id);continue;};
             let Some(parent)=ensure_directory(volume,&path,options,shared)?else{continue;};
             let prior:HashSet<_>=volume.index.children(parent).into_iter().filter(|row|volume.index.is_dir(*row)).collect();
-            let children=scan_one(volume,parent,false,options,shared)?;
+            let children=match scan_one(volume,parent,false,options,shared)?{Ok(children)=>children,Err(error)=>{
+                if parent==0||device_lost(&error){return Err(error);}volume.denied+=1;continue;
+            }};
             for child in children{if !prior.contains(&child){walk(volume,child,false,options,shared,sender)?;}}
         }
         volume.checkpoint=(page.next as i64).min(target);

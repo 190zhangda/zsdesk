@@ -62,6 +62,42 @@ fn collect(service:&FastSearch,generation:u64)->Result<(Vec<PathBuf>,SearchEvent
     first.cancel();assert!(first.poll().is_empty());stop(first);stop(second);Ok(())
 }
 
+#[test]fn native_incremental_survives_deleted_and_unreadable_directories()->Result<()>{
+    let fixture=Fixture::new(&std::env::temp_dir())?;fixture.write("keep.txt",b"k")?;
+    let core=native::shared(&fixture.index);let options=SearchOptions::default();
+    let all=|core:&native::Core|direct(core,&fixture,options,"*",0,200,everything::SearchSort::NameAsc).map(|(paths,_)|paths);
+    all(&core)?;
+    // Without a readable journal every search rescans; there is no incremental pass to verify.
+    if !native::checkpoints(&core).iter().all(|c|c.2){return Ok(());}
+    let builds=native::inspect(&core).2;
+    // The journal names a parent that no longer exists; OpenFileById reports it as an invalid parameter.
+    let gone=fixture.files.join("gone");fs::create_dir(&gone)?;fs::write(gone.join("inner.txt"),b"x")?;fs::remove_file(gone.join("inner.txt"))?;fs::remove_dir(&gone)?;
+    let added=fixture.write("added.txt",b"a")?;let paths=all(&core)?;
+    assert!(paths.contains(&added)&&!paths.iter().any(|path|path.starts_with(&gone)),"incremental result incorrect: {paths:?}");
+    assert_eq!(native::inspect(&core).2,builds,"a deleted directory rebuilt the catalog");
+    // A changed directory whose attributes are readable but whose entries are not.
+    struct Unlock(PathBuf);impl Drop for Unlock{fn drop(&mut self){let _=std::process::Command::new("icacls").arg(&self.0).args(["/remove:d","*S-1-1-0"]).output();}}
+    let locked=fixture.files.join("locked");fs::create_dir(&locked)?;fs::write(locked.join("hidden.txt"),b"h")?;let _unlock=Unlock(locked.clone());
+    let denied=std::process::Command::new("icacls").arg(&locked).args(["/deny","*S-1-1-0:(RD)"]).output().is_ok_and(|output|output.status.success())&&fs::read_dir(&locked).is_err();
+    if denied{
+        let later=fixture.write("later.txt",b"l")?;let paths=all(&core)?;
+        assert!(paths.contains(&later)&&paths.contains(&added),"incremental result incorrect: {paths:?}");
+        assert_eq!(native::inspect(&core).2,builds,"an unreadable directory rebuilt the catalog");
+    }
+    Ok(())
+}
+
+#[test]fn native_failed_build_is_not_retried_by_every_search()->Result<()>{
+    let fixture=Fixture::new(&std::env::temp_dir())?;let late=fixture.root.join("late");let core=native::shared(&fixture.index);
+    let search=||{let shared=shared();let(sender,_receiver)=mpsc::sync_channel(128);
+        let request=Request{generation:1,query:"*".into(),preferred:None,invalid:None,offset:0,limit:10,sort:everything::SearchSort::NameAsc};
+        native::execute(&core,&SearchOptions::default(),Some(std::slice::from_ref(&late)),&shared,&sender,&request)};
+    assert!(search().is_err());fs::create_dir(&late)?;fs::write(late.join("a.txt"),b"a")?;
+    assert!(search().is_err(),"a failed location was walked again by the next search");
+    // An explicit refresh is the user's way to retry at once.
+    native::refresh(&core);search()?;assert_eq!(native::inspect(&core).2,1);Ok(())
+}
+
 #[test]fn builtin_preference_blocks_everything_entry_points()->Result<()>{
     let fixture=Fixture::new(&std::env::temp_dir())?;let profile=fixture.root.join("explorer-session.json");let session=crate::storage::default_session();crate::storage::save(&profile,&session)?;
     assert!(require_everything(&profile).is_err());assert!(everything::open_settings(&profile).is_err());assert!(everything::enable_service(&profile).is_err());

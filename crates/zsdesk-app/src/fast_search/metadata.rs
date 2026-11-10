@@ -82,6 +82,11 @@ impl Index {
         self.order[start..].iter().take_while(|row|self.ids[**row as usize]==id).chain(self.delta.get(&id).into_iter().flatten())
             .copied().find(|row|self.live(*row)&&self.is_dir(*row))
     }
+    /// True when `id` already names `parent` or one of its ancestors. A bind or virtualized
+    /// view can list a directory again below itself; that entry is an alias, never a child.
+    pub fn aliases_ancestor(&self,parent:u32,id:u64)->bool{
+        let mut at=parent;for _ in 0..1024{let Some(&value)=self.ids.get(at as usize)else{return false;};if value==id{return true;}if at==0{return false;}at=self.parent[at as usize];}false
+    }
     pub fn begin_build(&mut self){self.building=true;}
     pub fn children(&self,parent:u32)->Vec<u32>{
         let mut rows=Vec::new();let mut row=self.first.get(parent as usize).copied().unwrap_or(NONE);
@@ -181,6 +186,11 @@ pub fn excluded_name(name:&str)->bool{matches!(name,".git"|".hg"|".svn"|"node_mo
         assert_eq!(index.rows_for_id(9).len(),2);index.name[dir as usize]=index.names.intern(OsStr::new("移动后")).unwrap();
         assert_eq!(index.path(Path::new(r"C:\"),a).unwrap(),PathBuf::from(r"C:\移动后\甲.txt"));
         index.delete(dir);assert!(!index.searchable(a));assert!(index.searchable(b));index.compact().unwrap();assert_eq!(index.len(),2);index.validate().unwrap();
+    }
+    #[test]fn ancestor_aliases_are_recognized_by_identity(){
+        let mut index=Index::new(5,false);let a=index.append(8,0,OsStr::new("a"),DIRECTORY).unwrap();let b=index.append(9,a,OsStr::new("b"),DIRECTORY).unwrap();index.reindex();
+        for id in [5,8,9]{assert!(index.aliases_ancestor(b,id),"{id}");}
+        assert!(!index.aliases_ancestor(a,9));assert!(!index.aliases_ancestor(b,10));assert!(!index.aliases_ancestor(NONE,5));
     }
     #[test]fn exclusion_prunes_descendants_and_metadata_cost_is_optional(){
         let mut index=Index::new(5,false);let dir=index.append(6,0,OsStr::new("node_modules"),DIRECTORY).unwrap();index.append(7,dir,OsStr::new("x"),0).unwrap();
