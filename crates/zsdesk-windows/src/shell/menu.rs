@@ -104,6 +104,7 @@ fn intercepted_verb(verb: Option<&str>, intercept: MenuInterceptions) -> Option<
         _ => None,
     }
 }
+fn empty_recycle_verb(verb:&str)->bool{verb.eq_ignore_ascii_case("empty")||verb.eq_ignore_ascii_case("emptyrecyclebin")}
 fn decode_native_result(result: NativeMenuResult, applications: &[u32]) -> Result<Option<MenuOutcome>> {
     let status = windows::core::HRESULT(result.status);
     if matches!(status.0 as u32, 0x800704c7 | 0x80004004) { return Ok(Some(MenuOutcome::Dismissed)); }
@@ -378,6 +379,7 @@ pub fn forward_menu_message(msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT>
 pub struct ShellMenu {
     menu: IContextMenu,
     hmenu: HMENU,
+    recycle_bin:bool,
     /// Populated for Shift+right-click. Explorer answers that gesture with the
     /// classic menu directly; the Windows 11 presenter is never involved.
     extended: Cell<bool>,
@@ -386,15 +388,17 @@ pub struct ShellMenu {
 impl ShellMenu {
     pub fn new(menu: IContextMenu) -> Result<Self> {
         let hmenu = unsafe { CreatePopupMenu()? };
-        Ok(Self { menu, hmenu, extended: Cell::new(false) })
+        Ok(Self { menu, hmenu, recycle_bin:false, extended: Cell::new(false) })
     }
 
     /// A snapshot of absolute identities, including mixed-folder selections.
     pub fn for_items(owner: HWND, pidls: &[Vec<u8>]) -> Result<Self> {
         let _timer=MenuPhaseTimer::bind();
         let offsets = item_offsets(pidls)?;
-        if same_item_parent(pidls, &offsets) { Self::new(items_ui_object(owner, pidls)?) }
-        else { Self::new(mixed_item_context(owner, pidls)?) }
+        let mut menu=if same_item_parent(pidls, &offsets) { Self::new(items_ui_object(owner, pidls)?)? }
+        else { Self::new(mixed_item_context(owner, pidls)?)? };
+        menu.recycle_bin=pidls.len()==1&&super::pidl::item_from_pidl(&pidls[0]).is_ok_and(|item|super::shell_item::is_recycle_bin_item(&item));
+        Ok(menu)
     }
 
     /// Background menu of a folder ("新建", "粘贴", "属性" …).
@@ -407,7 +411,17 @@ impl ShellMenu {
     pub fn for_view(view: &IShellView, selection: bool) -> Result<Self> {
         let _timer=MenuPhaseTimer::bind();
         let menu: IContextMenu = unsafe { view.GetItemObject(if selection { SVGIO_SELECTION } else { SVGIO_BACKGROUND })? };
-        Self::new(menu)
+        let mut menu=Self::new(menu)?;
+        if !selection{
+            use windows::Win32::UI::Shell::{IFolderView2,IPersistFolder2};
+            if let Ok(folder)=view.cast::<IFolderView2>().and_then(|view|unsafe{view.GetFolder::<IPersistFolder2>()}){
+                if let Ok(pidl)=unsafe{folder.GetCurFolder()}{
+                    let bytes=super::pidl::pidl_bytes(pidl);unsafe{windows::Win32::System::Com::CoTaskMemFree(Some(pidl.cast()))};
+                    menu.recycle_bin=super::pidl::item_from_pidl(&bytes).is_ok_and(|item|super::shell_item::is_recycle_bin_item(&item));
+                }
+            }
+        }
+        Ok(menu)
     }
 
     pub fn hmenu(&self) -> HMENU { self.hmenu }
@@ -532,6 +546,11 @@ impl ShellMenu {
         let _active = ActiveMenuScope::enter(&self.menu, filter, menu);
         let flags = TRACK_POPUP_MENU_FLAGS(TPM_RETURNCMD.0 | TPM_RIGHTBUTTON.0 | TPM_LEFTALIGN.0 | TPM_TOPALIGN.0);
         let chosen = unsafe { TrackPopupMenuEx(menu, flags.0, point.x, point.y, owner, None) }.0 as u32;
+        // Complete the foreground popup handoff before its owner is reused or
+        // destroyed. Without this documented benign message, a subsequent
+        // popup can immediately dismiss after switching between menu owners.
+        let _=unsafe{windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(owner),
+            windows::Win32::UI::WindowsAndMessaging::WM_NULL,WPARAM(0),LPARAM(0))};
         (chosen != 0).then_some(chosen)
     }
 
@@ -578,12 +597,18 @@ impl ShellMenu {
     /// Runs a Shell command chosen from the menu.
     pub fn invoke(&self, owner: HWND, id: u32, point: Option<POINT>, shift: bool, control: bool) -> Result<()> {
         if !Self::is_shell_id(id) { return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80070057u32 as i32))); }
+        if self.recycle_bin&&self.verb(id).is_some_and(|verb|empty_recycle_verb(&verb)){
+            // The documented API keeps the native confirmation and progress UI
+            // without depending on an Explorer-only context-menu service site.
+            return unsafe{windows::Win32::UI::Shell::SHEmptyRecycleBinW(Some(owner),PCWSTR::null(),0)};
+        }
         let offset = usize::from(command_offset(id, SHELL_FIRST)?);
         self.invoke_raw(owner, PCSTR(offset as *const u8), PCWSTR(offset as *const u16), point, shift, control)
     }
 
     /// Runs a canonical verb without showing the menu.
     pub fn invoke_verb(&self, owner: HWND, verb: &str, shift: bool) -> Result<()> {
+        if self.recycle_bin&&empty_recycle_verb(verb){return unsafe{windows::Win32::UI::Shell::SHEmptyRecycleBinW(Some(owner),PCWSTR::null(),0)};}
         let ansi: Vec<u8> = verb.bytes().chain(Some(0)).collect();
         let wide: Vec<u16> = verb.encode_utf16().chain(Some(0)).collect();
         self.invoke_raw(owner, PCSTR(ansi.as_ptr()), PCWSTR(wide.as_ptr()), None, shift, false)
@@ -759,6 +784,21 @@ mod presenter_tests {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+    #[test]
+    fn recycle_menu_routes_only_the_root_empty_command()->Result<()>{
+        use windows::Win32::{System::Ole::{OleInitialize,OleUninitialize},UI::Shell::{SHGetKnownFolderItem,FOLDERID_RecycleBinFolder,KF_FLAG_DEFAULT}};
+        unsafe{OleInitialize(None)}?;
+        struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
+        let item:windows::Win32::UI::Shell::IShellItem=unsafe{SHGetKnownFolderItem(&FOLDERID_RecycleBinFolder,KF_FLAG_DEFAULT,None)}?;
+        let identity=super::super::pidl::item_pidl(&item).unwrap();
+        let menu=ShellMenu::for_items(HWND::default(),&[identity])?;assert!(menu.recycle_bin);
+        menu.populate(false,false)?;
+        let count=unsafe{GetMenuItemCount(Some(menu.hmenu()))};
+        assert!((0..count).any(|index|menu.verb(unsafe{GetMenuItemID(menu.hmenu(),index)}).is_some_and(|verb|empty_recycle_verb(&verb))),"recycle root has no empty command");
+        assert!(!empty_recycle_verb("delete"));assert!(!empty_recycle_verb("empty-other-folder"));
+        // Read-only: no command is invoked and the user's recycle bin is untouched.
+        Ok(())
+    }
     #[test]
     fn shift_extended_menus_never_use_the_windows11_presenter() {
         assert!(uses_modern_presenter(true, false, 0, false, false));

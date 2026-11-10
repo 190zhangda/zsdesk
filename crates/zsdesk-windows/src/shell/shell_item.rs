@@ -33,7 +33,11 @@ pub unsafe fn shell_item(location: &ShellLocation) -> Result<IShellItem> {
             let text = wide(&path.to_string_lossy());
             unsafe { SHCreateItemFromParsingName(PCWSTR(text.as_ptr()), None) }
         }
-        ShellLocation::Shell { parsing_name, .. } => {
+        ShellLocation::Shell { parsing_name, pidl, .. } => {
+            let identity_error=if let Some(identity)=pidl{
+                match super::pidl::item_from_pidl(identity){Ok(item)=>return Ok(item),Err(error)=>Some(error)}
+            }else{None};
+            if parsing_name.trim().is_empty(){return Err(identity_error.unwrap_or_else(||Error::from_hresult(HRESULT(0x80070057u32 as i32))));}
             let text = wide(&normalized_shell_parsing_name(parsing_name));
             unsafe { SHCreateItemFromParsingName(PCWSTR(text.as_ptr()), None) }
         }
@@ -76,6 +80,14 @@ fn normalized_shell_parsing_name(value: &str) -> Cow<'_, str> {
     }
 }
 
+pub fn is_recycle_bin_name(name:&str)->bool{
+    let name=name.get(..6).filter(|prefix|prefix.eq_ignore_ascii_case("shell:")).map_or(name,|_|&name[6..]);
+    name.eq_ignore_ascii_case("RecycleBinFolder")||name.eq_ignore_ascii_case("::{645FF040-5081-101B-9F08-00AA002F954E}")
+}
+pub(crate) fn is_recycle_bin_item(item:&IShellItem)->bool{
+    unsafe{item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING)}.ok().is_some_and(|name|is_recycle_bin_name(&unsafe{take_pwstr(name)}))
+}
+
 pub unsafe fn selected_shell_item(view: &IShellView) -> Result<IShellItem> {
     let folder_view: IFolderView2 = view.cast()?;
     let selected = unsafe { folder_view.GetSelection(false)? };
@@ -116,15 +128,22 @@ pub unsafe fn open_path(owner: HWND, path: &std::path::Path) {
 /// COM must be initialized on the current thread and `item` must belong to an
 /// apartment that can be called from that thread.
 pub unsafe fn location_from_shell_item(item: &IShellItem) -> Option<ShellLocation> {
-    if let Ok(path) = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) } {
+    let pidl=super::pidl::item_pidl(item);
+    // The namespace Desktop root also advertises a filesystem path, but its
+    // empty PIDL denotes the virtual parent of This PC and other namespaces.
+    let desktop_root=pidl.as_deref().is_some_and(|bytes|bytes==[0,0]);
+    let filesystem=unsafe{item.GetAttributes(windows::Win32::System::SystemServices::SFGAO_FILESYSTEM)}
+        .is_ok_and(|flags|flags.0&windows::Win32::System::SystemServices::SFGAO_FILESYSTEM.0!=0);
+    if let Ok(path) = if filesystem&&!desktop_root{unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }}else{Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)))} {
         let path = unsafe { take_pwstr(path) };
         if !path.is_empty() {
             return Some(ShellLocation::Path(PathBuf::from(path)));
         }
     }
 
-    let parsing_name = unsafe { item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING).ok()? };
-    let parsing_name = unsafe { take_pwstr(parsing_name) };
+    let parsing_name = unsafe { item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) }.ok()
+        .map(|name|unsafe{take_pwstr(name)}).unwrap_or_default();
+    if parsing_name.trim().is_empty()&&pidl.is_none(){return None;}
     if is_this_pc(&parsing_name) {
         return Some(ShellLocation::ThisPc);
     }
@@ -138,6 +157,7 @@ pub unsafe fn location_from_shell_item(item: &IShellItem) -> Option<ShellLocatio
     Some(ShellLocation::Shell {
         parsing_name,
         title,
+        pidl,
     })
 }
 
@@ -154,15 +174,10 @@ pub unsafe fn location_from_pidl(
         if let Some(location) = unsafe { location_from_shell_item(&item) } { return Some(location); }
     }
 
-    if let Ok(path) = unsafe { SHGetNameFromIDList(pidl, SIGDN_FILESYSPATH) } {
-        let path = unsafe { take_pwstr(path) };
-        if !path.is_empty() {
-            return Some(ShellLocation::Path(PathBuf::from(path)));
-        }
-    }
-
-    let parsing_name = unsafe { SHGetNameFromIDList(pidl, SIGDN_DESKTOPABSOLUTEPARSING).ok()? };
-    let parsing_name = unsafe { take_pwstr(parsing_name) };
+    let identity=super::pidl::checked_pidl_bytes(pidl);
+    let parsing_name = unsafe { SHGetNameFromIDList(pidl, SIGDN_DESKTOPABSOLUTEPARSING) }.ok()
+        .map(|name|unsafe{take_pwstr(name)}).unwrap_or_default();
+    if parsing_name.trim().is_empty()&&identity.is_none(){return None;}
     if is_this_pc(&parsing_name) {
         return Some(ShellLocation::ThisPc);
     }
@@ -173,6 +188,7 @@ pub unsafe fn location_from_pidl(
     Some(ShellLocation::Shell {
         parsing_name,
         title,
+        pidl:identity,
     })
 }
 
@@ -264,13 +280,37 @@ fn wide(value: &str) -> Vec<u16> {
 }
 
 #[cfg(test)]
+#[path="shell_item_contract_tests.rs"]
+mod contract_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{is_this_pc, normalized_shell_parsing_name, parsing_title};
 
     #[test]
+    fn namespace_identity_does_not_require_a_reparseable_display_name()->windows::core::Result<()>{
+        use zsdesk_core::model::explorer::ShellLocation;
+        use windows::Win32::{System::Ole::{OleInitialize,OleUninitialize},UI::Shell::{SHGetKnownFolderItem,FOLDERID_RecycleBinFolder,KF_FLAG_DEFAULT,IShellItem}};
+        unsafe{OleInitialize(None)}?;
+        struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
+        let item:IShellItem=unsafe{SHGetKnownFolderItem(&FOLDERID_RecycleBinFolder,KF_FLAG_DEFAULT,None)}?;
+        let mut location=unsafe{super::location_from_shell_item(&item)}.unwrap();
+        let ShellLocation::Shell{parsing_name,pidl,..}=&mut location else{panic!("namespace was converted to a filesystem path");};
+        assert!(pidl.as_ref().is_some_and(|pidl|super::super::pidl::valid(pidl)));
+        *parsing_name="portable provider: non-reparseable display name".into();
+        let persisted=serde_json::to_string(&location).unwrap();let restored=serde_json::from_str(&persisted).unwrap();
+        let opened=unsafe{super::shell_item(&restored)}?;
+        assert_eq!(super::super::pidl::item_pidl(&opened),super::super::pidl::item_pidl(&item));
+        let legacy:ShellLocation=serde_json::from_str(r#"{"Shell":{"parsing_name":"shell:RecycleBinFolder","title":"Recycle Bin"}}"#).unwrap();
+        unsafe{super::shell_item(&legacy)}?;
+        Ok(())
+    }
+
+    #[test]
     fn this_pc_hides_known_folders_but_keeps_drives() {
         use windows::Win32::UI::Shell::{IEnumShellItems, IShellItem, BHID_EnumItems};
-        let _ = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED) };
+        unsafe { windows::Win32::System::Ole::OleInitialize(None) }.unwrap();
+        struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{windows::Win32::System::Ole::OleUninitialize();}}}let _apartment=Apartment;
         let this_pc = unsafe { super::shell_item(&zsdesk_core::model::explorer::ShellLocation::ThisPc) }.unwrap();
         assert!(super::is_this_pc_item(&this_pc));
         let children: IEnumShellItems = unsafe { this_pc.BindToHandler(None, &BHID_EnumItems) }.unwrap();
@@ -286,10 +326,14 @@ mod tests {
             }
         }
         assert!(!drives.is_empty(), "This PC listed no drives");
-        assert!(hidden.iter().flatten().any(|path| path.to_ascii_lowercase().ends_with("\\downloads")), "Downloads not recognised: {hidden:?}");
+        // Current Windows builds may omit these shortcuts from This PC already.
+        // Exercise classification with the actual known folder independently.
+        let downloads:IShellItem=unsafe{windows::Win32::UI::Shell::SHGetKnownFolderItem(
+            &windows::Win32::UI::Shell::FOLDERID_Downloads,windows::Win32::UI::Shell::KF_FLAG_DEFAULT,None)}.unwrap();
+        assert!(super::is_this_pc_known_folder(&downloads),"Downloads not recognised");
         // Quick access lists the same folders; they must stay visible there.
         let quick = unsafe { super::shell_item(&zsdesk_core::model::explorer::ShellLocation::Shell{
-            parsing_name:"shell:::{679F85CB-0220-4080-B29B-5540CC05AAB6}".into(),title:String::new()}) }.unwrap();
+            pidl:None, parsing_name:"shell:::{679F85CB-0220-4080-B29B-5540CC05AAB6}".into(),title:String::new()}) }.unwrap();
         let children: IEnumShellItems = unsafe { quick.BindToHandler(None, &BHID_EnumItems) }.unwrap();
         let mut quick_items = 0;
         loop {
@@ -309,6 +353,10 @@ mod tests {
         assert!(is_this_pc("shell:::{20d04fe0-3aea-1069-a2d8-08002b30309d}"));
         assert!(!is_this_pc("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\::{11111111-1111-1111-1111-111111111111}"));
         assert_eq!(parsing_title("::{645FF040-5081-101B-9F08-00AA002F954E}"), None);
+        assert!(super::is_recycle_bin_name("shell:RecycleBinFolder"));
+        assert!(super::is_recycle_bin_name("::{645FF040-5081-101B-9F08-00AA002F954E}"));
+        assert!(!super::is_recycle_bin_name("::{645FF040-5081-101B-9F08-00AA002F954E}\\deleted-file"));
+        assert!(!super::is_recycle_bin_name(r"C:\RecycleBinFolder"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! One bounded STA owns desktop Shell menus, including their command handlers.
 //! Only PIDL bytes and application command IDs cross the desktop UI boundary.
-use std::{cell::Cell,collections::VecDeque,path::PathBuf,sync::{Arc,Mutex,atomic::{AtomicBool,AtomicIsize,AtomicU64,Ordering},mpsc},thread::{self,JoinHandle},time::{Duration,Instant}};
+use std::{cell::{Cell,RefCell},collections::VecDeque,path::{Path,PathBuf},sync::{Arc,Mutex,atomic::{AtomicBool,AtomicIsize,AtomicU64,Ordering},mpsc},thread::{self,JoinHandle},time::{Duration,Instant}};
+use std::os::windows::fs::MetadataExt;
 use windows::{core::{w,PCWSTR},Win32::{Foundation::{HINSTANCE,HWND,LPARAM,LRESULT,POINT,WPARAM},System::{LibraryLoader::GetModuleHandleW,Ole::{OleInitialize,OleUninitialize,OleFlushClipboard},Threading::GetCurrentThreadId,DataExchange::GetClipboardOwner},UI::{Input::KeyboardAndMouse::{SetActiveWindow,SetFocus},WindowsAndMessaging::*}}};
 use zsdesk_ui::menus::{MenuItemSpec,MenuSpec};
 use zsdesk_windows::shell::menu::{forward_menu_message,MenuInterceptions,MenuOutcome,ShellMenu};
@@ -35,6 +36,7 @@ pub(super) struct Timing{
     pub input_to_menu_microseconds:Option<u64>,pub result:String,
     pub extension_process:Option<u32>,
     pub initial_validation_microseconds:u64,pub settings_microseconds:u64,pub request_snapshot_microseconds:u64,
+    pub settings_cache_hit:bool,
     pub isolation:crate::context_menu_process::MenuTimings,
 }
 struct ValidationEvent(usize);
@@ -138,7 +140,36 @@ impl Drop for Apartment{fn drop(&mut self){
 }}
 struct Owner(HWND);
 impl Drop for Owner{fn drop(&mut self){let _=unsafe{DestroyWindow(self.0)};}}
-struct WindowState{shared:Arc<Shared>,generation:Cell<u64>,source:Cell<isize>,entered:Cell<Option<Instant>>,#[cfg(test)]probe:Cell<Option<Probe>>}
+#[derive(Default)]
+struct MenuPolicyCache{
+    entry:Option<(PathBuf,(u64,u64,u64),zsdesk_windows::shell::menu::ContextMenuOptions)>,
+    #[cfg(test)]reads:u64,
+}
+impl MenuPolicyCache{
+    fn stamp(profile:&Path)->Option<(u64,u64,u64)>{
+        let metadata=std::fs::metadata(profile).ok()?;
+        metadata.is_file().then(||(metadata.len(),metadata.last_write_time(),metadata.creation_time()))
+    }
+    fn options(&mut self,profile:&Path)->(zsdesk_windows::shell::menu::ContextMenuOptions,bool){
+        let stamp=Self::stamp(profile);
+        if let Some((cached_path,cached_stamp,options))=&self.entry{
+            if cached_path==profile&&Some(*cached_stamp)==stamp{return (options.clone(),true);}
+        }
+        #[cfg(test)]{self.reads+=1;}
+        let loaded=crate::storage::load(profile).map(|session|crate::context_preferences::native(&session.ui.context_menu));
+        // Cache only one verified snapshot on this menu STA. Session navigation
+        // can enlarge the profile substantially, but unchanged right-clicks
+        // need only its metadata; cross-window preference edits invalidate it.
+        self.entry=None;
+        match loaded{
+            Ok(options)=>{
+                if stamp.is_some()&&Self::stamp(profile)==stamp{self.entry=Some((profile.into(),stamp.unwrap(),options.clone()));}
+                (options,false)
+            },Err(_)=>(Default::default(),false),
+        }
+    }
+}
+struct WindowState{shared:Arc<Shared>,generation:Cell<u64>,source:Cell<isize>,entered:Cell<Option<Instant>>,policy:RefCell<MenuPolicyCache>,#[cfg(test)]probe:Cell<Option<Probe>>}
 unsafe extern "system" fn procedure(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->LRESULT{
     if message==WM_NCCREATE{let create=unsafe{&*(lp.0 as*const CREATESTRUCTW)};unsafe{SetWindowLongPtrW(hwnd,GWLP_USERDATA,create.lpCreateParams as isize);}return LRESULT(1);}
     let state=unsafe{GetWindowLongPtrW(hwnd,GWLP_USERDATA)}as*const WindowState;
@@ -216,7 +247,8 @@ fn perform(shared:&Shared,state:&WindowState,owner:HWND,request:&Request,timing:
     timing.initial_validation_microseconds=micros(stage.elapsed());
     if !foreground_allowed(request.foreground){return Err(windows::core::Error::new(windows::core::HRESULT(0x80004004u32 as i32),"菜单打开前前台窗口已改变"));}
     let stage=Instant::now();
-    let options=crate::storage::load(&request.profile).map(|session|crate::context_preferences::native(&session.ui.context_menu)).unwrap_or_default();
+    let (options,cache_hit)=state.policy.borrow_mut().options(&request.profile);
+    timing.settings_cache_hit=cache_hit;
     timing.settings_microseconds=micros(stage.elapsed());let stage=Instant::now();
     let(pidls,folder,intercept)=match &request.target{
         Target::Items{pidls,key}=>(pidls.clone(),None,MenuInterceptions{rename:key.is_some(),open:pidls.len()==1&&key.is_some()}),
@@ -244,7 +276,7 @@ fn run(shared:Arc<Shared>)->windows::core::Result<()>{
     unsafe{OleInitialize(None)?;}let _apartment=Apartment;
     let instance=HINSTANCE(unsafe{GetModuleHandleW(None)?}.0);
     unsafe{RegisterClassW(&WNDCLASSW{hInstance:instance,lpfnWndProc:Some(procedure),lpszClassName:CLASS,..Default::default()});}
-    let state=Box::new(WindowState{shared:shared.clone(),generation:Cell::new(0),source:Cell::new(0),entered:Cell::new(None),#[cfg(test)]probe:Cell::new(None)});
+    let state=Box::new(WindowState{shared:shared.clone(),generation:Cell::new(0),source:Cell::new(0),entered:Cell::new(None),policy:RefCell::new(MenuPolicyCache::default()),#[cfg(test)]probe:Cell::new(None)});
     let owner=Owner(unsafe{CreateWindowExW(WS_EX_TOOLWINDOW,CLASS,w!("ZSdesk"),WS_POPUP,0,0,0,0,None,None,Some(instance),Some((&*state as*const WindowState).cast()))?});
     shared.window.store(owner.0.0 as isize,Ordering::Release);
     while !shared.stop.load(Ordering::Acquire){
@@ -268,6 +300,29 @@ fn run(shared:Arc<Shared>)->windows::core::Result<()>{
     use super::*;
     use anyhow::{Context,Result,ensure};
     use windows::Win32::System::{DataExchange::GetClipboardSequenceNumber,Ole::{OleGetClipboard,OleSetClipboard}};
+    #[test]
+    fn menu_policy_cache_reuses_unchanged_profiles_and_observes_external_edits()->Result<()>{
+        let root=std::env::temp_dir().join(format!("zsdesk-menu-policy-{}",std::process::id()));
+        std::fs::create_dir(&root)?;
+        struct Fixture(PathBuf);impl Drop for Fixture{fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}}
+        let _fixture=Fixture(root.clone());let first=root.join("first.json");let second=root.join("second.json");
+        let mut session=crate::storage::default_session();session.ui.context_menu.show_wps=false;
+        crate::storage::save(&first,&session)?;
+        session.ui.context_menu.show_wps=true;crate::storage::save(&second,&session)?;
+        let mut cache=MenuPolicyCache::default();
+        let (initial,hit)=cache.options(&first);ensure!(!initial.show_wps&&!hit&&cache.reads==1,"initial policy was not loaded");
+        for _ in 0..4{let (options,hit)=cache.options(&first);ensure!(!options.show_wps&&hit,"unchanged menu policy was reparsed");}
+        ensure!(cache.reads==1,"unchanged profile reparsed");
+        let (options,hit)=cache.options(&second);ensure!(options.show_wps&&!hit,"a different profile reused the first policy");
+        let (options,hit)=cache.options(&first);ensure!(!options.show_wps&&!hit,"bounded cache did not switch back");
+        crate::storage::save(&first,&session)?;
+        let (options,hit)=cache.options(&first);ensure!(options.show_wps&&!hit,"external preference edit was hidden by the cache");
+        std::fs::write(&first,b"invalid session")?;
+        let (options,hit)=cache.options(&first);ensure!(!options.show_wps&&!hit&&cache.entry.is_none(),"invalid configuration retained stale policy");
+        crate::storage::save(&first,&session)?;
+        let (options,hit)=cache.options(&first);ensure!(options.show_wps&&!hit,"restored configuration was not reloaded");
+        Ok(())
+    }
     #[link(name="user32")]unsafe extern "system"{
         fn CreateDesktopW(name:*const u16,device:*const u16,mode:*const core::ffi::c_void,flags:u32,access:u32,attributes:*const core::ffi::c_void)->*mut core::ffi::c_void;
         fn CloseDesktop(desktop:*mut core::ffi::c_void)->i32;

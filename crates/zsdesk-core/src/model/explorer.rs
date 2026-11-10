@@ -8,7 +8,12 @@ use serde::{Deserialize, Serialize};
 pub enum ShellLocation {
     ThisPc,
     Path(PathBuf),
-    Shell { parsing_name: String, title: String },
+    Shell { parsing_name: String, title: String,
+        /// Namespace identities (including MTP objects) need not round-trip
+        /// through a filesystem path or provider display name.
+        #[serde(default,skip_serializing_if="Option::is_none")]
+        pidl:Option<Vec<u8>>,
+    },
     /// Stable query parameters; transient Shell search addresses are not persisted.
     Search { query: String, scope: Option<PathBuf> },
 }
@@ -17,7 +22,7 @@ impl ShellLocation {
         match self {
             Self::ThisPc => "此电脑".to_string(),
             Self::Path(path) => path_title(path),
-            Self::Shell { parsing_name, title } => shell_display_title(parsing_name, title),
+            Self::Shell { parsing_name, title, .. } => shell_display_title(parsing_name, title),
             Self::Search { query, .. } => format!("搜索：{query}"),
         }
     }
@@ -26,7 +31,7 @@ impl ShellLocation {
         match self {
             Self::ThisPc => "此电脑".to_string(),
             Self::Path(path) => path.to_string_lossy().into_owned(),
-            Self::Shell { parsing_name, .. } => parsing_name.clone(),
+            Self::Shell { parsing_name, title, .. } => if parsing_name.trim().is_empty(){shell_display_title(parsing_name,title)}else{parsing_name.clone()},
             Self::Search { query, scope } => format!("搜索 {}：{}", scope.as_ref().map(|p|p.display().to_string()).unwrap_or_else(||"全部本地磁盘".into()), query),
         }
     }
@@ -573,14 +578,14 @@ mod tests {
     #[test]
     fn legacy_namespace_titles_are_readable_without_rewriting_addresses() {
         let address = "::{645FF040-5081-101B-9F08-00AA002F954E}";
-        let location = ShellLocation::Shell { parsing_name: address.into(), title: address.into() };
+        let location = ShellLocation::Shell { pidl:None, parsing_name: address.into(), title: address.into() };
         assert_eq!(location.title(), "回收站");
         assert_eq!(location.address(), address);
         let restored: ShellLocation = serde_json::from_str(&serde_json::to_string(&location).unwrap()).unwrap();
         assert_eq!(restored.title(), "回收站");
-        assert_eq!(ShellLocation::Shell { parsing_name: "shell:RecycleBinFolder".into(), title: "Shell".into() }.title(), "回收站");
-        assert_eq!(ShellLocation::Shell { parsing_name: address.into(), title: "已删除的文件".into() }.title(), "已删除的文件");
-        assert_eq!(ShellLocation::Shell { parsing_name: "::{11111111-1111-1111-1111-111111111111}".into(), title: String::new() }.title(), "系统位置");
+        assert_eq!(ShellLocation::Shell { pidl:None, parsing_name: "shell:RecycleBinFolder".into(), title: "Shell".into() }.title(), "回收站");
+        assert_eq!(ShellLocation::Shell { pidl:None, parsing_name: address.into(), title: "已删除的文件".into() }.title(), "已删除的文件");
+        assert_eq!(ShellLocation::Shell { pidl:None, parsing_name: "::{11111111-1111-1111-1111-111111111111}".into(), title: String::new() }.title(), "系统位置");
     }
 
     #[test]

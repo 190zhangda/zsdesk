@@ -224,7 +224,7 @@ fn run(output:&std::path::Path)->Result<serde_json::Value>{
     let saved=storage::load(&config)?.ui.window.context("saved window placement")?;
     ensure!(saved.width==1080&&saved.height==720,"window size was not persisted");
     ensure!(initial_rect(Some(saved))==(normal.left,normal.top,1080,720),"reopened geometry differs from saved size");
-    for (hit,id) in [(HTLEFT,IDC_SIZEWE),(HTRIGHT,IDC_SIZEWE),(HTTOP,IDC_SIZENS),(HTBOTTOM,IDC_SIZENS),(HTTOPLEFT,IDC_SIZENWSE),(HTBOTTOMRIGHT,IDC_SIZENWSE),(HTTOPRIGHT,IDC_SIZENESW),(HTBOTTOMLEFT,IDC_SIZENESW)]{
+    for (hit,id) in [(HTLEFT,IDC_SIZEWE),(HTRIGHT,IDC_SIZEWE),(HTTOP,IDC_SIZENS),(HTBOTTOM,IDC_SIZENS),(HTTOPLEFT,IDC_SIZENWSE),(HTBOTTOMRIGHT,IDC_SIZENWSE),(HTTOPRIGHT,IDC_SIZENESW),(HTBOTTOMLEFT,IDC_SIZENESW),(HTCAPTION,IDC_ARROW)]{
         let result=unsafe{SendMessageW(hwnd,WM_SETCURSOR,Some(WPARAM(hwnd.0 as usize)),Some(LPARAM((hit|(WM_MOUSEMOVE<<16))as isize)))};
         ensure!(result.0==1&&unsafe{GetCursor()}==unsafe{LoadCursorW(None,id)?},"resize cursor missing for hit {hit}");
     }

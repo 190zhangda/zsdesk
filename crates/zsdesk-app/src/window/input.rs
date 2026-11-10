@@ -508,12 +508,28 @@ impl WindowState {
     unsafe fn more_menu(&mut self) {
         let anchor = self.layout.command_rect(CommandId::More);
         let mut spec=menus::more_menu(self.view_status.selected > 0, crate::edition::NETWORK);
+        let recycle=matches!(self.current_location(),ShellLocation::Shell{parsing_name,..} if zsdesk_windows::shell::is_recycle_bin_name(parsing_name));
+        if recycle{spec.items.insert(0,menus::entry("清空回收站…","empty-recycle-bin",true,false));}
+        if self.session.ui.dual_pane{
+            let available=self.view_status.selected>0&&self.current_location().as_path().is_some()
+                &&self.other_folder_destination().is_some_and(|target|self.current_location().as_path().is_none_or(|source|!crate::explorer_forwarder::same_path(source,&target)));
+            spec.items.push(MenuItemSpec::Separator);
+            spec.items.push(menus::entry("复制到另一栏","copy-to-other-pane",available,false));
+            spec.items.push(menus::entry("移动到另一栏","move-to-other-pane",available,false));
+        }
         spec.items.push(MenuItemSpec::Separator);
         spec.items.push(self.search_options_menu());
         let choice = popup(self.hwnd, &spec, anchor);
         if let Some(id)=choice.as_deref(){if unsafe{self.apply_search_option(id)}{return;}}
         let hwnd = self.hwnd;
         match choice.as_deref() {
+            Some("copy-to-other-pane")=>self.transfer_to_other_pane(false),
+            Some("move-to-other-pane")=>self.transfer_to_other_pane(true),
+            Some("empty-recycle-bin") if recycle=>{
+                let result=unsafe{windows::Win32::UI::Shell::SHEmptyRecycleBinW(Some(hwnd),PCWSTR::null(),0)};
+                self.shell_result(Some(result));
+                unsafe{self.execute(Command::Refresh);}
+            },
             Some("undo") => {
                 let view = self.browser.as_ref().and_then(|b| unsafe { b.current_view() }.ok());
                 let result = view.map(|view| keyboard::execute(&view, hwnd, keyboard::FileShortcut::Undo));

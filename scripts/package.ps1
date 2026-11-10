@@ -91,6 +91,12 @@ $env:TMP=$env:TEMP
 
 function Get-BuildInfo([string]$Path) {
     if ((Get-Item -LiteralPath $Path).VersionInfo.ProductVersion -ne $version) { throw 'The executable resource version differs from the workspace version' }
+    $resource=(Get-Item -LiteralPath $Path).VersionInfo
+    $numeric=[version](($version -split '[-+]')[0])
+    if($resource.FileMajorPart -ne $numeric.Major -or $resource.FileMinorPart -ne $numeric.Minor -or $resource.FileBuildPart -ne $numeric.Build -or $resource.FilePrivatePart -ne 0 -or
+       $resource.ProductMajorPart -ne $numeric.Major -or $resource.ProductMinorPart -ne $numeric.Minor -or $resource.ProductBuildPart -ne $numeric.Build -or $resource.ProductPrivatePart -ne 0){
+        throw 'The executable numeric resource version differs from the workspace version'
+    }
     $start = New-Object Diagnostics.ProcessStartInfo
     $start.FileName=$Path; $start.Arguments='--build-info'; $start.UseShellExecute=$false
     $start.CreateNoWindow=$true; $start.WindowStyle=[Diagnostics.ProcessWindowStyle]::Hidden
@@ -157,6 +163,12 @@ try {
         Copy-Item -LiteralPath (Join-Path $root 'packaging\licenses') -Destination (Join-Path $stage 'licenses') -Recurse
         Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $stage 'LICENSE.txt')
         Copy-Item -LiteralPath (Join-Path $root 'THIRD-PARTY-NOTICES.txt') -Destination (Join-Path $stage 'THIRD-PARTY-NOTICES.txt')
+        if (-not $definition.DesktopOnly) {
+            $listaryStage=Join-Path $stage 'integrations\listary'
+            [IO.Directory]::CreateDirectory($listaryStage) | Out-Null
+            Copy-Item -LiteralPath (Join-Path $root 'native\listary\Prepare-Listary7.ps1') -Destination (Join-Path $listaryStage 'Prepare-Listary7.ps1')
+            Copy-Item -LiteralPath (Join-Path $root 'native\listary\README.md') -Destination (Join-Path $listaryStage 'README.md')
+        }
         if (-not $definition.DesktopOnly) {
         $engineStage=Join-Path $stage 'engines\everything'
         [IO.Directory]::CreateDirectory($engineStage) | Out-Null

@@ -163,7 +163,7 @@ impl NamespaceTreeHost {
         let enum_flags = navigation_enum_flags();
 
         let quick_access = ShellLocation::Shell {
-            parsing_name: QUICK_ACCESS.into(),
+            pidl:None, parsing_name: QUICK_ACCESS.into(),
             title: "快速访问".into(),
         };
         let quick_access_added = unsafe { shell_item(&quick_access) }.is_ok_and(|item| {
@@ -539,7 +539,7 @@ fn navigation_row_height(build: u32, dpi: u32, compact: bool, font_height: i32) 
 
 fn launch_location(value:Option<u32>)->ShellLocation {
     if value==Some(1) {ShellLocation::ThisPc}
-    else {ShellLocation::Shell{parsing_name:QUICK_ACCESS.into(),title:"快速访问".into()}}
+    else {ShellLocation::Shell{pidl:None, parsing_name:QUICK_ACCESS.into(),title:"快速访问".into()}}
 }
 
 fn navigation_rect(rect: RECT, dpi: u32) -> RECT {
@@ -798,9 +798,9 @@ mod tests {
         assert_eq!(initial_root(&ShellLocation::ThisPc),InitialRoot::ThisPc);
         assert_eq!(initial_root(&ShellLocation::Path(r"C:\\".into())),InitialRoot::ThisPc);
         for name in [QUICK_ACCESS,"SHELL:Home","shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}"] {
-            assert_eq!(initial_root(&ShellLocation::Shell{parsing_name:name.into(),title:String::new()}),InitialRoot::QuickAccess);
+            assert_eq!(initial_root(&ShellLocation::Shell{pidl:None, parsing_name:name.into(),title:String::new()}),InitialRoot::QuickAccess);
         }
-        let recycle=ShellLocation::Shell{parsing_name:"shell:RecycleBinFolder".into(),title:String::new()};
+        let recycle=ShellLocation::Shell{pidl:None, parsing_name:"shell:RecycleBinFolder".into(),title:String::new()};
         assert_eq!(initial_root(&recycle),InitialRoot::Neither);
         assert_eq!(root_style(InitialRoot::QuickAccess,InitialRoot::ThisPc)&NSTCRS_EXPANDED.0 as u32,0);
         assert_ne!(root_style(InitialRoot::ThisPc,InitialRoot::ThisPc)&NSTCRS_EXPANDED.0 as u32,0);

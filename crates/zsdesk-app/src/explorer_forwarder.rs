@@ -33,6 +33,17 @@ impl Snapshot{
         && self.selected.len()==other.selected.len()&&self.selected.iter().all(|a|other.selected.iter().any(|b|same_path(a,b)))}
 }
 struct Snapshots{views:Vec<Snapshot>,multiple:HashSet<isize>}
+fn read_snapshot(browser:&IWebBrowser2,window:HWND,pid:u32)->windows::core::Result<Snapshot>{
+    let view=unsafe{browser.Document()?}.cast::<IShellFolderViewDual>()?;
+    let folder=unsafe{view.Folder()?}.cast::<Folder2>()?;
+    let folder=PathBuf::from(unsafe{folder.Self_()?.Path()?}.to_string());
+    let items=unsafe{view.SelectedItems()?};let count=unsafe{items.Count()?};
+    if !(0..=128).contains(&count){return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80070057u32 as i32)));}
+    let mut selected=Vec::with_capacity(count as usize);
+    for i in 0..count{selected.push(PathBuf::from(unsafe{items.Item(&VARIANT::from(i))?.Path()?}.to_string()));}
+    let this_pc=folder.to_string_lossy().eq_ignore_ascii_case("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}");
+    Ok(Snapshot{window,pid,folder,selected,browser:browser.clone(),this_pc})
+}
 fn snapshots(shell:&IShellWindows)->Result<Snapshots>{
     let mut result=Vec::new();let mut counts=HashMap::new();
     for index in 0..unsafe{shell.Count()?}.clamp(0,128){
@@ -45,17 +56,7 @@ fn snapshots(shell:&IShellWindows)->Result<Snapshots>{
         let expected=PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(||r"C:\Windows".into())).join("explorer.exe");
         if !unsafe{browser.FullName()}.is_ok_and(|name|same_path(Path::new(&name.to_string()),&expected)){continue;}
         let mut pid=0;unsafe{GetWindowThreadProcessId(window,Some(&mut pid));}if pid==0{continue;}
-        let snapshot=(||->windows::core::Result<Snapshot>{
-            let view=unsafe{browser.Document()?}.cast::<IShellFolderViewDual>()?;
-            let folder=unsafe{view.Folder()?}.cast::<Folder2>()?;
-            let folder=PathBuf::from(unsafe{folder.Self_()?.Path()?}.to_string());
-            let items=unsafe{view.SelectedItems()?};let count=unsafe{items.Count()?};
-            if !(0..=128).contains(&count){return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80070057u32 as i32)));}
-            let mut selected=Vec::with_capacity(count as usize);
-            for i in 0..count{selected.push(PathBuf::from(unsafe{items.Item(&VARIANT::from(i))?.Path()?}.to_string()));}
-            let this_pc=folder.to_string_lossy().eq_ignore_ascii_case("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}");
-            Ok(Snapshot{window,pid,folder,selected,browser:browser.clone(),this_pc})
-        })();
+        let snapshot=read_snapshot(&browser,window,pid);
         if let Ok(snapshot)=snapshot{if (snapshot.this_pc&&snapshot.selected.is_empty())||(snapshot.folder.is_absolute()&&snapshot.selected.iter().all(|p|p.parent().is_some_and(|parent|same_path(parent,&snapshot.folder)))){result.push(snapshot);}}
     }
     let multiple=counts.iter().filter_map(|(window,count)|(*count>1).then_some(*window)).collect();
@@ -101,10 +102,13 @@ fn forward(profile:&Path,executable:&Path,snapshot:&Snapshot)->Result<()>{
 }
 
 const SELECTION_SETTLE_MS:u64=150;
-const CLOSE_RESERVE_MS:u64=40;
-struct Candidate{lease:Lease,ready_at:Option<u64>,first:Option<Snapshot>,sent:Option<Snapshot>,launched:bool,committed:bool}
+const EMPTY_OBSERVATION_MS:u64=600;
+const SELECTED_OBSERVATION_MS:u64=450;
+const SELECTION_STABLE_MS:u64=150;
+const CLOSE_RESERVE_MS:u64=120;
+struct Candidate{lease:Lease,ready_at:Option<u64>,first:Option<Snapshot>,observed:Option<(Snapshot,u64)>,sent:Option<Snapshot>,launched:bool,committed:bool}
 impl Candidate{
-    fn new(lease:Lease)->Self{Self{lease,ready_at:None,first:None,sent:None,launched:false,committed:false}}
+    fn new(lease:Lease)->Self{Self{lease,ready_at:None,first:None,observed:None,sent:None,launched:false,committed:false}}
 }
 fn packet(snapshot:&Snapshot)->Result<Vec<u8>>{
     if snapshot.this_pc{Ok(serde_json::to_vec(&(Some(zsdesk_core::model::explorer::ShellLocation::ThisPc),None::<String>))?)}
@@ -119,7 +123,15 @@ fn start_target(profile:&Path,snapshot:&Snapshot)->Result<()>{
     Ok(())
 }
 fn can_deliver(ready_at:u64,now:u64,has_selection:bool)->bool{has_selection||now.saturating_sub(ready_at)>=SELECTION_SETTLE_MS}
-fn close_due(deadline:u64,now:u64)->bool{now<deadline&&now.saturating_add(CLOSE_RESERVE_MS)>=deadline}
+fn close_due(deadline:u64,now:u64,ready:u64,stable:u64,has_selection:bool)->bool{
+    let observation=if has_selection{SELECTED_OBSERVATION_MS}else{EMPTY_OBSERVATION_MS};
+    now>=ready&&now>=stable&&now.saturating_sub(ready)>=observation
+        &&now.saturating_sub(stable)>=SELECTION_STABLE_MS&&now.saturating_add(CLOSE_RESERVE_MS)<=deadline
+}
+fn launch_selected_target(launched:&mut bool,has_selection:bool,launch:impl FnOnce()->Result<()>)->Result<()>{
+    if !*launched&&has_selection{launch()?;*launched=true;}
+    Ok(())
+}
 fn update_candidate(profile:&Path,guard:&Connection,candidate:&mut Candidate,snapshot:&Snapshot)->Result<()>{
     ensure!(guard.active(&candidate.lease),"来源窗口隐藏租约已结束");
     ensure!(snapshot.pid==candidate.lease.identity.pid&&snapshot.window.0 as isize==candidate.lease.identity.window
@@ -129,9 +141,15 @@ fn update_candidate(profile:&Path,guard:&Connection,candidate:&mut Candidate,sna
     let ready=*candidate.ready_at.get_or_insert(stamp);
     if let Some(first)=&candidate.first{ensure!(first.same_location(snapshot),"来源窗口已导航到其他位置");}
     else{candidate.first=Some(snapshot.clone());}
+    if candidate.observed.as_ref().is_none_or(|(last,_)|!last.equivalent(snapshot)){
+        candidate.observed=Some((snapshot.clone(),stamp));
+    }
     if !can_deliver(ready,stamp,!snapshot.selected.is_empty())||candidate.committed{return Ok(());}
     let Some(target)=find_target(profile)else{
-        if !candidate.launched{start_target(profile,snapshot)?;candidate.launched=true;}
+        // Without an explicit selection, a cold start cannot establish whether
+        // this is a plain folder open or an as-yet incomplete /select request.
+        // Keep the original Explorer usable instead of creating a duplicate.
+        launch_selected_target(&mut candidate.launched,!snapshot.selected.is_empty(),||start_target(profile,snapshot))?;
         return Ok(());
     };
     let bytes=packet(snapshot)?;
@@ -143,12 +161,19 @@ fn update_candidate(profile:&Path,guard:&Connection,candidate:&mut Candidate,sna
         candidate.sent=Some(snapshot.clone());
         if candidate.lease.foreground||unsafe{GetForegroundWindow()}==snapshot.window{crate::instance::request_activation(target);}
     }
-    // Keep accepting late /select updates while the source is hidden. Only
-    // the final, freshly enumerated single-tab snapshot authorizes a close.
-    if close_due(candidate.lease.deadline,visibility_guard::now()){
+    // Silence cannot prove that no future /select will arrive. Retain a longer
+    // observation for an empty selection and restart the stability period on
+    // every change. A slow-ready view or late change simply exhausts the fixed
+    // lease and restores Explorer; it never earns a lease extension.
+    let stable=candidate.observed.as_ref().map_or(stamp,|(_,at)|*at);
+    if close_due(candidate.lease.deadline,visibility_guard::now(),ready,stable,!snapshot.selected.is_empty()){
         let verified=send_with_budget(target,if snapshot.this_pc{crate::reveal::VERIFY_THIS_PC}else{crate::reveal::VERIFY_TAG},
             if snapshot.this_pc{&[]}else{&bytes},budget);
-        if verified&&guard.active(&candidate.lease){guard.commit(&candidate.lease)?;candidate.committed=true;}
+        if verified&&guard.active(&candidate.lease){
+            let latest=read_snapshot(&snapshot.browser,snapshot.window,snapshot.pid)?;
+            if !snapshot.equivalent(&latest){candidate.observed=Some((latest,visibility_guard::now()));return Ok(());}
+            if guard.active(&candidate.lease){guard.commit(&candidate.lease)?;candidate.committed=true;}
+        }
     }
     Ok(())
 }
@@ -221,7 +246,9 @@ impl Bridge{
 impl Drop for Bridge{fn drop(&mut self){self.stop.store(true,Ordering::Release);if self.worker.as_ref().is_some_and(JoinHandle::is_finished){if let Some(worker)=self.worker.take(){let _=worker.join();}}}}
 fn write_status(profile:&Path,active:bool,forwarded:u64,error:Option<&str>,guard_pid:Option<u32>){
     if let Ok(bytes)=serde_json::to_vec(&serde_json::json!({"schema":2,"pid":std::process::id(),"active":active,"forwarded":forwarded,
-        "last_error":error,"visibility_guard_pid":guard_pid,"maximum_hidden_ms":visibility_guard::LEASE_MS,"selection_settle_ms":SELECTION_SETTLE_MS})){
+        "last_error":error,"visibility_guard_pid":guard_pid,"maximum_hidden_ms":visibility_guard::LEASE_MS,"selection_settle_ms":SELECTION_SETTLE_MS,
+        "empty_observation_ms":EMPTY_OBSERVATION_MS,"selected_observation_ms":SELECTED_OBSERVATION_MS,
+        "selection_stable_ms":SELECTION_STABLE_MS,"minimum_close_budget_ms":CLOSE_RESERVE_MS})){
         let _=crate::quick_search::control::atomic_write(&profile.with_file_name("explorer-forwarding-status.json"),&bytes);
     }
 }
@@ -231,8 +258,29 @@ fn write_status(profile:&Path,active:bool,forwarded:u64,error:Option<&str>,guard
     #[test]fn late_selection_wait_is_bounded_and_does_not_renew_the_visibility_lease(){
         assert!(!can_deliver(100,249,false));assert!(can_deliver(100,250,false));
         assert!(can_deliver(100,100,true));
-        assert!(!close_due(900,859));assert!(close_due(900,860));assert!(close_due(900,899));
-        assert!(!close_due(900,900));assert!(!close_due(900,1000));
+        assert!(!close_due(900,549,100,100,true));assert!(close_due(900,550,100,100,true));
+        assert!(!close_due(900,699,100,100,false));assert!(close_due(900,700,100,100,false));
+        assert!(close_due(900,730,100,500,true),"a slow enumeration must not miss a 40 ms closing window");
+        assert!(!close_due(900,700,100,600,true),"late selection has not settled");
+        assert!(close_due(900,750,100,600,true));
+        assert!(!close_due(900,800,100,650,true),"too little time remains for confirmation and close");
+        for stamp in [500,650,780,800,900,1000]{
+            assert!(!close_due(900,stamp,500,500,false),"slow empty view must restore rather than close");
+            assert!(!close_due(900,stamp,500,500,true),"slow selected view must restore rather than close");
+        }
+        assert!(!close_due(900,900,100,550,true));assert!(!close_due(900,1000,100,550,true));
+    }
+    #[test]fn cold_target_waits_for_selection_and_is_started_at_most_once()->Result<()>{
+        let mut launched=false;let mut starts=0;
+        for selected in [false,false,true,true,false]{
+            launch_selected_target(&mut launched,selected,||{starts+=1;Ok(())})?;
+            if !selected&&!launched{assert_eq!(starts,0,"empty selection cold-started another window");}
+        }
+        assert!(launched);assert_eq!(starts,1);
+        let mut failed=false;
+        assert!(launch_selected_target(&mut failed,true,||anyhow::bail!("fixture launch failure")).is_err());
+        assert!(!failed,"failed launch must remain retryable");
+        launch_selected_target(&mut failed,true,||Ok(()))?;assert!(failed);Ok(())
     }
     #[test]fn path_comparison_preserves_unicode_and_normalizes_windows_spelling(){assert!(same_path(Path::new(r"E:\资料\Äbc"),Path::new("e:/资料/äBC/")));assert!(!same_path(Path::new(r"E:\a"),Path::new(r"E:\ab")));}
     #[test]

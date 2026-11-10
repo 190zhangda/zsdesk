@@ -11,14 +11,16 @@ use windows::{
     core::{Interface, PCWSTR},
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, SIZE, WPARAM},
-        Graphics::Gdi::{DeleteObject, GetObjectW, DIBSECTION, HBITMAP},
+        Graphics::Gdi::{DeleteObject, GetObjectW, DIBSECTION, HBITMAP, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
+            CreateCompatibleDC,DeleteDC,GetDIBits,DIB_RGB_COLORS,BI_RGB},
         Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES,
-        System::{Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE}, Threading::GetCurrentThreadId},
+        System::{Com::{CoCreateInstance,CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,CLSCTX_INPROC_SERVER}, Threading::GetCurrentThreadId},
         UI::{
             Controls::{IImageList, ILD_TRANSPARENT},
             Shell::{
                 IShellItemImageFactory, SHGetFileInfoW, SHGetImageList, SHFILEINFOW, SHGFI_PIDL, SHGFI_SYSICONINDEX,
-                SHIL_EXTRALARGE, SHIL_JUMBO, SHIL_LARGE, SHIL_SMALL, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY, SIIGBF_RESIZETOFIT,
+                IThumbnailCache,ISharedBitmap,LocalThumbnailCache,WTS_EXTRACT,WTS_ALPHATYPE,WTSAT_RGB,WTSAT_ARGB,WTSAT_UNKNOWN,
+                SHIL_EXTRALARGE, SHIL_JUMBO, SHIL_LARGE, SHIL_SMALL, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
                 SHGFI_USEFILEATTRIBUTES,
                 DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass,
             },
@@ -308,23 +310,67 @@ fn bitmap_bytes(bitmap: HBITMAP) -> u64 {
 
 fn load(request: &IconRequest) -> Option<(HBITMAP, BitmapAlpha)> {
     let item = super::pidl::item_from_pidl(&request.pidl).ok()?;
+    let requested=request.size.clamp(1,1024);
+    if request.thumbnail {
+        // GetImage uses this same Shell cache but discards the alpha contract.
+        // All-zero pixels can mean either transparent ARGB or opaque black RGB;
+        // preserve the provider's declared type instead of guessing from color.
+        if let Ok(cache)=unsafe{CoCreateInstance::<_,IThumbnailCache>(&LocalThumbnailCache,None,CLSCTX_INPROC_SERVER)}{
+            let mut shared=None;
+            if unsafe{cache.GetThumbnail(&item,requested,WTS_EXTRACT,Some(&mut shared),None,None)}.is_ok(){
+                if let Some(shared)=shared{if let Some(result)=detach_thumbnail(&shared){return Some(result);}}
+            }
+        }
+    }
     let factory: IShellItemImageFactory = item.cast().ok()?;
-    let size = SIZE { cx: request.size as i32, cy: request.size as i32 };
-    let flags = if request.thumbnail { SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK } else { SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK };
+    let size = SIZE { cx: requested as i32, cy: requested as i32 };
+    // Extraction failure falls back to the associated icon, not a second
+    // thumbnail extraction that would lose its alpha declaration again.
+    let flags = SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK;
     let bitmap = unsafe { factory.GetImage(size, flags).ok()? };
-    Some((bitmap, classify_alpha(bitmap)))
+    Some((bitmap, classify_alpha(bitmap,WTSAT_UNKNOWN)))
 }
 
-/// Shell bitmaps may carry straight, premultiplied or no alpha; inspect the pixels.
-fn classify_alpha(bitmap: HBITMAP) -> BitmapAlpha {
+fn detach_thumbnail(shared:&ISharedBitmap)->Option<(HBITMAP,BitmapAlpha)>{
+    let kind=unsafe{shared.GetFormat()}.ok()?;
+    let bitmap=unsafe{shared.Detach()}.ok()?;
+    Some((bitmap,classify_alpha(bitmap,kind)))
+}
+
+/// Respect an explicit no-alpha/alpha contract, including fully transparent
+/// images. Pixel inspection is used only to distinguish straight from premultiplied data.
+fn classify_alpha(bitmap: HBITMAP,kind:WTS_ALPHATYPE) -> BitmapAlpha {
+    if kind==WTSAT_RGB{return BitmapAlpha::Ignore;}
+    let alpha_present=kind==WTSAT_ARGB;
+    let fallback=if alpha_present{BitmapAlpha::Premultiplied}else{BitmapAlpha::Ignore};
     let mut section = DIBSECTION::default();
     let read = unsafe { GetObjectW(bitmap.into(), std::mem::size_of::<DIBSECTION>() as i32, Some((&mut section as *mut DIBSECTION).cast())) };
-    if read as usize != std::mem::size_of::<DIBSECTION>() || section.dsBm.bmBits.is_null() || section.dsBm.bmBitsPixel != 32 {
-        return BitmapAlpha::Ignore;
+    if (read as usize)<std::mem::size_of::<BITMAP>()||section.dsBm.bmBitsPixel!=32{return fallback;}
+    let width=section.dsBm.bmWidth;let height=section.dsBm.bmHeight.unsigned_abs();
+    if width<=0||height==0{return fallback;}
+    let row_bytes=(width as usize).checked_mul(4);let length=row_bytes.and_then(|row|row.checked_mul(height as usize));
+    let Some(length)=length.filter(|length|*length<=MAX_READY_BYTES as usize)else{return fallback;};
+    if read as usize==std::mem::size_of::<DIBSECTION>()&&!section.dsBm.bmBits.is_null()
+        &&section.dsBm.bmWidthBytes as usize==row_bytes.unwrap(){
+        let pixels=unsafe{std::slice::from_raw_parts(section.dsBm.bmBits.cast::<u8>(),length)};
+        return classify_pixels(pixels,alpha_present);
     }
-    let len = (section.dsBm.bmWidthBytes as usize) * (section.dsBm.bmHeight.unsigned_abs() as usize);
-    let pixels = unsafe { std::slice::from_raw_parts(section.dsBm.bmBits.cast::<u8>(), len) };
-    let mut any_alpha = false;
+    // A DDB's unused high byte is not an alpha declaration. In particular,
+    // legacy RGB bitmaps can contain arbitrary values there.
+    if !alpha_present{return BitmapAlpha::Ignore;}
+    // DDBs do not expose bmBits. Read them through GDI before choosing WIC's
+    // alpha mode; absence of a directly mapped DIB does not mean opacity.
+    let dc=unsafe{CreateCompatibleDC(None)};if dc.is_invalid(){return fallback;}
+    let mut info=BITMAPINFO{bmiHeader:BITMAPINFOHEADER{biSize:std::mem::size_of::<BITMAPINFOHEADER>()as u32,
+        biWidth:width,biHeight:-(height as i32),biPlanes:1,biBitCount:32,biCompression:BI_RGB.0,..Default::default()},..Default::default()};
+    let mut pixels=vec![0u8;length];
+    let rows=unsafe{GetDIBits(dc,bitmap,0,height,Some(pixels.as_mut_ptr().cast()),&mut info,DIB_RGB_COLORS)};
+    let _=unsafe{DeleteDC(dc)};
+    if rows==height as i32{classify_pixels(&pixels,alpha_present)}else{fallback}
+}
+
+fn classify_pixels(pixels:&[u8],alpha_present:bool)->BitmapAlpha{
+    let mut any_alpha = alpha_present;
     for px in pixels.chunks_exact(4) {
         let a = px[3];
         if a != 0 { any_alpha = true; }
@@ -336,6 +382,8 @@ fn classify_alpha(bitmap: HBITMAP) -> BitmapAlpha {
 fn scan_rest(pixels: &[u8]) -> BitmapAlpha {
     if pixels.chunks_exact(4).any(|p| p[3] != 0) { BitmapAlpha::Straight } else { BitmapAlpha::Ignore }
 }
+
+#[cfg(test)]#[path="icons_alpha_tests.rs"]mod alpha_tests;
 
 #[cfg(test)]
 mod tests {

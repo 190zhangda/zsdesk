@@ -1,6 +1,7 @@
 //! UI-side ownership and selection for the asynchronous Shell window registry.
 use super::*;
 use crate::shell_window_registry::{Entry, Registry};
+#[cfg(test)]#[path="shell_reveal_regression.rs"]mod native_reveal_tests;
 
 pub(super) fn taskbar_created_message()->u32 {
     static MESSAGE:std::sync::OnceLock<u32>=std::sync::OnceLock::new();
@@ -10,7 +11,24 @@ pub(super) fn taskbar_created_message()->u32 {
 pub(super) fn same_location(left:&ShellLocation,right:&ShellLocation)->bool {
     match (left,right) {
         (ShellLocation::Path(left),ShellLocation::Path(right))=>crate::explorer_forwarder::same_path(left,right),
+        (ShellLocation::Shell{parsing_name:left,pidl:left_id,..},ShellLocation::Shell{parsing_name:right,pidl:right_id,..})=>{
+            if !left.trim().is_empty()&&!right.trim().is_empty(){left==right}
+            else{left_id.as_deref().zip(right_id.as_deref()).is_some_and(|(left,right)|
+                zsdesk_windows::shell::pidl::valid(left)&&zsdesk_windows::shell::pidl::valid(right)&&left==right)}
+        },
         _=>left==right,
+    }
+}
+
+#[cfg(test)]mod namespace_identity_tests{
+    use super::*;
+    #[test]fn nameless_virtual_locations_compare_identities_not_labels(){
+        let location=|bytes:Vec<u8>|ShellLocation::Shell{parsing_name:String::new(),title:"同名设备目录".into(),pidl:Some(bytes)};
+        let first=location(vec![4,0,1,2,0,0]);let second=location(vec![4,0,3,4,0,0]);
+        assert!(same_location(&first,&first));assert!(!same_location(&first,&second));
+        let named=ShellLocation::Shell{parsing_name:"provider:folder".into(),title:"同一目录".into(),pidl:Some(vec![4,0,1,2,0,0])};
+        assert!(same_location(&first,&named));
+        let invalid=location(vec![5,0]);assert!(!same_location(&invalid,&invalid));
     }
 }
 

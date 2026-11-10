@@ -8,6 +8,19 @@ use windows::core::{BOOL, GUID, HRESULT, Interface};
 use zsdesk_core::model::explorer::{ShellViewState, ViewPropertyKey, ViewSortColumn, ViewColumn, ViewGrouping};
 use super::ExplorerBrowserHost;
 
+/// Folder templates may restore their own flags after a view is created.
+/// Apply only the header policy after navigation or an explicit mode change;
+/// never from OnStateChange, where SetCurrentFolderFlags can re-enter itself.
+pub(super) fn sync_column_header(view:&IFolderView2)->windows::core::Result<()>{
+    use windows::Win32::UI::Shell::{FVM_DETAILS,FWF_NOHEADERINALLVIEWS,FWF_NOCOLUMNHEADER};
+    let mut mode=FOLDERVIEWMODE(0);let mut icon=0;
+    unsafe{view.GetViewModeAndIconSize(&mut mode,&mut icon)}?;
+    let mask=(FWF_NOHEADERINALLVIEWS|FWF_NOCOLUMNHEADER).0 as u32;
+    let desired=(FWF_NOHEADERINALLVIEWS.0|if mode==FVM_DETAILS{0}else{FWF_NOCOLUMNHEADER.0})as u32;
+    if unsafe{view.GetCurrentFolderFlags()}?&mask!=desired{unsafe{view.SetCurrentFolderFlags(mask,desired)}?;}
+    Ok(())
+}
+
 /// View-only settings for an isolated background menu; no selection or paths.
 pub fn capture_view_layout(shell:&IShellView)->Option<ShellViewState> {
     let view:IFolderView2=shell.cast().ok()?;
@@ -25,6 +38,7 @@ pub fn restore_view_layout(shell:&IShellView,state:&ShellViewState) {
         let _=unsafe{view.SetViewModeAndIconSize(FOLDERVIEWMODE(state.mode),state.icon_size)};
     }
     restore_layout(shell,&view,state);
+    let _=sync_column_header(&view);
 }
 
 impl ExplorerBrowserHost {
@@ -36,11 +50,20 @@ impl ExplorerBrowserHost {
             let name:Vec<u16>=name.encode_wide().chain(Some(0)).collect();let mut pidl=std::ptr::null_mut();
             unsafe{folder.ParseDisplayName(HWND::default(),None,PCWSTR(name.as_ptr()),None,&mut pidl,std::ptr::null_mut())?;}
             let flags=SVSI_SELECT.0|if index==0{SVSI_DESELECTOTHERS.0|SVSI_FOCUSED.0|SVSI_ENSUREVISIBLE.0}else{0};
-            let result=unsafe{shell.SelectItem(pidl,flags as u32)};unsafe{CoTaskMemFree(Some(pidl.cast()))};result?;
+            let result=(||{unsafe{shell.SelectItem(pidl,flags as u32)}?;
+                let selected=unsafe{view.GetSelectionState(pidl)}?;
+                if selected&SVSI_SELECT.0 as u32==0{return Err(windows::core::Error::from_hresult(HRESULT(0x8000000au32 as i32)));}
+                Ok(())})();
+            unsafe{CoTaskMemFree(Some(pidl.cast()))};result?;
         }
         Ok(())
     }
     pub fn select_child(&self, name:&std::ffi::OsStr) -> windows::core::Result<()> {
+        self.select_children(&[name.to_os_string()])
+    }
+    /// Start editing the exact newly created item only after it is materialized.
+    pub fn rename_child(&self, name:&std::ffi::OsStr) -> windows::core::Result<()> {
+        self.select_child(name)?;
         use std::os::windows::ffi::OsStrExt;
         use windows::{core::PCWSTR,Win32::{Foundation::HWND,UI::Shell::IShellFolder}};
         let shell=unsafe {self.current_view()?};
@@ -49,7 +72,7 @@ impl ExplorerBrowserHost {
         let name:Vec<u16>=name.encode_wide().chain(Some(0)).collect();
         let mut pidl=std::ptr::null_mut();
         unsafe {folder.ParseDisplayName(HWND::default(),None,PCWSTR(name.as_ptr()),None,&mut pidl,std::ptr::null_mut())?;}
-        let result=unsafe {shell.SelectItem(pidl,(SVSI_SELECT.0|SVSI_DESELECTOTHERS.0|SVSI_FOCUSED.0|SVSI_ENSUREVISIBLE.0) as u32)};
+        let result=unsafe {shell.SelectItem(pidl,(SVSI_SELECT.0|SVSI_DESELECTOTHERS.0|SVSI_FOCUSED.0|SVSI_ENSUREVISIBLE.0|windows::Win32::UI::Shell::SVSI_EDIT.0) as u32)};
         unsafe {CoTaskMemFree(Some(pidl.cast()))};
         result
     }
@@ -61,7 +84,8 @@ impl ExplorerBrowserHost {
     }
     pub fn set_view_mode(&self, mode:i32, icon:i32) -> windows::core::Result<()> {
         let view: IFolderView2 = unsafe { self.current_view()?.cast()? };
-        unsafe { view.SetViewModeAndIconSize(FOLDERVIEWMODE(mode),icon) }
+        unsafe { view.SetViewModeAndIconSize(FOLDERVIEWMODE(mode),icon) }?;
+        sync_column_header(&view)
     }
     pub unsafe fn capture_view(&self) -> Option<ShellViewState> {
         let shell=unsafe {self.current_view().ok()?};
@@ -109,6 +133,7 @@ impl ExplorerBrowserHost {
             if !unchanged {let _=unsafe {view.SetViewModeAndIconSize(FOLDERVIEWMODE(state.mode),state.icon_size)};}
         }
         restore_layout(&shell_view,&view,state);
+        let _=sync_column_header(&view);
         // Clear once. Passing DESELECTOTHERS to SelectAndPositionItems applies
         // it to every item and leaves only the last item selected on DefView.
         let _=unsafe {shell_view.SelectItem(std::ptr::null(),SVSI_DESELECTOTHERS.0 as u32)};

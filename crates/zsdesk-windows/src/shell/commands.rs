@@ -66,12 +66,15 @@ impl ExplorerBrowserHost {
     /// Runs a verb on the selection ("cut", "copy", "delete", "properties" …).
     pub fn invoke_selection(&self, owner: HWND, verb: &str, shift: bool) -> Result<()> {
         let view = unsafe { self.current_view()? };
-        match verb {
-            "copy"=>return super::file_transfer::copy_view(&view,owner,false),
-            "cut"=>return super::file_transfer::copy_view(&view,owner,true),
-            "delete"=>return super::file_transfer::delete_view(&view,owner,shift),
-            _=>{},
-        }
+        let direct=match verb {
+            "copy"=>Some(super::file_transfer::copy_view(&view,owner,false)),
+            "cut"=>Some(super::file_transfer::copy_view(&view,owner,true)),
+            "delete"=>Some(super::file_transfer::delete_view(&view,owner,shift)),
+            _=>None,
+        };
+        // MTP and archive entries have Shell identities, not filesystem paths.
+        // An accepted asynchronous filesystem operation never runs twice.
+        if direct.is_some_and(|result|result.is_ok()){return Ok(());}
         let menu = ShellMenu::for_view(&view, true)?;
         menu.populate_for_invoke(shift)?;
         menu.invoke_verb(owner, verb, shift)
@@ -80,8 +83,12 @@ impl ExplorerBrowserHost {
     /// Runs a verb on the folder background ("paste", "NewFolder", "properties").
     pub fn invoke_background(&self, owner: HWND, verb: &str) -> Result<()> {
         let view = unsafe { self.current_view()? };
-        if verb=="paste"{return super::file_transfer::paste_view(&view,owner);}
-        if verb.eq_ignore_ascii_case("NewFolder"){return super::file_transfer::new_folder(owner,&super::file_transfer::folder_path(&view)?);}
+        if verb=="paste"&&super::file_transfer::paste_view(&view,owner).is_ok(){return Ok(());}
+        if verb.eq_ignore_ascii_case("NewFolder"){
+            if let Ok(path)=super::file_transfer::folder_path(&view){
+                if path.is_dir(){return super::file_transfer::new_folder(owner,&path);}
+            }
+        }
         let menu = ShellMenu::for_view(&view, false)?;
         menu.populate_for_invoke(false)?;
         menu.invoke_verb(owner, verb, false)

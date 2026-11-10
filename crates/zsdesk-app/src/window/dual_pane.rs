@@ -34,6 +34,7 @@ pub(super) struct InactivePane {
     wheel_remainder: i32,
     launch_selection: Option<std::ffi::OsString>,
     launch_selections: Vec<std::ffi::OsString>,
+    deferred_selection: Option<deferred_selection::Pending>,
     open_requests: std::collections::VecDeque<crate::instance::OpenRequest>,
 }
 
@@ -45,7 +46,7 @@ impl Default for InactivePane {
             browser_role:BrowserRole::Fresh, fast_search:None, fast_generation:0, fast_submitted:None,
             fast_found:0, search_progress:None, fast_events:Default::default(), fast_reset_pending:false,
             fast_clearing:None, fast_restore:None, wheel_remainder:0, launch_selection:None,
-            launch_selections:Vec::new(), open_requests:Default::default() }
+            launch_selections:Vec::new(), deferred_selection:None, open_requests:Default::default() }
     }
 }
 
@@ -57,7 +58,7 @@ impl Drop for InactivePane {
 }
 
 pub(super) fn browser_message(message:u32)->bool {
-    matches!(message,WM_SHELL_NAVIGATED|WM_SHELL_FOLDER_INVOKED|WM_SHELL_NAVIGATION_FAILED|WM_SHELL_SELECTION_CHANGED|WM_OPEN_TAB_PATH)
+    matches!(message,WM_SHELL_NAVIGATED|WM_SHELL_FOLDER_INVOKED|WM_SHELL_NAVIGATION_FAILED|WM_SHELL_SELECTION_CHANGED)
 }
 
 fn discard_message(message:u32,lp:LPARAM) {
@@ -65,7 +66,6 @@ fn discard_message(message:u32,lp:LPARAM) {
     unsafe { match message {
         WM_SHELL_NAVIGATED|WM_SHELL_FOLDER_INVOKED=>drop(Box::from_raw(lp.0 as *mut ShellLocation)),
         WM_SHELL_SELECTION_CHANGED=>acknowledge_selection_changed(lp.0),
-        WM_OPEN_TAB_PATH=>drop(Box::from_raw(lp.0 as *mut PathBuf)),
         _=>{},
     }}
 }
@@ -127,7 +127,7 @@ impl WindowState {
         swap!(browser,browser_source,folder_sizes,view_hwnd,navigation_epoch,pending,queued,shown_tab,closed_tabs,view_status,
             view_mode,search_panel,search_scope,search_result,browser_role,fast_search,fast_generation,
             fast_submitted,fast_found,search_progress,fast_events,fast_reset_pending,fast_clearing,
-            fast_restore,wheel_remainder,launch_selection,launch_selections,open_requests);
+            fast_restore,wheel_remainder,launch_selection,launch_selections,deferred_selection,open_requests);
         std::mem::swap(&mut self.session.tabs,&mut self.session.secondary_pane.tabs);
         std::mem::swap(&mut self.session.active_tab,&mut self.session.secondary_pane.active_tab);
         self.active_pane_right=!self.active_pane_right;
@@ -159,16 +159,47 @@ impl WindowState {
     }
 
     pub(super) fn other_source(&self)->usize {self.other_pane.browser_source}
+    pub(super) fn other_folder_destination(&self)->Option<PathBuf>{
+        if !self.session.ui.dual_pane||self.other_pane.browser.is_none()||self.other_pane.pending.is_some()||self.other_pane.queued.is_some(){return None;}
+        let tab=self.session.secondary_pane.tabs.get(self.session.secondary_pane.active_tab)?;
+        if self.other_pane.shown_tab!=Some(tab.id){return None;}
+        tab.current().as_path().map(PathBuf::from)
+    }
+
+    pub(super) fn transfer_to_other_pane(&mut self,moving:bool){
+        if self.pending.is_some()||self.queued.is_some(){return;}
+        let Some(destination)=self.other_folder_destination()else{return;};
+        let Some(browser)=self.browser.as_ref()else{return;};
+        let result=(||->windows::core::Result<()>{
+            let view=unsafe{browser.current_view()}?;
+            let paths=zsdesk_windows::shell::file_transfer::selected_paths(&view)?;
+            if paths.is_empty(){return Ok(());}
+            if paths.iter().all(|path|path.parent().is_some_and(|parent|crate::explorer_forwarder::same_path(parent,&destination))){
+                return Err(windows::core::Error::new(windows::core::HRESULT(0x80070057u32 as i32),"两栏显示同一目录，无需复制或移动"));
+            }
+            // Snapshot and submit one native batch. No clipboard roundtrip,
+            // recursive Rust copy, or second enumeration of selected files.
+            zsdesk_windows::shell::file_transfer::transfer_paths(self.hwnd,paths,destination,moving)
+        })();
+        self.shell_result(Some(result));
+    }
     pub(super) fn other_identity(&self)->Option<pane_input::Identity> {
         self.session.secondary_pane.tabs.get(self.session.secondary_pane.active_tab).map(|tab|pane_input::Identity{
             source:self.other_pane.browser_source,tab:tab.id,epoch:self.other_pane.navigation_epoch})
     }
 
     pub(super) fn pane_open_folder(&mut self,source:usize,path:PathBuf) {
+        self.pane_open_folders(source,vec![path]);
+    }
+
+    pub(super) fn pane_open_folders(&mut self,source:usize,paths:Vec<PathBuf>) {
         let other=source!=self.browser_source;
         if other && (source!=self.other_pane.browser_source || self.other_pane.browser.is_none()){return;}
         if other {self.background_pane=true;self.swap_pane_runtime();self.relayout();}
-        unsafe{self.new_tab(ShellLocation::Path(path));}
+        for path in paths.into_iter().take(32){
+            let target=if path.is_dir(){path}else{path.parent().map(PathBuf::from).unwrap_or(path)};
+            unsafe{self.new_tab(ShellLocation::Path(target));}
+        }
         if other {self.swap_pane_runtime();self.background_pane=false;self.relayout();self.position_children();unsafe{self.update_address();}}
     }
 
@@ -301,6 +332,21 @@ impl WindowState {
         }
     }
 
+    pub(super) fn select_created_in_other_pane(&mut self,location:&ShellLocation,name:&std::ffi::OsStr){
+        if !self.session.ui.dual_pane||self.other_pane.browser.is_none(){return;}
+        if !self.session.secondary_pane.tabs.get(self.session.secondary_pane.active_tab)
+            .is_some_and(|tab|shell_registration::same_location(tab.current(),location)){return;}
+        self.swap_pane_runtime();self.defer_selection(vec![name.to_os_string()],false);self.swap_pane_runtime();
+    }
+
+    pub(super) fn poll_pane_selections(&mut self){
+        self.poll_deferred_selection();
+        if self.other_pane.browser.is_some()&&self.other_pane.deferred_selection.is_some(){
+            self.background_pane=true;self.swap_pane_runtime();self.poll_deferred_selection();self.swap_pane_runtime();self.background_pane=false;
+        }
+        if self.deferred_selection.is_none()&&self.other_pane.deferred_selection.is_none(){let _=unsafe{KillTimer(Some(self.hwnd),deferred_selection::TIMER)};}
+    }
+
     pub(super) fn pane_wheel(&mut self,source:usize,delta:i32) {
         if source!=self.browser_source {
             if source!=self.other_pane.browser_source || self.other_pane.browser.is_none(){return;}
@@ -363,6 +409,11 @@ impl WindowState {
     pub(super) fn pane_title(&self,right:bool)->String {
         if right==self.active_pane_right { self.current_location().address() }
         else { self.session.secondary_pane.tabs.get(self.session.secondary_pane.active_tab).map(|t|t.current().address()).unwrap_or_default() }
+    }
+
+    #[cfg(test)]pub(super) fn pane_selection_paths(&self,right:bool)->Vec<String>{
+        let browser=if right==self.active_pane_right{self.browser.as_ref()}else{self.other_pane.browser.as_ref()};
+        browser.map_or_else(Vec::new,ExplorerBrowserHost::selection_paths)
     }
 
     pub(super) fn destroy_other_pane(&mut self) {
@@ -457,6 +508,45 @@ pub(super) fn native_exercise(slot:&Slot,output:&std::path::Path,pump:fn(u64))->
     ready()?;
     {let mut slot=slot.borrow_mut();slot.as_mut().unwrap().toggle_dual_pane();}
     ready()?;
+    // Both panes initially browse the very same folder. Re-enter it from a
+    // different folder, switch selection repeatedly and drain Shell callbacks.
+    for _ in 0..4{
+        {let mut slot=slot.borrow_mut();let state=slot.as_mut().unwrap();state.activate_pane(true);
+            unsafe{state.navigate_to(ShellLocation::Path(right.clone()));}}
+        ready()?;
+        {let mut slot=slot.borrow_mut();let state=slot.as_mut().unwrap();
+            unsafe{state.navigate_to(ShellLocation::Path(left.clone()));}}
+        ready()?;
+        for active_right in [false,true,false,true]{
+            {let mut slot=slot.borrow_mut();let state=slot.as_mut().unwrap();state.activate_pane(active_right);
+                state.defer_selection(vec!["left-only.txt".into()],false);}
+            pump(150);
+            let slot=slot.borrow();let state=slot.as_ref().unwrap();
+            ensure!(state.browser.as_ref().unwrap().selection_paths().iter().any(|path|path.ends_with("left-only.txt")),"same-directory pane selection lost");
+        }
+    }
+    {slot.borrow_mut().as_mut().unwrap().activate_pane(false);}
+    let created=left.join(format!("new-folder-selection-{}",std::process::id()));
+    {slot.borrow_mut().as_mut().unwrap().select_created_folder(created.clone());}
+    pump(100);std::fs::create_dir(&created)?;
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(8);
+    loop{pump(50);let selected=slot.borrow().as_ref().unwrap().browser.as_ref().unwrap().selection_paths();
+        if selected.iter().any(|path|PathBuf::from(path)==created){break;}
+        ensure!(std::time::Instant::now()<deadline,"new folder was not selected after asynchronous enumeration");
+    }
+    let edit=unsafe{GetFocus()};
+    ensure!(text_input_window(edit),"new folder did not enter inline rename");
+    unsafe{SendMessageW(edit,WM_KEYDOWN,Some(WPARAM(VK_ESCAPE.0 as usize)),None);}pump(100);
+    let revealed=left.join(format!("download-{}-2.exe",std::process::id()));
+    {let mut slot=slot.borrow_mut();let state=slot.as_mut().unwrap();
+        unsafe{state.open_requested(crate::instance::OpenRequest{location:ShellLocation::Path(left.clone()),
+            selection:Some(revealed.file_name().unwrap().to_os_string()),selections:Vec::new()});}}
+    pump(100);std::fs::write(&revealed,b"selection fixture; not an executable")?;
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(8);
+    loop{pump(50);let selected=slot.borrow().as_ref().unwrap().browser.as_ref().unwrap().selection_paths();
+        if selected.iter().any(|path|PathBuf::from(path)==revealed){break;}
+        ensure!(std::time::Instant::now()<deadline,"external reveal lost a late-arriving file selection");
+    }
     {
         let mut slot=slot.borrow_mut();let state=slot.as_mut().unwrap();
         ensure!(state.other_pane.browser.is_some(),"second Shell view missing");
@@ -470,6 +560,21 @@ pub(super) fn native_exercise(slot:&Slot,output:&std::path::Path,pump:fn(u64))->
         ensure!(state.session.secondary_pane.tabs[state.session.secondary_pane.active_tab].current().as_path()==Some(right.as_path()),"right folder did not finish independently");
         ensure!(state.browser.as_ref().unwrap().item_paths_limit(32).iter().any(|p|p.ends_with("left-only.txt")),"left view was replaced by right contents");
         ensure!(state.other_pane.browser.as_ref().unwrap().item_paths_limit(32).iter().any(|p|p.ends_with("right-only.txt")),"right view contents are wrong");
+    }
+    for (moving,kind) in [(false,"copy"),(true,"move")]{
+        let name=format!("direct-pane-{kind}-{}.txt",std::process::id());let source=left.join(&name);let target=right.join(&name);
+        ensure!(!source.exists()&&!target.exists(),"direct pane fixture already exists");
+        std::fs::write(&source,b"native direct pane transfer")?;
+        {let mut slot=slot.borrow_mut();let state=slot.as_mut().unwrap();state.activate_pane(false);state.defer_selection(vec![name.clone().into()],false);}
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(8);
+        loop{pump(25);if slot.borrow().as_ref().unwrap().browser.as_ref().unwrap().selection_paths().iter().any(|path|PathBuf::from(path)==source){break;}
+            ensure!(std::time::Instant::now()<deadline,"direct pane source did not materialize");}
+        {slot.borrow_mut().as_mut().unwrap().transfer_to_other_pane(moving);}
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(8);
+        loop{pump(25);if target.is_file()&&(!moving||!source.exists()){break;}
+            ensure!(std::time::Instant::now()<deadline,"direct pane {kind} did not complete");}
+        ensure!(std::fs::read(&target)?==b"native direct pane transfer","direct pane transfer changed contents");
+        ensure!(source.exists()!=moving,"copy/move source semantics differ");
     }
     let view={let mut slot=slot.borrow_mut();let state=slot.as_mut().unwrap();state.activate_pane(true);
         state.set_view_dimensions(windows::Win32::UI::Shell::FVM_ICON.0,48);state.view_hwnd};
@@ -486,6 +591,16 @@ pub(super) fn native_exercise(slot:&Slot,output:&std::path::Path,pump:fn(u64))->
     }
     ready()?;
     let before=slot.borrow().as_ref().unwrap().session.tabs.len();
+    let right_tabs=slot.borrow().as_ref().unwrap().session.secondary_pane.tabs.len();
+    {let slot=slot.borrow();let state=slot.as_ref().unwrap();
+        let identity=state.other_identity().context("inactive pane identity")?;
+        ensure!(pane_input::post_tab_paths(state.hwnd,identity,vec![right.clone(),nested.clone()]),"batch tab ticket rejected");}
+    ready()?;
+    {let mut slot=slot.borrow_mut();let state=slot.as_mut().unwrap();
+        ensure!(!state.active_pane_right&&state.session.secondary_pane.tabs.len()==right_tabs+2,"batched drop lost a path after the first tab changed its epoch");
+        state.activate_pane(true);let active=state.session.active_tab;unsafe{state.close_group(active,false);}
+        state.activate_pane(false);}
+    ready()?;
     {let mut slot=slot.borrow_mut();let state=slot.as_mut().unwrap();unsafe{state.new_tab(ShellLocation::Path(left.clone()));}}
     ready()?;
     {
@@ -517,5 +632,8 @@ pub(super) fn native_exercise(slot:&Slot,output:&std::path::Path,pump:fn(u64))->
     ensure!(slot.borrow().as_ref().unwrap().current_location().as_path()==Some(left.as_path()),"late closed-pane completion altered remaining pane");
     Ok(serde_json::json!({"independent_native_views":true,"background_navigation_does_not_steal_active_pane":true,
         "sent_ctrl_wheel":true,"double_click_closes_one_tab":true,"disable_releases_native_view":true,"right_folder_persisted":true,
-        "last_pane_tab_preserves_other_pane":true,"closed_pane_late_navigation_rejected":true}))
+        "last_pane_tab_preserves_other_pane":true,"closed_pane_late_navigation_rejected":true,
+        "same_folder_two_panes_repeated_navigation_and_selection":true,"new_folder_delayed_selection_and_rename":true,
+        "external_reveal_waits_for_file_enumeration":true,"batch_drop_preserves_all_paths_and_inactive_pane":true,
+        "direct_other_pane_copy_and_move":true}))
 }

@@ -822,12 +822,9 @@ impl IExplorerBrowserEvents_Impl for BrowserEvents_Impl {
         self.selection_revision.set(self.selection_revision.get().wrapping_add(1));
         if let Some(view) = shell_view.as_ref() {
             view_background::install(view,self.background.clone());
-            if let Ok(folder)=view.cast::<IFolderView2>(){
-                use windows::Win32::UI::Shell::{FWF_NOHEADERINALLVIEWS,FWF_NOCOLUMNHEADER};
-                let _=unsafe{folder.SetCurrentFolderFlags((FWF_NOHEADERINALLVIEWS|FWF_NOCOLUMNHEADER).0 as u32,FWF_NOHEADERINALLVIEWS.0 as u32)};
-            }
             unsafe { super::menu::attach_view_menu(view, self.modern.clone()); }
             if self.results_active.get() { configure_results_columns(view); }
+            if let Ok(folder)=view.cast::<IFolderView2>(){let _=super::view_state::sync_column_header(&folder);}
         }
         Ok(())
     }
@@ -837,9 +834,10 @@ impl IExplorerBrowserEvents_Impl for BrowserEvents_Impl {
         pidl_folder: *const windows::Win32::UI::Shell::Common::ITEMIDLIST,
     ) -> Result<()> {
         self.selection_revision.set(self.selection_revision.get().wrapping_add(1));
-        if self.results_active.get() {
-            if let Some(browser) = self.browser.upgrade() {
-                if let Ok(view) = unsafe { browser.GetCurrentView::<IShellView>() } { configure_results_columns(&view); }
+        if let Some(browser) = self.browser.upgrade() {
+            if let Ok(view) = unsafe { browser.GetCurrentView::<IShellView>() } {
+                if self.results_active.get(){configure_results_columns(&view);}
+                if let Ok(folder)=view.cast::<IFolderView2>(){let _=super::view_state::sync_column_header(&folder);}
             }
         }
         let logical = if self.results_active.get() { self.results_location.borrow().clone() } else { None };
@@ -865,6 +863,7 @@ fn configure_results_columns(view: &IShellView) {
     let Ok(folder) = view.cast::<IFolderView2>() else { return };
     if unsafe { folder.GetFolder::<IResultsFolder>() }.is_err() { return; }
     let _ = unsafe { folder.SetViewModeAndIconSize(FVM_DETAILS, 16) };
+    let _=super::view_state::sync_column_header(&folder);
     let Ok(columns) = view.cast::<IColumnManager>() else { return };
     let mut keys = Vec::new();
     for name in ["System.ItemNameDisplay", "System.ItemFolderPathDisplay", "System.DateModified", "System.Size"] {

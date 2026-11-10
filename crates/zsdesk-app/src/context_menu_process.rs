@@ -203,6 +203,8 @@ pub struct MenuTimings {
     pub com_microseconds:u64,pub worker_setup_microseconds:u64,pub validation_microseconds:u64,
     pub worker_to_menu_microseconds:Option<u64>,pub parent_to_menu_microseconds:Option<u64>,pub status_reads:u64,
     pub parent_validation_microseconds:u64,pub worker_validation_count:u64,pub menu_open_observation:Option<String>,
+    #[serde(default)]pub foreground_microseconds:u64,
+    #[serde(default)]pub tracking_to_menu_microseconds:Option<u64>,
 }
 #[derive(Clone,Serialize,Deserialize)]
 struct Status{token:String,pid:u32,window:isize,phase:String,validation:u64,before_invoke:bool,outcome:Option<MenuOutcome>,error:Option<String>,bind_microseconds:u64,populate_microseconds:u64,
@@ -295,7 +297,7 @@ fn cleanup(workspace:&Path){
 }
 
 #[derive(Serialize,Deserialize)]
-struct MenuOpened{token:String,pid:u32,at:u64,worker_started:u64,observation:String}
+struct MenuOpened{token:String,pid:u32,at:u64,worker_started:u64,observation:String,#[serde(default)]tracking_started:u64}
 
 pub struct Client{
     child:Option<Child>,job:Option<usize>,workspace:PathBuf,token:String,session:String,events:Option<EventSet>,
@@ -391,6 +393,7 @@ impl Client{
                 self.timing.fault_report_available=status.timing.fault_report_available;
                 self.timing.com_microseconds=status.timing.com_microseconds;self.timing.worker_setup_microseconds=status.timing.worker_setup_microseconds;
                 self.timing.validation_microseconds=status.timing.validation_microseconds;self.timing.worker_validation_count=status.validation;
+                self.timing.foreground_microseconds=status.timing.foreground_microseconds;
                 self.last_status=Some(status);
             }
         }
@@ -399,6 +402,7 @@ impl Client{
                 if opened.token==self.token&&self.pid()==Some(opened.pid)&&opened.at>=self.started_counter{
                     self.timing.parent_to_menu_microseconds=Some(opened.at-self.started_counter);
                     self.timing.worker_to_menu_microseconds=Some(opened.at.saturating_sub(opened.worker_started));
+                    self.timing.tracking_to_menu_microseconds=(opened.tracking_started!=0).then_some(opened.at.saturating_sub(opened.tracking_started));
                     self.timing.menu_open_observation=Some(opened.observation);
                 }
             }
@@ -554,6 +558,7 @@ struct Worker<'a>{request:Request,path:PathBuf,status:Status,events:&'a EventSet
 struct Watch{
     request:Request,path:PathBuf,status_event:usize,cancel_event:usize,worker_started:u64,
     menu_open:std::cell::Cell<bool>,
+    tracking_started:std::cell::Cell<u64>,
     #[cfg(test)]command:std::cell::Cell<Option<u32>>,
 }
 extern "C"{fn zs_menu_is_open(owner:HWND)->i32;}
@@ -613,7 +618,7 @@ impl Watch{
         if let Some(observation)=observation{
             self.menu_open.set(true);
             #[cfg(test)]if self.request.probe.as_deref()==Some("menu-dismiss"){unsafe{SetTimer(Some(hwnd),2,80,None);}}
-            let value=MenuOpened{token:self.request.token.clone(),pid:std::process::id(),at:monotonic_us(),worker_started:self.worker_started,observation:observation.into()};
+            let value=MenuOpened{token:self.request.token.clone(),pid:std::process::id(),at:monotonic_us(),worker_started:self.worker_started,observation:observation.into(),tracking_started:self.tracking_started.get()};
             if write(&self.path.with_file_name("opened.json"),&value).is_ok(){EventSet::signal(self.status_event);}
             unsafe{SetTimer(Some(hwnd),1,100,None);}
         }
@@ -656,7 +661,7 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
     let instance=HINSTANCE(unsafe{GetModuleHandleW(None)}.context("menu owner module")?.0);let class=w!("ZSDesk.ExtensionMenu.Worker");
     unsafe{RegisterClassW(&WNDCLASSW{hInstance:instance,lpfnWndProc:Some(procedure),lpszClassName:class,..Default::default()});}
     let watch=Box::new(Watch{request:state.request.clone(),path:path.into(),status_event:events.status,cancel_event:events.cancel,
-        worker_started,menu_open:std::cell::Cell::new(false),#[cfg(test)]command:std::cell::Cell::new(None)});
+        worker_started,menu_open:std::cell::Cell::new(false),tracking_started:std::cell::Cell::new(0),#[cfg(test)]command:std::cell::Cell::new(None)});
     let window=unsafe{CreateWindowExW(WS_EX_TOOLWINDOW,class,w!("ZSdesk"),WS_POPUP,0,0,0,0,None,None,Some(instance),Some((&*watch as*const Watch).cast()))}.context("create menu owner window")?;
     struct Window(HWND);impl Drop for Window{fn drop(&mut self){let _=unsafe{DestroyWindow(self.0)};}}let owned_window=Window(window);
     state.status.window=window.0 as isize;unsafe{SetTimer(Some(window),1,15,None);}
@@ -693,13 +698,16 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
                 .find(|id|menu.verb(*id).is_some_and(|verb|verb.eq_ignore_ascii_case("copy"))).context("native copy command missing")?;
             watch.command.set(Some(command));
         }
+        let foreground_started=Instant::now();
         unsafe{let _=ShowWindow(window,SW_SHOWNOACTIVATE);let _=SetForegroundWindow(window);}
+        state.status.timing.foreground_microseconds=micros(foreground_started.elapsed());
         let point=POINT{x:request.point[0],y:request.point[1]};
         #[cfg(test)]let probe_outcome=if request.probe.as_deref()==Some("background-details"){
             ensure!(background_view.is_some(),"background view required");let command=isolation_tests::background_details_command(&menu)?;
             state.allow(true)?;menu.invoke(window,command,None,false,false)?;Some(MenuOutcome::ShellInvoked)
         }else{None};
         #[cfg(not(test))]let probe_outcome:Option<MenuOutcome>=None;
+        watch.tracking_started.set(monotonic_us());
         let outcome=if let Some(outcome)=probe_outcome{outcome}
             else if let (Some(item),Some(host))=(&background,&background_view){menu.track_background_view(window,point,item,&host.browser,&mut||state.allow(true))?}
             else if request.pidls.is_empty(){menu.track_folder_background(window,point,request.folder.as_deref().unwrap(),0,&mut||state.allow(true))?}

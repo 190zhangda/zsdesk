@@ -203,7 +203,7 @@ pub fn enumerate_folder(path: &Path) -> Result<Vec<ShellEntry>> {
 /// Resolves a saved member even when the live desktop view is hidden or omits it.
 pub fn entry_from_parsing_name(key: &str) -> Option<ShellEntry> {
     let location = if key.starts_with("::{") || key.starts_with("shell:") {
-        zsdesk_core::model::explorer::ShellLocation::Shell { parsing_name: key.into(), title: String::new() }
+        zsdesk_core::model::explorer::ShellLocation::Shell { pidl:None, parsing_name: key.into(), title: String::new() }
     } else { zsdesk_core::model::explorer::ShellLocation::Path(PathBuf::from(key)) };
     let absolute = pidl::location_pidl(&location)?;
     let mut child: *mut ITEMIDLIST = std::ptr::null_mut();

@@ -17,6 +17,29 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore="Read-only native Shell ordering comparison on isolated fixture folders; requires ZSDESK_NATIVE_TEST_OUTPUT"]
+    fn native_filename_order_matches_windows_shell()->anyhow::Result<()>{
+        use anyhow::{Context,ensure};
+        use windows::{core::w,Win32::{Foundation::RECT,System::Ole::{OleInitialize,OleUninitialize},UI::WindowsAndMessaging::*}};
+        use zsdesk_windows::shell::{ExplorerBrowserHost,Panes,commands::Column};
+        let output=std::path::PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("isolated output required")?);
+        ensure!(output.is_absolute(),"absolute fixture root required");let root=output.join("system-sort-fixtures");std::fs::create_dir_all(&root)?;
+        let names=["文件10","文件2","阿","波","赵","张","A10","A2","ä","z","_one","-two"];
+        for name in names{std::fs::create_dir_all(root.join(name))?;}
+        unsafe{OleInitialize(None)}?;struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
+        let hwnd=unsafe{CreateWindowExW(WS_EX_NOACTIVATE,w!("STATIC"),w!("Sort fixture"),WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,
+            -30000,-30000,900,650,None,None,None,None)}?;
+        struct Window(windows::Win32::Foundation::HWND);impl Drop for Window{fn drop(&mut self){let _=unsafe{DestroyWindow(self.0)};pump(30);}}let _window=Window(hwnd);
+        let browser=unsafe{ExplorerBrowserHost::create_transient(hwnd,RECT{left:0,top:0,right:880,bottom:610},false,Panes::default())}?;
+        browse(&browser,&root)?;browser.set_group(None)?;browser.set_sort(Column::Name,true)?;pump(200);
+        let actual=browser.item_paths_limit(64).into_iter().filter_map(|path|std::path::Path::new(&path).file_name().map(|name|name.to_string_lossy().into_owned())).collect::<Vec<_>>();
+        let mut expected=names.iter().map(|name|name.to_string()).collect::<Vec<_>>();expected.sort_by(|a,b|zsdesk_core::model::view::natural_cmp(a,b));
+        ensure!(actual==expected,"native collation differs: Shell={actual:?}, model={expected:?}");
+        std::fs::write(output.join("system-sort.current.json"),serde_json::to_vec_pretty(&serde_json::json!({"state":"passed","shell":actual,"model":expected,"user_settings_changed":false}))?)?;
+        Ok(())
+    }
+
+    #[test]
     fn folder_preferences_share_a_profile_but_not_a_different_profile() {
         let root = std::env::temp_dir().join("zsdesk-view-memory-identity");
         let profile = root.join("配置").join("explorer-session.json");

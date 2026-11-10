@@ -32,8 +32,8 @@ impl WindowState {
         }
         let index=self.session.tabs.iter().position(|t|shell_registration::same_location(t.current(),&request.location));
         if index==Some(self.session.active_tab){
-            if !request.selections.is_empty(){if let Some(browser)=&self.browser{let _=browser.select_children(&request.selections);}return;}
-            if let (Some(browser),Some(name))=(&self.browser,request.selection){let _=browser.select_child(&name);}
+            let names=if request.selections.is_empty(){request.selection.into_iter().collect()}else{request.selections};
+            self.defer_selection(names,false);
             return;
         }
         self.launch_selection=request.selection;
@@ -48,6 +48,7 @@ impl WindowState {
         if let Some(tab)=self.session.tabs.iter_mut().find(|t|t.id==id) {tab.view=snapshot;}
     }
     pub(super) unsafe fn request_navigation(&mut self,request:NavigationRequest) {
+        self.deferred_selection=None;
         self.navigation_epoch=self.navigation_epoch.wrapping_add(1);
         self.folder_sizes.cancel();
         if !self.background_pane {self.end_address_edit();}
@@ -140,10 +141,9 @@ impl WindowState {
                     if let (Some(browser),Some(view))=(&self.browser,&self.session.tabs[index].view) {
                         unsafe {browser.restore_view(view);}
                     }
-                    if let (Some(browser),Some(name))=(&self.browser,self.launch_selection.take()) {
-                        if let Err(e)=browser.select_child(&name) {self.show_message(format!("无法选中项目：{e}"));}
-                    }
-                    if !self.launch_selections.is_empty(){if let Some(browser)=&self.browser{if let Err(e)=browser.select_children(&self.launch_selections){self.show_message(format!("无法选中项目：{e}"));}}self.launch_selections.clear();}
+                    let names=if self.launch_selections.is_empty(){self.launch_selection.take().into_iter().collect()}
+                        else{self.launch_selection=None;std::mem::take(&mut self.launch_selections)};
+                    self.defer_selection(names,false);
                 }
             } else {self.shown_tab=None;}
         } else if let Some(id)=self.shown_tab {
@@ -238,7 +238,10 @@ impl WindowState {
         let target=match self.current_location() {
             ShellLocation::Path(path)=>path.parent().map(|p|ShellLocation::Path(p.into())).unwrap_or(ShellLocation::ThisPc),
             ShellLocation::ThisPc=>return,
-            ShellLocation::Shell {..}=>ShellLocation::ThisPc,
+            location@ShellLocation::Shell {..}=>unsafe{zsdesk_windows::shell::shell_item(location)}.ok()
+                .and_then(|item|unsafe{item.GetParent()}.ok())
+                .and_then(|parent|unsafe{zsdesk_windows::shell::location_from_shell_item(&parent)})
+                .unwrap_or(ShellLocation::ThisPc),
             ShellLocation::Search {scope,..}=>scope.clone().map(ShellLocation::Path).unwrap_or(ShellLocation::ThisPc),
         };
         unsafe {self.navigate_to(target);}
@@ -301,6 +304,12 @@ impl WindowState {
         unsafe{self.commit_address_text(&text);}
     }
     pub(super) unsafe fn commit_address_text(&mut self,text:&str) {
+        if matches!(self.current_location(),ShellLocation::Shell{parsing_name,pidl:Some(_),..} if parsing_name.trim().is_empty())
+            &&text.trim()==self.current_location().address(){
+            // A provider label is display-only. Preserve its PIDL when the
+            // user accepts an unchanged address instead of parsing the label.
+            self.end_address_edit();self.focus_view();return;
+        }
         if let Some(request)=super::terminal::parse(&text) {
             match request {
                 Ok(request)=>if self.launch_terminal(&request) { self.end_address_edit(); },
@@ -336,12 +345,12 @@ fn parse_address_with(text:&str,lookup:impl Fn(&str)->Option<String>)->Option<Sh
     let text=expanded.trim().trim_matches('"');
     if text.is_empty(){return None;}
     if text=="此电脑" || text.eq_ignore_ascii_case("this pc") || text.eq_ignore_ascii_case("shell:MyComputerFolder") {return Some(ShellLocation::ThisPc);}
-    if has_prefix(text,"shell:") || text.starts_with("::{") {return Some(ShellLocation::Shell{parsing_name:text.into(),title:"Shell".into()});}
+    if has_prefix(text,"shell:") || text.starts_with("::{") {return Some(ShellLocation::Shell{pidl:None, parsing_name:text.into(),title:"Shell".into()});}
     let lower=text.to_ascii_lowercase();
     // FTP sites open in the Windows Shell FTP folder.
     if lower.starts_with("ftp://") {
         let host=text[6..].split(['/','\\']).next().unwrap_or("FTP").rsplit('@').next().unwrap_or("FTP").to_string();
-        return Some(ShellLocation::Shell{parsing_name:text.into(),title:host});
+        return Some(ShellLocation::Shell{pidl:None, parsing_name:text.into(),title:host});
     }
     if let Some(unc)=smb_to_unc(text) {return Some(ShellLocation::Path(unc));}
     if let Some(unc)=sftp_to_unc(text) {return Some(ShellLocation::Path(unc));}

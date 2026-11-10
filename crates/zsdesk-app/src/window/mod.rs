@@ -16,6 +16,7 @@ mod navigation;
 mod address_input;
 mod terminal;
 mod quick_preview;
+mod quicklook;
 pub(crate) mod preview_process;
 mod wps_preview;
 mod preview_handlers;
@@ -36,10 +37,13 @@ mod wheel_input;
 mod folder_sizes;
 mod view_memory;
 mod shell_registration;
+mod deferred_selection;
 pub(crate) mod diagnostics;
 #[cfg(test)]mod integration_navigation_regression;
 #[cfg(test)]
 mod selection_regression;
+#[cfg(test)]
+mod thumbnail_regression;
 #[cfg(test)]
 mod geometry_regression;
 #[cfg(test)]
@@ -86,7 +90,6 @@ pub(super) const ACTION_CLOSE_SEARCH:usize=2114;
 const WM_LAYOUT: u32 = WM_APP + 2;
 pub(super) const WM_ACTION: u32 = WM_APP + 3;
 const WM_OPEN_REQUEST: u32 = WM_APP + 4;
-const WM_OPEN_TAB_PATH: u32 = WM_APP + 5;
 const TIMER_STATUS: usize = 1;
 const TIMER_MESSAGE: usize = 2;
 const TIMER_SEARCH: usize = 3;
@@ -224,7 +227,9 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
         }
         let plain_key=msg.message==WM_KEYDOWN && ![VK_CONTROL,VK_SHIFT,VK_MENU].iter().any(|k|unsafe{GetKeyState(k.0 as i32)}<0);
         let enabled=slot.try_borrow().ok().and_then(|s|s.as_ref().map(|s|s.session.ui.space_preview)).unwrap_or(false);
-        if plain_key && !text_input_window(msg.hwnd) && (msg.wParam.0==VK_SPACE.0 as usize || (msg.wParam.0==VK_ESCAPE.0 as usize && quick_preview.as_ref().is_some_and(|p|p.is_open()))){
+        let preview_open=quick_preview.as_ref().is_some_and(|p|p.is_open());
+        if !enabled&&!preview_open&&quicklook::key(&msg,&slot){continue;}
+        if (enabled||preview_open)&&plain_key && !text_input_window(msg.hwnd) && (msg.wParam.0==VK_SPACE.0 as usize || (msg.wParam.0==VK_ESCAPE.0 as usize && preview_open)){
             if msg.lParam.0 as usize & (1usize<<30)!=0 { continue; }
             if quick_preview.as_ref().is_some_and(|p|p.is_open()){hover_preview.dismiss(&mut quick_preview);quick_preview=None;continue;}
             if enabled && msg.wParam.0==VK_SPACE.0 as usize {
@@ -282,12 +287,12 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
     drop(pane_preview);
     let _ = unsafe { DestroyAcceleratorTable(accelerators) };
     // Posted payloads still own their allocation even after the receiver is destroyed.
-    for message in [WM_SHELL_NAVIGATED, WM_SHELL_FOLDER_INVOKED, WM_BOOKMARK_PATH_DROPPED, WM_OPEN_REQUEST, WM_TREE_NAVIGATE, WM_OPEN_TAB_PATH, WM_SHELL_SELECTION_CHANGED,crate::routing_control::WM_RESULT,WM_DIAGNOSTIC] {
+    for message in [WM_SHELL_NAVIGATED, WM_SHELL_FOLDER_INVOKED, WM_BOOKMARK_PATH_DROPPED, WM_OPEN_REQUEST, WM_TREE_NAVIGATE, WM_SHELL_SELECTION_CHANGED,crate::routing_control::WM_RESULT,WM_DIAGNOSTIC] {
         while unsafe { PeekMessageW(&mut msg, Some(hwnd), message, message, PM_REMOVE) }.as_bool() {
             if msg.lParam.0 == 0 { continue; }
             unsafe {
                 match message {
-                    WM_BOOKMARK_PATH_DROPPED | WM_OPEN_TAB_PATH => drop(Box::from_raw(msg.lParam.0 as *mut PathBuf)),
+                    WM_BOOKMARK_PATH_DROPPED => drop(Box::from_raw(msg.lParam.0 as *mut PathBuf)),
                     WM_OPEN_REQUEST => drop(Box::from_raw(msg.lParam.0 as *mut crate::instance::OpenRequest)),
                     WM_SHELL_SELECTION_CHANGED => acknowledge_selection_changed(msg.lParam.0),
                     crate::routing_control::WM_RESULT => drop(Box::from_raw(msg.lParam.0 as *mut String)),
@@ -334,7 +339,7 @@ pub(super) struct BookmarkDrag { pub id:u64,pub start:POINT,pub point:POINT,pub 
 
 /// Drop zones of the chrome shared with the OLE drop target.
 #[derive(Clone, Copy, Default)]
-pub(super) struct DropZones { pub bookmarks: LayoutRect, pub strip: LayoutRect, pub tabs:LayoutRect }
+pub(super) struct DropZones { pub bookmarks: LayoutRect, pub strip: LayoutRect, pub tabs:LayoutRect, pub identity:Option<pane_input::Identity> }
 
 struct WindowState {
     search_panel:search_panel::SearchPanel,
@@ -400,6 +405,7 @@ struct WindowState {
     status: String,
     launch_selection: Option<std::ffi::OsString>,
     launch_selections: Vec<std::ffi::OsString>,
+    deferred_selection: Option<deferred_selection::Pending>,
     open_requests: std::collections::VecDeque<crate::instance::OpenRequest>,
     /// Folder the current search started from, and the results location it produced.
     search_scope: Option<ShellLocation>,
@@ -438,7 +444,7 @@ impl WindowState {
             icons: HashMap::new(), view_status: ViewStatus::default(), view_mode: (0, 0), bookmark_widths: Vec::new(),bookmark_order:Vec::new(),
             drop_registration: None, drop_zones: Rc::new(Cell::new(DropZones::default())), last_focus: HWND::default(),
             pending: None, queued: None, shown_tab: None, closed_tabs: Vec::new(), status: String::new(),
-            launch_selection, launch_selections:Vec::new(), open_requests: Default::default(), search_scope: None, search_result: None,
+            launch_selection, launch_selections:Vec::new(), deferred_selection:None, open_requests: Default::default(), search_scope: None, search_result: None,
             browser_role:BrowserRole::Fresh,fast_search:None,fast_generation:0,fast_submitted:None,fast_found:0,search_progress:None,fast_events:Default::default(),
             fast_reset_pending:false,fast_clearing:None,fast_restore:None,
             search_settings_job:None,
@@ -577,7 +583,8 @@ impl WindowState {
         }
         self.layout_dual_pane();
         self.layout_crumbs();
-        self.drop_zones.set(DropZones { bookmarks: self.layout.bookmarks_row, strip: self.layout.strip,tabs:self.layout.tab_panel });
+        self.drop_zones.set(DropZones { bookmarks: self.layout.bookmarks_row, strip: self.layout.strip,tabs:self.layout.tab_panel,
+            identity:if self.background_pane{self.drop_zones.get().identity}else{self.identity_for_source(self.browser_source)} });
         let frame_height=if crate::edition::THEMED && self.mica {self.layout.browser.y}else{self.layout.strip.height};
         theme::extend_frame(self.hwnd, if self.fullscreen_restore.is_some() { 0 } else { frame_height });
     }
@@ -859,6 +866,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     // cursors. Returning FALSE lets the child finish WM_SETCURSOR processing.
     if msg == WM_SETCURSOR && wp.0 != hwnd.0 as usize { return LRESULT(0); }
     if msg == WM_SETCURSOR {
+        if (lp.0&0xffff)as u32==HTCAPTION{
+            if let Ok(cursor)=unsafe{LoadCursorW(None,IDC_ARROW)}{unsafe{SetCursor(Some(cursor));}return LRESULT(1);}
+        }
         if let Some(cursor)=resize_cursor((lp.0&0xffff)as u32){
             if let Ok(cursor)=unsafe{LoadCursorW(None,cursor)}{unsafe{SetCursor(Some(cursor));}return LRESULT(1);}
         }
@@ -1085,7 +1095,7 @@ unsafe fn reentrant(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             LRESULT(0)
         }
         WM_CLOSE | WM_LAYOUT | WM_ACTION | WM_SHELL_NAVIGATED | WM_SHELL_FOLDER_INVOKED | WM_SHELL_NAVIGATION_FAILED | WM_BOOKMARK_PATH_DROPPED
-        | WM_OPEN_REQUEST | WM_TREE_NAVIGATE | WM_OPEN_TAB_PATH | WM_SHELL_SELECTION_CHANGED | crate::routing_control::WM_RESULT | WM_FAST_SEARCH | WM_DIAGNOSTIC
+        | WM_OPEN_REQUEST | WM_TREE_NAVIGATE | WM_SHELL_SELECTION_CHANGED | crate::routing_control::WM_RESULT | WM_FAST_SEARCH | WM_DIAGNOSTIC
         | WM_CANCELMODE | WM_CAPTURECHANGED | WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED | WM_SYSCOLORCHANGE | pane_input::MESSAGE | crate::shell_window_registry::WM_SELECT => {
             defer_message(hwnd,msg,wp,lp);
             LRESULT(0)
@@ -1116,7 +1126,7 @@ fn flush_deferred(hwnd:HWND,live:bool){
         if live && unsafe{PostMessageW(Some(h),message,wp,lp)}.is_ok(){continue;}
         if lp.0==0{continue;}
         unsafe{match message{
-            WM_BOOKMARK_PATH_DROPPED|WM_OPEN_TAB_PATH=>drop(Box::from_raw(lp.0 as *mut PathBuf)),
+            WM_BOOKMARK_PATH_DROPPED=>drop(Box::from_raw(lp.0 as *mut PathBuf)),
             WM_OPEN_REQUEST=>drop(Box::from_raw(lp.0 as *mut crate::instance::OpenRequest)),
             WM_SHELL_SELECTION_CHANGED=>acknowledge_selection_changed(lp.0),
             crate::routing_control::WM_RESULT=>drop(Box::from_raw(lp.0 as *mut String)),
@@ -1209,6 +1219,7 @@ impl WindowState {
             }
             WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED | WM_SYSCOLORCHANGE => self.refresh_system_theme(),
             WM_TIMER => {
+                if wp.0==deferred_selection::TIMER{self.poll_pane_selections();}
                 if wp.0==TIMER_PLACEMENT{let _=unsafe{KillTimer(Some(self.hwnd),TIMER_PLACEMENT)};self.remember_placement();self.save();}
                 if wp.0 == TIMER_STATUS { self.update_shell_registry();self.refresh_status();self.poll_search_settings();self.poll_pane_searches();self.poll_folder_sizes(); }
                 if wp.0 == TIMER_SEARCH { let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_SEARCH) }; unsafe { self.live_search(); } }
@@ -1289,11 +1300,6 @@ impl WindowState {
                 if wp.0 != 0 { unsafe { self.new_tab(location); } } else { unsafe { self.navigate_from_tree(location); } }
             },
             WM_BOOKMARK_PATH_DROPPED => if lp.0 != 0 { self.add_bookmark_path(unsafe { *Box::from_raw(lp.0 as *mut PathBuf) }); },
-            WM_OPEN_TAB_PATH => if lp.0 != 0 {
-                let path = unsafe { *Box::from_raw(lp.0 as *mut PathBuf) };
-                let target = if path.is_dir() { path } else { path.parent().map(PathBuf::from).unwrap_or(path) };
-                unsafe { self.new_tab(ShellLocation::Path(target)); }
-            },
             WM_OPEN_REQUEST => if lp.0 != 0 { unsafe { self.open_requested(*Box::from_raw(lp.0 as *mut crate::instance::OpenRequest)); } },
             WM_FAST_SEARCH => self.poll_pane_searches(),
             WM_DIAGNOSTIC=>if lp.0!=0{let request=unsafe{Box::from_raw(lp.0 as *mut crate::instance::DiagnosticRequest)};let _=self.write_diagnostics(&request);},
@@ -1301,7 +1307,7 @@ impl WindowState {
             message if message>=0xC000&&message==zsdesk_windows::shell::file_transfer::result_message()=>{
                 let code=wp.0 as u32;
                 if code==0{
-                    if let Some(path)=zsdesk_windows::shell::file_transfer::take_created_folder(self.hwnd){if let(Some(browser),Some(name))=(&self.browser,path.file_name()){let _=browser.select_child(name);let _=browser.rename_selection();}}
+                    while let Some(path)=zsdesk_windows::shell::file_transfer::take_created_folder(self.hwnd){self.select_created_folder(path);}
                 }else if code!=0x800704c7{self.show_message(format!("文件操作未完成：{}",windows::core::Error::from_hresult(windows::core::HRESULT(code as i32))));}
             },
             message if message >= 0xC000 && message == zsdesk_windows::shell::menu::failure_message() => {
@@ -1338,11 +1344,15 @@ impl DropHandler for ChromeDrop {
     fn leave(&self) { self.accepted.set(false); }
     fn dropped(&self, data: &windows::Win32::System::Com::IDataObject, _keys: u32, point: POINT, _allowed: DROPEFFECT) -> DROPEFFECT {
         let Some(bookmarks) = self.zone(point).filter(|_| self.accepted.get()) else { return DROPEFFECT_NONE };
-        let message = if bookmarks { WM_BOOKMARK_PATH_DROPPED } else { WM_OPEN_TAB_PATH };
-        for path in hdrop_paths(data).into_iter().take(32) {
-            if !bookmarks {hover_preview::post_tab_path(HWND(self.hwnd as *mut _),0,path);continue;}
+        let paths=hdrop_paths(data).into_iter().take(32).collect::<Vec<_>>();
+        if !bookmarks{
+            let sent=self.zones.get().identity.is_some_and(|identity|
+                pane_input::post_tab_paths(HWND(self.hwnd as*mut _),identity,paths));
+            return if sent{DROPEFFECT_LINK}else{DROPEFFECT_NONE};
+        }
+        for path in paths {
             let payload = Box::into_raw(Box::new(path));
-            if unsafe { PostMessageW(Some(HWND(self.hwnd as *mut _)), message, WPARAM(0), LPARAM(payload as isize)) }.is_err() {
+            if unsafe { PostMessageW(Some(HWND(self.hwnd as *mut _)), WM_BOOKMARK_PATH_DROPPED, WPARAM(0), LPARAM(payload as isize)) }.is_err() {
                 unsafe { drop(Box::from_raw(payload)); }
             }
         }

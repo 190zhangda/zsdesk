@@ -136,13 +136,13 @@ impl WindowState {
     }
     /// Starts another file window at `location` in the same profile.
     pub(super) fn open_in_new_window(&mut self,location:&ShellLocation)->bool {
-        let target:std::ffi::OsString=match location{ShellLocation::Path(path)=>path.as_os_str().to_owned(),ShellLocation::Shell{parsing_name,..}=>parsing_name.into(),
-            ShellLocation::Search{scope:Some(scope),..}=>scope.as_os_str().to_owned(),_=>"--this-pc".into()};
-        let profile=self.config_path.parent().unwrap_or(std::path::Path::new(".")).as_os_str().to_owned();
-        let arguments=vec!["--new-window".into(),"--profile-dir".into(),profile.clone(),target.clone()];
-        match crate::runtime::enqueue_local(&self.config_path,arguments){Ok(true)=>return true,Err(error)=>{self.show_message(error.to_string());return false;},Ok(false)=>{}}
-        let mut command = std::process::Command::new(match std::env::current_exe() { Ok(path)=>path, Err(error)=>{self.show_message(error.to_string());return false;} });
-        command.arg("--new-window").arg("--profile-dir").arg(profile).arg(target);
+        let profile=self.config_path.parent().unwrap_or(std::path::Path::new("."));
+        let arguments=match crate::app::new_window_arguments(profile,location){Ok(args)=>args,Err(error)=>{self.show_message(error.to_string());return false;}};
+        match crate::runtime::enqueue_local(&self.config_path,arguments.clone()){Ok(true)=>return true,Err(error)=>{self.show_message(error.to_string());return false;},Ok(false)=>{}}
+        let executable=match std::env::current_exe(){Ok(path)=>path,Err(error)=>{self.show_message(error.to_string());return false;}};
+        if !crate::app::window_command_line_fits(&executable,&arguments){self.show_message("窗口位置超过系统命令行容量，标签页已保留".into());return false;}
+        let mut command = std::process::Command::new(executable);
+        command.args(arguments);
         match command.spawn(){Ok(_)=>true,Err(error)=>{self.show_message(format!("无法打开新窗口：{error}"));false}}
     }
     /// A tab dragged out of the tab strip continues in its own window.

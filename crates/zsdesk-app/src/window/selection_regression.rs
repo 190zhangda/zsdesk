@@ -76,6 +76,12 @@ fn select(shell: &IShellView, index: i32, replace: bool) -> Result<()> {
 fn capture(shell: &IShellView, root: &Path, name: &str) -> Result<(Value, Vec<u8>)> {
     pump(160);
     let window = unsafe { shell.GetWindow()? };
+    // These windows are deliberately outside the visible desktop. DefView may
+    // defer a buffer repaint there even after its selection model is current;
+    // synchronize this owned view before reading pixels through PrintWindow.
+    use windows::Win32::Graphics::Gdi::{RedrawWindow,RDW_INVALIDATE,RDW_UPDATENOW,RDW_ALLCHILDREN};
+    ensure!(unsafe{RedrawWindow(Some(window),None,None,RDW_INVALIDATE|RDW_UPDATENOW|RDW_ALLCHILDREN)}.as_bool(),"native view repaint failed");
+    pump(40);
     let mut rect = RECT::default();
     unsafe { GetClientRect(window, &mut rect)?; }
     let (width, height) = (rect.right, rect.bottom);
@@ -90,7 +96,7 @@ fn capture(shell: &IShellView, root: &Path, name: &str) -> Result<(Value, Vec<u8
     let folder: IFolderView2 = shell.cast()?;
     let record = json!({"frame": name, "width": width, "height": height,
         "selected": unsafe { folder.ItemCount(SVGIO_SELECTION)? },
-        "focus": unsafe { GetFocus() }.0 as usize, "view_window": window.0 as usize});
+        "focus": unsafe { GetFocus() }.0 as usize, "view_window": window.0 as usize,"explicit_native_repaint":true});
     Ok((record, pixels))
 }
 
@@ -200,7 +206,7 @@ fn full_window_keeps_selection_background_after_navigation() -> Result<()> {
     wait_navigation(&slot)?;
     let shell = view(&slot)?;
     let folder: IFolderView2 = shell.cast()?;
-    unsafe { folder.SetViewModeAndIconSize(FVM_DETAILS, 16)?; }
+    slot.borrow().as_ref().unwrap().browser.as_ref().unwrap().set_view_mode(FVM_DETAILS.0,16)?;
     clear_selection(&shell)?;
     let (baseline, empty) = capture(&shell, &output, "unselected")?;
     let width = baseline["width"].as_u64().unwrap() as usize;

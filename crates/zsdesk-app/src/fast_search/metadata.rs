@@ -11,6 +11,18 @@ pub const BLOCKED:u8=32;
 pub const UNKNOWN:u64=u64::MAX;
 pub const MAX_ROWS:usize=32_000_000;
 pub const MAX_HEAP_BYTES:usize=512*1024*1024;
+// Compacted and restored columns have no spare capacity. Vec's default growth
+// doubles every column on the first journal append, even for one changed file.
+fn reserve_column<T>(column:&mut Vec<T>,additional:usize)->Result<()>{
+    let required=column.len().checked_add(additional).ok_or_else(||anyhow::anyhow!("索引列超出容量"))?;
+    if required>column.capacity(){
+        let element=std::mem::size_of::<T>().max(1);
+        let growth=(column.capacity()/8).clamp((4096/element).max(1),(1024*1024/element).max(1));
+        let capacity=required.max(column.capacity().saturating_add(growth));
+        column.try_reserve_exact(capacity-column.len())?;
+    }
+    Ok(())
+}
 pub struct VolumeIndex {
     pub root:PathBuf,pub serial:u32,pub journal_id:u64,pub checkpoint:i64,pub has_journal:bool,
     pub mft:bool,pub denied:u64,pub index:Index,
@@ -34,7 +46,7 @@ impl Names {
         ensure!(self.len()<MAX_ROWS&&self.units.len()+units.len()<u32::MAX as usize,"文件名索引超出容量");
         let id=self.len()as u32;let folded=String::from_utf16_lossy(units).to_lowercase();
         ensure!(self.folded.len()+folded.len()<u32::MAX as usize,"文件名索引超出容量");
-        self.units.try_reserve(units.len())?;self.starts.try_reserve(1)?;self.folded.try_reserve(folded.len())?;self.folded_starts.try_reserve(1)?;self.slots.try_reserve(1)?;
+        reserve_column(&mut self.units,units.len())?;reserve_column(&mut self.starts,1)?;reserve_column(&mut self.folded,folded.len())?;reserve_column(&mut self.folded_starts,1)?;self.slots.try_reserve(1)?;
         self.units.extend_from_slice(units);self.starts.push(self.units.len()as u32);
         self.folded.extend_from_slice(folded.as_bytes());self.folded_starts.push(self.folded.len()as u32);self.slots.insert(key,id);Ok(id)
     }
@@ -95,8 +107,8 @@ impl Index {
     pub fn append(&mut self,id:u64,parent:u32,name:&OsStr,flags:u8)->Result<u32>{
         ensure!(self.len()<MAX_ROWS,"索引项目数量超过上限");
         if self.len()%4096==0{ensure!(self.heap_bytes()<MAX_HEAP_BYTES,"自带索引超过内存预算，请启用开发目录排除或关闭属性索引");}
-        self.ids.try_reserve(1)?;self.parent.try_reserve(1)?;self.name.try_reserve(1)?;self.flags.try_reserve(1)?;self.first.try_reserve(1)?;self.next.try_reserve(1)?;
-        if let Some(attrs)=&mut self.attributes{attrs.size.try_reserve(1)?;attrs.modified.try_reserve(1)?;}
+        reserve_column(&mut self.ids,1)?;reserve_column(&mut self.parent,1)?;reserve_column(&mut self.name,1)?;reserve_column(&mut self.flags,1)?;reserve_column(&mut self.first,1)?;reserve_column(&mut self.next,1)?;
+        if let Some(attrs)=&mut self.attributes{reserve_column(&mut attrs.size,1)?;reserve_column(&mut attrs.modified,1)?;}
         if !self.building{self.delta.try_reserve(1)?;self.delta.entry(id).or_default().try_reserve(1)?;}
         let name=self.names.intern(name)?;let row=self.len()as u32;
         self.ids.push(id);self.parent.push(parent);self.name.push(name);self.flags.push(flags);self.first.push(NONE);self.next.push(NONE);
@@ -180,6 +192,17 @@ pub fn excluded_name(name:&str)->bool{matches!(name,".git"|".hg"|".svn"|"node_mo
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn incremental_changes_keep_compacted_memory_bounded(){
+        for metadata in [false,true]{
+            let mut index=Index::new(5,metadata);index.begin_build();
+            for id in 10..60_010{index.append(id,0,OsStr::new(&format!("document-{id:08}.txt")),0).unwrap();}
+            index.compact().unwrap();let compact=index.heap_bytes();
+            for id in 70_000..71_000{index.append(id,0,OsStr::new(&format!("new-document-{id:08}.txt")),0).unwrap();}
+            assert!(index.heap_bytes()<compact+compact/4,"incremental columns grew from {compact} to {}",index.heap_bytes());
+            assert_eq!(index.rows_for_id(70_999).len(),1);index.validate().unwrap();
+            assert!(index.path(Path::new(r"C:\"),index.rows_for_id(70_999)[0]).unwrap().ends_with("new-document-00070999.txt"));
+        }
+    }
     #[test]fn columns_preserve_aliases_and_parent_renames(){
         let mut index=Index::new(5,false);let dir=index.append(8,0,OsStr::new("中文"),DIRECTORY).unwrap();
         let a=index.append(9,dir,OsStr::new("甲.txt"),0).unwrap();let b=index.append(9,0,OsStr::new("乙.txt"),0).unwrap();index.reindex();

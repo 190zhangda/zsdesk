@@ -20,6 +20,8 @@ struct Options {
     profile: Option<PathBuf>,
     classic: bool,
     target: Option<OsString>,
+    window_location:Option<ShellLocation>,
+    shell_open:bool,
     select: bool,
     mode: Mode,
     import_source: Option<PathBuf>,
@@ -40,6 +42,12 @@ fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
     let mut opts = Options::default();
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
+        if arg=="--window-location"{
+            let value=iter.next().context("缺少窗口位置数据")?;
+            let location=decode_window_location(&value)?;
+            if opts.window_location.replace(location).is_some(){bail!("窗口位置只能指定一次");}
+            continue;
+        }
         if arg=="--focus-search"{opts.focus_search=true;continue;}
         if arg=="--search-settings"{opts.focus_search=true;opts.search_settings=true;continue;}
         if arg=="--integration-enable"{opts.integration_enable=true;continue;}
@@ -80,7 +88,7 @@ fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
         if arg == "--profile-dir" { opts.profile = Some(PathBuf::from(iter.next().context("缺少配置目录")?)); continue; }
         if arg == "--select" { opts.select = true; continue; }
         // Registered by system integration: behaves like a plain path argument.
-        if arg == "--shell-open" { continue; }
+        if arg == "--shell-open" {opts.shell_open=true; continue; }
         if arg == "--desktop" { if matches!(opts.mode, Mode::ImportTencent | Mode::QuickSearch(_)) { bail!("不能混用桌面和其他启动模式"); } if opts.mode == Mode::Explorer { opts.mode = Mode::Desktop(DesktopCommand::Show); } continue; }
         if arg == "--desktop-guard" {
             if matches!(opts.mode, Mode::ImportTencent | Mode::QuickSearch(_)) { bail!("不能混用守护器和其他启动模式"); }
@@ -104,6 +112,11 @@ fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
         let target = if arg == "--this-pc" { OsString::from("shell:MyComputerFolder") } else { arg };
         if opts.target.replace(target).is_some() { bail!("只能指定一个文件或目录"); }
     }
+    if opts.window_location.is_some()&&(!opts.new_window||opts.mode!=Mode::Explorer||opts.target.is_some()||opts.select||opts.shell_open
+        ||opts.integration_enable||opts.integration_refresh||opts.uninstall_integration||opts.routing_apply||opts.win_e
+        ||opts.diagnostics_main.is_some()||opts.import_source.is_some()||opts.import_report.is_some()||opts.apply_import||opts.focus_search){
+        bail!("窗口位置数据只能用于独立文件窗口，不能与定位、集成或其他启动模式混用");
+    }
     if opts.select && opts.target.is_none() { bail!("缺少定位目标"); }
     if opts.integration_enable&&(opts.mode!=Mode::Explorer||opts.target.is_some()||opts.select||opts.classic||opts.integration_refresh||opts.uninstall_integration||opts.routing_apply||opts.diagnostics_main.is_some()||opts.new_window||opts.win_e){bail!("启用系统集成不能与其他操作混用");}
     if opts.win_e && (opts.mode!=Mode::Explorer || opts.target.is_some() || opts.select || opts.classic || opts.integration_refresh || opts.uninstall_integration || opts.routing_apply || opts.diagnostics_main.is_some()) {bail!("Win+E 启动不能与其他操作混用");}
@@ -123,6 +136,64 @@ fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
         bail!("--import-report 和 --apply-import 必须与 --import-tencent 配合使用");
     }
     Ok(opts)
+}
+
+const MAX_WINDOW_LOCATION_JSON:usize=96*1024;
+fn validate_window_location(location:&ShellLocation)->Result<()>{
+    use std::os::windows::ffi::OsStrExt;
+    match location{
+        ShellLocation::ThisPc=>{},
+        ShellLocation::Path(path)=>{
+            let units:Vec<_>=path.as_os_str().encode_wide().collect();
+            if !path.is_absolute()||units.contains(&0)||units.len()>32767{bail!("窗口文件夹路径无效");}
+        },
+        ShellLocation::Shell{parsing_name,title,pidl}=>{
+            if parsing_name.contains('\0')||title.contains('\0')||parsing_name.encode_utf16().count()>32767||title.len()>4096{bail!("Shell 窗口位置名称无效");}
+            if let Some(identity)=pidl{if !zsdesk_windows::shell::pidl::valid(identity){bail!("Shell 窗口标识无效或超过 64 KiB");}}
+            if parsing_name.trim().is_empty()&&pidl.is_none(){bail!("Shell 窗口位置缺少标识");}
+        },
+        ShellLocation::Search{..}=>bail!("独立窗口位置不能携带临时搜索状态"),
+    }
+    Ok(())
+}
+fn decode_window_location(value:&std::ffi::OsStr)->Result<ShellLocation>{
+    let value=value.to_str().context("窗口位置数据不是有效 Unicode")?;
+    if value.len()>MAX_WINDOW_LOCATION_JSON{bail!("窗口位置数据过长");}
+    let location=serde_json::from_str(value).context("窗口位置数据无效")?;
+    validate_window_location(&location)?;Ok(location)
+}
+/// Preserve opaque namespace identities across the existing runtime ingress.
+/// Ordinary filesystem arguments stay lossless Windows OsStrings.
+pub(crate) fn new_window_arguments(profile:&std::path::Path,location:&ShellLocation)->Result<Vec<OsString>>{
+    let mut args=vec!["--new-window".into(),"--profile-dir".into(),profile.as_os_str().to_owned()];
+    match location{
+        ShellLocation::Shell{..}=>{
+            validate_window_location(location)?;
+            let value=serde_json::to_string(location)?;
+            if value.len()>MAX_WINDOW_LOCATION_JSON{bail!("窗口位置数据过长");}
+            args.extend(["--window-location".into(),value.into()]);
+        },
+        ShellLocation::Path(path)|ShellLocation::Search{scope:Some(path),..}=>args.push(path.as_os_str().to_owned()),
+        _=>args.push("--this-pc".into()),
+    }
+    Ok(args)
+}
+pub(crate) fn window_command_line_fits(executable:&std::path::Path,args:&[OsString])->bool{
+    use std::os::windows::ffi::OsStrExt;
+    // Quote every argument for a conservative UTF-16 upper bound, including
+    // escaped JSON quotes and trailing backslashes. Include the final NUL.
+    let mut total=executable.as_os_str().encode_wide().count()+3;
+    for argument in args{
+        total=total.saturating_add(3);let mut slashes=0usize;
+        for unit in argument.encode_wide(){
+            if unit==0{return false;}
+            if unit==92{slashes+=1;continue;}
+            total=total.saturating_add(if unit==34{slashes.saturating_mul(2)+2}else{slashes+1});slashes=0;
+        }
+        total=total.saturating_add(slashes.saturating_mul(2));
+        if total>32767{return false;}
+    }
+    total<=32767
 }
 
 /// Target of a `--shell-open` launch, so `main` can fall back to Explorer.
@@ -230,14 +301,14 @@ pub(crate) fn run_arguments(args:Vec<OsString>,in_host:bool)->Result<()> {
         Mode::QuickSearch(action) => return crate::quick_search::run(config, action),
         Mode::Explorer => {}
     }
-    let mut requested = None;
+    let mut requested = opts.window_location;
     let mut selection = None;
     if let Some(argument) = opts.target {
         let text = argument.to_string_lossy();
         let location = if text.eq_ignore_ascii_case("shell:MyComputerFolder") {
             ShellLocation::ThisPc
         } else if text.starts_with("shell:") || text.starts_with("::{") {
-            ShellLocation::Shell { parsing_name: text.into_owned(), title: "Shell".into() }
+            ShellLocation::Shell { pidl:None, parsing_name: text.into_owned(), title: "Shell".into() }
         } else {
             let path = std::path::absolute(PathBuf::from(&argument))?;
             if opts.select || path.is_file() {
@@ -274,6 +345,40 @@ fn activate(session: &mut ExplorerSession, target: ShellLocation, fresh: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]fn typed_window_location_preserves_namespace_identity(){
+        let location=ShellLocation::Shell{parsing_name:String::new(),title:"设备存储 中文".into(),pidl:Some(vec![4,0,7,9,0,0])};
+        let args=new_window_arguments(std::path::Path::new(r"E:\配置 空格"),&location).unwrap();
+        let options=parse(args.clone()).unwrap();
+        assert!(options.new_window&&options.target.is_none()&&!options.select);
+        assert_eq!(options.window_location,Some(location));
+        assert!(window_command_line_fits(std::path::Path::new(r"C:\Program Files\ZSDesk\ZSDesk.exe"),&args));
+    }
+    #[test]fn typed_window_location_rejects_mixed_modes_and_invalid_identity(){
+        let location=ShellLocation::Shell{parsing_name:String::new(),title:"设备".into(),pidl:Some(vec![0,0])};
+        let json=serde_json::to_string(&location).unwrap();
+        assert!(parse(vec!["--window-location".into(),json.clone().into()]).is_err());
+        for conflict in ["--select","--shell-open","--this-pc","--desktop","--background","--integration-enable","--integration-refresh","--uninstall-integration","--routing-apply","--win-e","--focus-search",r"C:\other"]{
+            assert!(parse(vec!["--new-window".into(),"--window-location".into(),json.clone().into(),conflict.into()]).is_err(),"accepted {conflict}");
+        }
+        assert!(parse(vec!["--new-window".into(),"--window-location".into(),json.clone().into(),"--window-location".into(),json.into()]).is_err());
+        for invalid in [
+            ShellLocation::Shell{parsing_name:String::new(),title:String::new(),pidl:None},
+            ShellLocation::Shell{parsing_name:"shell:Desktop".into(),title:String::new(),pidl:Some(vec![9,0])},
+            ShellLocation::Path("relative".into()),ShellLocation::Search{query:"name".into(),scope:None},
+        ]{assert!(decode_window_location(std::ffi::OsStr::new(&serde_json::to_string(&invalid).unwrap())).is_err());}
+        assert!(decode_window_location(std::ffi::OsStr::new(&"x".repeat(MAX_WINDOW_LOCATION_JSON+1))).is_err());
+    }
+    #[test]fn typed_window_location_respects_packet_and_command_line_bounds(){
+        let mut identity=vec![2,0].repeat(12_000);identity.extend([0,0]);
+        let location=ShellLocation::Shell{parsing_name:String::new(),title:"设备".into(),pidl:Some(identity)};
+        let args=new_window_arguments(std::path::Path::new(r"E:\profile"),&location).unwrap();
+        #[derive(serde::Serialize)]struct Envelope<'a>{args:&'a[OsString]}
+        assert!(serde_json::to_vec(&Envelope{args:&args}).unwrap().len()>128*1024);
+        assert!(!window_command_line_fits(std::path::Path::new(r"C:\ZSDesk.exe"),&args));
+        assert!(!window_command_line_fits(std::path::Path::new(r"C:\ZSDesk.exe"),&["bad\0path".into()]));
+        let ordinary=new_window_arguments(std::path::Path::new(r"E:\profile"),&ShellLocation::Path(r"E:\中文 空格".into())).unwrap();
+        assert_eq!(parse(ordinary).unwrap().target,Some(r"E:\中文 空格".into()));
+    }
     #[test]fn standalone_box_routes_to_desktop_and_keeps_a_separate_identity(){
         if crate::edition::DESKTOP_ONLY{
             let arguments=edition_arguments(vec![]).unwrap();assert!(matches!(parse(arguments).unwrap().mode,Mode::Desktop(DesktopCommand::Show)));

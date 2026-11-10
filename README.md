@@ -10,7 +10,7 @@ Windows 原生多标签文件管理器与桌面格子，使用 Rust、Win32/COM�
 
 ## 版本
 
-当前版本：0.3.8。
+当前版本：0.3.10。
 
 | 版本 | Cargo features | 功能 |
 |---|---|---|
@@ -171,9 +171,15 @@ Windows 10 及其他版本的 Windows 11 直接使用经典菜单，“≡ → �
 ## Listary 快速切换
 
 Listary 插件通过官方 FileAppPlugin 接口提供当前标签页已打开的文件夹。
+适用于 Listary 6 和 7.0；Listary 7.1 已停止加载用户安装的集成插件，暂不支持此接入方式。
+Listary 7.1 可使用随附 `integrations/listary/Prepare-Listary7.ps1` 生成目录打开及搜索结果定位的配置副本；这两项适配不依赖旧 DLL。
 插件源码和部署步骤见 [native/listary](native/listary/README.md)。启用后，在标准打开/保存对话框中
 按 Listary 的 `Ctrl+G` 快速切换快捷键，可切换到当前 ZSDesk 文件夹。
 搜索结果、虚拟系统位置和尚未完成的导航不作为快速切换目录。
+
+双栏模式的“更多”菜单提供“复制到另一栏”和“移动到另一栏”，通过一次原生批量文件操作直接提交选中文件，保留系统进度、冲突处理和撤销记录，不改变剪贴板内容。
+
+QuickLook 用户可在“预览与操作”中关闭“空格预览”；QuickLook 保持运行时，文件列表中的空格键将预览交给 QuickLook，编辑文件名及输入路径时仍按普通文本输入处理。
 
 ## 桌面格子
 

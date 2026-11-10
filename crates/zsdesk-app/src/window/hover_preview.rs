@@ -345,15 +345,6 @@ impl MiddleClick{
     }
 }
 
-/// WM_OPEN_TAB_PATH is shared with ChromeDrop and its receiver owns a PathBuf,
-/// not a ShellLocation enum. Keep the allocation type identical on all paths.
-pub(super) fn post_tab_path(owner:HWND,source:usize,path:PathBuf){
-    let pointer=Box::into_raw(Box::new(path));
-    if unsafe{PostMessageW(Some(owner),super::WM_OPEN_TAB_PATH,WPARAM(source),LPARAM(pointer as isize))}.is_err(){
-        unsafe{drop(Box::from_raw(pointer));}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,16 +371,4 @@ mod tests {
         assert!(shared.mailbox.lock().unwrap().request.is_none());
     }
 
-    #[test]
-    fn native_middle_click_posts_the_path_payload_expected_by_the_receiver(){
-        use windows::Win32::UI::WindowsAndMessaging::*;
-        let owner=unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),windows::core::w!("STATIC"),windows::core::w!("middle payload"),WS_POPUP,0,0,10,10,None,None,None,None)}.unwrap();
-        let expected=PathBuf::from(r"E:\中文 空格\folder");post_tab_path(owner,17,expected.clone());
-        let mut message=MSG::default();
-        assert!(unsafe{PeekMessageW(&mut message,Some(owner),super::super::WM_OPEN_TAB_PATH,super::super::WM_OPEN_TAB_PATH,PM_REMOVE)}.as_bool());
-        let received=unsafe{Box::from_raw(message.lParam.0 as*mut PathBuf)};
-        assert_eq!(*received,expected);drop(received);
-        assert_eq!(message.wParam.0,17);
-        let _=unsafe{DestroyWindow(owner)};
-    }
 }
