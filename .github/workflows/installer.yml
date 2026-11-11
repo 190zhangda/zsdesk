@@ -1,5 +1,9 @@
 name: Windows installer
 
+# 产出 Inno Setup 标准安装包（写注册表 / 开始菜单 / 卸载项），不是便携版 exe。
+# 触发：
+#   - push tag v*        -> 打包并自动创建 GitHub Release
+#   - workflow_dispatch  -> 手动打包，仅上传 Artifact
 on:
   push:
     tags: ['v*']
@@ -25,67 +29,165 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: zsdesk
-          
+
       - name: Read the ZSUI revision
         id: zsui
         shell: pwsh
         run: '"revision=$((Get-Content -LiteralPath zsdesk/packaging/zsui-revision.txt -Raw).Trim())" >> $env:GITHUB_OUTPUT'
-      
+
+      # package.ps1 要求 zsui 与 zsdesk 是同级兄弟目录
       - uses: actions/checkout@v7
         with:
           repository: qiu7824/zsui
           ref: ${{ steps.zsui.outputs.revision }}
           path: zsui
-          
+
       - name: Read the workspace version
         id: meta
         shell: pwsh
         run: |
-          $v=[regex]::Match((Get-Content -LiteralPath zsdesk/Cargo.toml -Raw),'(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          $raw = Get-Content -LiteralPath zsdesk/Cargo.toml -Raw
+          $m = [regex]::Match($raw, '(?m)^version\s*=\s*"([^"]+)"')
+          $v = if ($m.Success) { $m.Groups[1].Value } else { '0.0.0' }
           "version=$v" >> $env:GITHUB_OUTPUT
-          
+
       - uses: dtolnay/rust-toolchain@1.99.0
-      
+
       - name: Install Inno Setup 6
-        run: choco install innosetup --yes --no-progress
-        
-      # ========== 彻底修复的 Everything 准备步骤 ==========
-      - name: Fetch Everything runtime (Ultimate Fix)
+        id: inno
         shell: pwsh
         run: |
-          # 1. 创建目标目录
-          New-Item -ItemType Directory -Path everything -Force | Out-Null
-          
-          # 2. 直接下载官方纯净的 Everything.exe (免压缩包，不会被拦截)
-          Invoke-WebRequest -Uri 'https://www.voidtools.com/Everything-1.4.1.1032.x64.exe' -OutFile everything/Everything.exe -UseBasicParsing
-          
-          # 3. 【关键】直接从仓库源码拷贝 License.txt (官方压缩包里没有！)
-          Copy-Item zsdesk/packaging/engines/License.txt everything/License.txt -Force
-          
-          # 4. 复制仓库要求的校验清单（manifest.json 必须与 everything.json 哈希一致）
-          Copy-Item zsdesk/packaging/engines/everything.json everything/manifest.json -Force
-          
-          # 5. 打印目录内容用于调试确认
-          Write-Host "Everything dir contents:"
-          Get-ChildItem everything
-          
-      # ========== 编译与打包 ==========
+          choco install innosetup --yes --no-progress
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            $found = Get-ChildItem -Path 'C:\Program Files (x86)\Inno Setup*','C:\Program Files\Inno Setup*' -Recurse -Filter ISCC.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $iscc = $found.FullName }
+          }
+          if (-not (Test-Path $iscc)) { throw '找不到 ISCC.exe，Inno Setup 安装失败' }
+          Write-Host "ISCC = $iscc"
+          "iscc=$iscc" >> $env:GITHUB_OUTPUT
+
+      # ---------------------------------------------------------------
+      # 准备 Everything 运行时目录。
+      # package.ps1 要求该目录同时含：Everything.exe + 语言包 + License.txt + manifest.json，
+      # 来源与 SHA-256 全部记录在 packaging/engines/everything.json。
+      # 因此这里优先按清单里的真实 URL 下载，不再硬编码任何猜测的直链。
+      # ---------------------------------------------------------------
+      - name: Prepare Everything runtime
+        id: everything
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $engines = 'zsdesk/packaging/engines'
+          $dir = Join-Path $PWD 'everything'
+          Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+          # 1) 清单原样复制为 manifest.json
+          Copy-Item "$engines/everything.json" "$dir/manifest.json" -Force
+
+          # 2) 从清单中抽取所有下载 URL，逐个下载到 everything/
+          $raw = Get-Content -LiteralPath "$engines/everything.json" -Raw
+          $urls = [regex]::Matches($raw, 'https?://[^"\s]+') |
+                  ForEach-Object { $_.Value.TrimEnd(',', '"', "'") } |
+                  Select-Object -Unique
+          Write-Host "清单中的下载源数量: $($urls.Count)"
+
+          $zips = @()
+          foreach ($u in $urls) {
+            $dest = $null
+            try {
+              $name = [System.IO.Path]::GetFileName(($u -split '\?')[0])
+              if ([string]::IsNullOrWhiteSpace($name)) { continue }
+              $dest = Join-Path $dir $name
+              Write-Host "下载: $u"
+              Invoke-WebRequest -Uri $u -OutFile $dest -UseBasicParsing -TimeoutSec 120
+              $bytes = [System.IO.File]::ReadAllBytes($dest)
+              if ($name -like '*.zip') {
+                if ($bytes.Length -lt 100000 -or $bytes[0] -ne 0x50 -or $bytes[1] -ne 0x4B) {
+                  throw '下载到的不是有效 ZIP（可能是 404 HTML 页面）'
+                }
+                $zips += $dest
+              }
+            } catch {
+              Write-Warning "下载失败，跳过 $u -> $($_.Exception.Message)"
+              if ($dest -and (Test-Path $dest)) { Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue }
+            }
+          }
+
+          # 3) 清单没给全时，回退到官方便携版 x64 多语言 ZIP
+          if (-not (Test-Path (Join-Path $dir 'Everything.exe'))) {
+            $fallbacks = @(
+              'https://www.voidtools.com/Everything-1.4.1.1032.x64.zip',
+              'https://www.voidtools.com/downloads/Everything-1.4.1.1032.x64.zip'
+            )
+            foreach ($u in $fallbacks) {
+              $tmp = Join-Path $PWD 'everything-fallback.zip'
+              try {
+                Write-Host "回退下载: $u"
+                Invoke-WebRequest -Uri $u -OutFile $tmp -UseBasicParsing -TimeoutSec 120
+                $b = [System.IO.File]::ReadAllBytes($tmp)
+                if ($b.Length -lt 100000 -or $b[0] -ne 0x50 -or $b[1] -ne 0x4B) {
+                  throw '下载到的不是有效 ZIP（可能是 404 HTML 页面）'
+                }
+                $zips += $tmp
+                break
+              } catch {
+                Write-Warning "回退源失败 $u -> $($_.Exception.Message)"
+                Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+              }
+            }
+          }
+
+          # 4) 解压所有 ZIP，把藏在任意层级子目录里的文件全部平铺到 everything/
+          foreach ($z in $zips) {
+            $ex = Join-Path $PWD ('unzip_' + [System.IO.Path]::GetFileNameWithoutExtension($z))
+            Remove-Item -Recurse -Force $ex -ErrorAction SilentlyContinue
+            Expand-Archive -LiteralPath $z -DestinationPath $ex -Force
+            Get-ChildItem -Path $ex -Recurse -File | ForEach-Object {
+              $target = Join-Path $dir $_.Name
+              if (-not (Test-Path $target)) {
+                Copy-Item -LiteralPath $_.FullName -Destination $target -Force
+              }
+            }
+            Remove-Item -Recurse -Force $ex -ErrorAction SilentlyContinue
+          }
+
+          # 5) 用仓库内固定文件补齐（不覆盖已下载文件，避免破坏 SHA-256）
+          Get-ChildItem -Path $engines -File |
+            Where-Object { $_.Name -ne 'everything.json' } |
+            ForEach-Object {
+              $target = Join-Path $dir $_.Name
+              if (-not (Test-Path $target)) { Copy-Item -LiteralPath $_.FullName -Destination $target -Force }
+            }
+
+          # 6) 硬性自检：缺任何一个文件都会在这里直接报清楚
+          Write-Host '== everything/ 实际内容 =='
+          Get-ChildItem -LiteralPath $dir -Recurse | ForEach-Object { Write-Host "$($_.FullName)  $($_.Length)" }
+          foreach ($need in @('Everything.exe', 'License.txt', 'manifest.json')) {
+            if (-not (Test-Path (Join-Path $dir $need))) {
+              throw "缺少 $need，package.ps1 必然报错。请对照上面的目录清单与 everything.json 里的来源 URL。"
+            }
+          }
+          "dir=$dir" >> $env:GITHUB_OUTPUT
+
       - name: Package payloads and compile installers
         shell: pwsh
-        run: >
-          ./zsdesk/scripts/package.ps1
-          -Editions ($env:EDITIONS -split ',')
-          -EverythingDir "$PWD/everything"
-          -InnoCompiler 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
-          -OutputDir "$PWD/out"
-          
+        run: |
+          $editions = $env:EDITIONS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+          ./zsdesk/scripts/package.ps1 `
+            -Editions $editions `
+            -EverythingDir "${{ steps.everything.outputs.dir }}" `
+            -InnoCompiler "${{ steps.inno.outputs.iscc }}" `
+            -OutputDir "$PWD/out"
+
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
           name: ZSDesk-${{ steps.meta.outputs.version }}-setup
           path: out/**/*-setup.exe
           if-no-files-found: error
-          
+
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
