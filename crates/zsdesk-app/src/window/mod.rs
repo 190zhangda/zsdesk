@@ -1402,6 +1402,7 @@ fn accelerator_table() -> Vec<ACCEL> {
         (FCONTROL | FVIRTKEY, VK_E, Command::FocusSearch), (FVIRTKEY, VK_F3, Command::FocusSearch),
         (FCONTROL | FSHIFT | FVIRTKEY, VK_N, Command::NewFolder), (FCONTROL | FSHIFT | FVIRTKEY, VK_C, Command::CopyPath),
         (FALT | FVIRTKEY, VK_P, Command::TogglePreview), (FALT | FSHIFT | FVIRTKEY, VK_P, Command::ToggleDetails),
+        (FCONTROL | FALT | FVIRTKEY, VK_2, Command::ToggleDualPane), 
         (FCONTROL | FVIRTKEY, VK_N, Command::NewWindow),
         (FVIRTKEY, VK_F11, Command::ToggleFullscreen),
         (FVIRTKEY, VK_F6, Command::FocusNext), (FSHIFT | FVIRTKEY, VK_F6, Command::FocusPrevious),
