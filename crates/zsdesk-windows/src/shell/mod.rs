@@ -6,6 +6,7 @@ mod events;
 mod explorer_browser;
 pub mod icons;
 pub mod menu;
+pub mod new_menu;
 mod namespace_tree;
 pub mod notify;
 pub mod pidl;

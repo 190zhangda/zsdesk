@@ -321,6 +321,7 @@ impl Default for QuickSearchPreferences {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ExplorerUi {
+    pub startup_location: StartupLocation,
     pub tab_placement: TabPlacement,
     pub dual_pane: bool,
     /// Split position in thousandths, independent of monitor scaling.
@@ -377,7 +378,7 @@ impl ExplorerUi{
 
 impl Default for ExplorerUi {
     fn default() -> Self {
-        Self { tab_placement:TabPlacement::Top, dual_pane:false, pane_ratio:500,
+        Self { startup_location:StartupLocation::default(), tab_placement:TabPlacement::Top, dual_pane:false, pane_ratio:500,
             double_click_close_tab:true, mouse_gestures:true, everything_folder_sizes:false,
             close_window_on_last_tab:true,show_tab_count:true,
             show_tree: true, tree_width: 220, show_bookmarks: true, show_preview: false, show_details: false,
@@ -391,6 +392,14 @@ impl Default for ExplorerUi {
             appearance: AppearancePreferences::default(),
             window: None }
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum StartupLocation {
+    #[default]
+    RestoreSession,
+    ThisPc,
+    Folder(PathBuf),
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -426,6 +435,17 @@ impl Default for ExplorerSession {
 }
 
 impl ExplorerSession {
+    /// Applied only when opening a window without an explicit Shell target.
+    pub fn apply_startup_location(&mut self) {
+        let location=match &self.ui.startup_location {
+            StartupLocation::RestoreSession=>return,
+            StartupLocation::ThisPc=>ShellLocation::ThisPc,
+            StartupLocation::Folder(path)=>ShellLocation::Path(path.clone()),
+        };
+        let id=self.take_id();self.tabs=vec![ExplorerTab::new(id,location)];self.active_tab=0;
+        self.secondary_pane=ExplorerPaneSession::default();
+    }
+
     pub fn normalize(&mut self) {
         if self.ui.search_backend.is_builtin(){self.ui.search_backend=SearchBackendPreference::NativeNtfs;}
         self.ui.search_idle_seconds=self.ui.search_idle_seconds.clamp(30,3600);
@@ -495,12 +515,8 @@ impl ExplorerSession {
 
     /// Move one node, preserving its subtree and rejecting cycles/invalid targets.
     pub fn move_bookmark_to(&mut self,id:u64,parent_id:Option<u64>,before:Option<u64>)->bool {
+        if !self.can_move_bookmark_to(id,parent_id){return false;}
         let Some(from)=self.bookmarks.iter().position(|b|b.id==id)else{return false;};
-        let mut ancestor=parent_id;let mut visited=std::collections::HashSet::new();
-        while let Some(parent)=ancestor {
-            if parent==id||!visited.insert(parent){return false;}
-            let Some(folder)=self.bookmarks.iter().find(|b|b.id==parent&&b.is_folder)else{return false;};ancestor=folder.parent_id;
-        }
         if before==Some(id){return false;}
         if let Some(before)=before {if !self.bookmarks.iter().any(|b|b.id==before&&b.parent_id==parent_id){return false;}}
         let mut item=self.bookmarks.remove(from);item.parent_id=parent_id;
@@ -508,15 +524,24 @@ impl ExplorerSession {
         self.bookmarks.insert(at,item);true
     }
 
+    pub fn can_move_bookmark_to(&self,id:u64,parent_id:Option<u64>)->bool {
+        if !self.bookmarks.iter().any(|b|b.id==id){return false;}
+        let mut ancestor=parent_id;let mut visited=std::collections::HashSet::new();
+        while let Some(parent)=ancestor {
+            if parent==id||!visited.insert(parent){return false;}
+            let Some(folder)=self.bookmarks.iter().find(|b|b.id==parent&&b.is_folder)else{return false;};ancestor=folder.parent_id;
+        }
+        true
+    }
+
     /// Every link inside a category, nested categories included, in bar order.
     pub fn bookmark_folder_links(&self,folder:u64)->Vec<ShellLocation> {
-        let mut result=Vec::new();let mut stack=vec![folder];let mut visited=std::collections::HashSet::new();
-        while let Some(parent)=stack.pop() {
-            if !visited.insert(parent){continue;}
-            let children:Vec<_>=self.bookmarks.iter().filter(|b|b.parent_id==Some(parent)).collect();
-            // Links first, then subcategories, each in their displayed order.
-            result.extend(children.iter().filter(|b|!b.is_folder).map(|b|b.target.clone()));
-            stack.extend(children.iter().filter(|b|b.is_folder).map(|b|b.id).rev());
+        let mut result=Vec::new();let mut visited=std::collections::HashSet::from([folder]);
+        let mut stack:Vec<_>=self.bookmarks.iter().filter(|b|b.parent_id==Some(folder)).rev().collect();
+        while let Some(item)=stack.pop() {
+            if !visited.insert(item.id){continue;}
+            if item.is_folder {stack.extend(self.bookmarks.iter().filter(|b|b.parent_id==Some(item.id)).rev());}
+            else {result.push(item.target.clone());}
         }
         result
     }
@@ -542,6 +567,16 @@ impl ExplorerSession {
         let parent=self.bookmarks[index].parent_id;self.bookmarks.remove(index);
         for child in &mut self.bookmarks {if child.parent_id==Some(id){child.parent_id=parent;}}
         true
+    }
+
+    /// Removes saved links only; never deletes their filesystem targets.
+    pub fn remove_bookmark_subtree(&mut self,id:u64)->bool {
+        if !self.bookmarks.iter().any(|b|b.id==id){return false;}
+        let mut removed=std::collections::HashSet::from([id]);let mut stack=vec![id];
+        while let Some(parent)=stack.pop(){
+            for item in &self.bookmarks {if item.parent_id==Some(parent)&&removed.insert(item.id){stack.push(item.id);}}
+        }
+        self.bookmarks.retain(|item|!removed.contains(&item.id));true
     }
 
     pub fn active_tab(&self) -> &ExplorerTab {
@@ -722,7 +757,7 @@ mod tests {
         session.bookmarks=vec![Bookmark::folder(10,"工程".into(),None),Bookmark::folder(11,"子类".into(),Some(10)),
             Bookmark::link(12,"甲".into(),a.clone(),Some(10)),Bookmark::link(13,"丙".into(),c.clone(),Some(11)),Bookmark::link(14,"乙".into(),b.clone(),Some(10)),
             Bookmark::link(15,"外部".into(),ShellLocation::ThisPc,None)];
-        assert_eq!(session.bookmark_folder_links(10),vec![a.clone(),b.clone(),c.clone()]);
+        assert_eq!(session.bookmark_folder_links(10),vec![c.clone(),a.clone(),b.clone()]);
         assert!(session.bookmark_folder_links(15).is_empty());
         let search=ShellLocation::Search{query:"x".into(),scope:None};
         let created=session.save_tabs_to_bookmarks(None,"暂存",None,&[a.clone(),search,b.clone(),a.clone()]);
@@ -743,5 +778,27 @@ mod tests {
         assert_eq!(session.visible_bookmarks().len(),4);
         assert!(session.bookmarks.iter().find(|b|b.display_name=="孤立").unwrap().parent_id.is_none());
         assert!(session.next_id>session.bookmarks.iter().map(|b|b.id).max().unwrap());
+    }
+
+    #[test]
+    fn category_subtree_deletion_preserves_external_links_and_targets(){
+        let mut session=ExplorerSession::default();let target=ShellLocation::Path(PathBuf::from(r"E:\保留文件夹"));
+        session.bookmarks=vec![Bookmark::folder(10,"分类".into(),None),Bookmark::folder(11,"子分类".into(),Some(10)),
+            Bookmark::link(12,"内".into(),target.clone(),Some(11)),Bookmark::link(13,"外".into(),target.clone(),None)];
+        assert!(session.remove_bookmark_subtree(10));assert_eq!(session.bookmarks.len(),1);
+        assert_eq!(session.bookmarks[0].id,13);assert_eq!(session.bookmarks[0].target,target);
+        assert!(!session.remove_bookmark_subtree(10));
+    }
+
+    #[test]
+    fn startup_default_migration_restore_and_custom_location(){
+        let mut session=ExplorerSession::default();let old=ShellLocation::Path(PathBuf::from(r"E:\旧位置"));
+        session.tabs[0].navigate(old.clone());session.bookmarks.push(Bookmark::folder(10,"分类".into(),None));session.normalize();
+        let original=session.clone();session.apply_startup_location();assert_eq!(session,original);
+        session.ui.startup_location=StartupLocation::ThisPc;session.apply_startup_location();assert_eq!(session.tabs.len(),1);assert_eq!(session.active_tab().current(),&ShellLocation::ThisPc);
+        assert_eq!(session.bookmarks,original.bookmarks);
+        let path=PathBuf::from(r"E:\自定义 空格");session.ui.startup_location=StartupLocation::Folder(path.clone());session.apply_startup_location();
+        assert_eq!(session.active_tab().current(),&ShellLocation::Path(path));
+        let restored:ExplorerSession=serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();assert_eq!(restored,session);
     }
 }

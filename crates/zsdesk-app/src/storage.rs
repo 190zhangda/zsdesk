@@ -43,6 +43,11 @@ pub fn save(path: &Path, session: &ExplorerSession) -> Result<()> {
     save_unlocked(path, session)
 }
 
+pub fn save_startup_location(path:&Path,location:&zsdesk_core::model::explorer::StartupLocation)->Result<()> {
+    let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
+    let mut session=load(path)?;session.ui.startup_location=location.clone();save_unlocked(path,&session)
+}
+
 /// A secondary window owns its appearance and bookmarks, while the primary
 /// window remains the owner of the persisted tab session.
 pub fn save_window(path: &Path, session: &ExplorerSession, secondary: bool) -> Result<()> {
@@ -89,9 +94,11 @@ fn save_window_preferences(path:&Path,session:&ExplorerSession,secondary:bool,
     baseline:&SearchPreferences,baseline_bookmarks:Option<&[Bookmark]>)->Result<(SearchPreferences,Vec<Bookmark>)>{
     let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
     let saved=load(path).ok();let mut next=session.clone();
+    if let Some(saved)=&saved {next.ui.startup_location=saved.ui.startup_location.clone();}
     if next.ui.search_preferences()==*baseline{if let Some(saved)=&saved{next.ui.apply_search_preferences(&saved.ui.search_preferences());}}
-    if baseline_bookmarks.is_some_and(|baseline|next.bookmarks==baseline){
-        if let Some(saved)=&saved{next.bookmarks=saved.bookmarks.clone();}
+    if let (Some(baseline),Some(saved))=(baseline_bookmarks,&saved){
+        next.bookmarks=merge_bookmarks(baseline,&next.bookmarks,&saved.bookmarks,next.next_id.max(saved.next_id));
+        next.normalize_bookmarks();
     }
     let bookmark_next=next.bookmarks.iter().map(|bookmark|bookmark.id).max().unwrap_or(0).saturating_add(1);
     next.next_id=next.next_id.max(bookmark_next).max(saved.as_ref().map_or(0,|saved|saved.next_id));
@@ -100,11 +107,70 @@ fn save_window_preferences(path:&Path,session:&ExplorerSession,secondary:bool,
     else{save_unlocked(path,&next)?;}Ok((preferences,bookmarks))
 }
 
+/// Field-wise edits preserve other windows' changes; deletion wins over a
+/// stale edit. Newly allocated IDs are remapped with their child references.
+fn merge_bookmarks(baseline:&[Bookmark],local:&[Bookmark],saved:&[Bookmark],mut next:u64)->Vec<Bookmark>{
+    use std::collections::{HashMap,HashSet};
+    let base:HashMap<_,_>=baseline.iter().map(|b|(b.id,b)).collect();
+    let local_ids:HashSet<_>=local.iter().map(|b|b.id).collect();
+    let mut result:Vec<_>=saved.iter().filter(|b|!base.contains_key(&b.id)||local_ids.contains(&b.id)).cloned().collect();
+    next=next.max(local.iter().chain(saved).map(|b|b.id).max().unwrap_or(0).saturating_add(1));
+    let mut remap=HashMap::new();
+    for item in local.iter().filter(|b|!base.contains_key(&b.id)){
+        if result.iter().any(|b|b.id==item.id){remap.insert(item.id,next);next=next.saturating_add(1);}
+    }
+    for item in local {
+        let mut item=item.clone();
+        if let Some(id)=item.parent_id.and_then(|id|remap.get(&id)){item.parent_id=Some(*id);}
+        if let Some(old)=base.get(&item.id){
+            if let Some(current)=result.iter_mut().find(|b|b.id==item.id){
+                if item.display_name!=old.display_name{current.display_name=item.display_name;}
+                if item.target!=old.target{current.target=item.target;}
+                if item.parent_id!=old.parent_id{current.parent_id=item.parent_id;}
+                if item.is_folder!=old.is_folder{current.is_folder=item.is_folder;}
+                if item.collapsed!=old.collapsed{current.collapsed=item.collapsed;}
+            }
+        }else{if let Some(id)=remap.get(&item.id){item.id=*id;}result.push(item);}
+    }
+    let before:Vec<_>=baseline.iter().filter(|b|local_ids.contains(&b.id)).map(|b|b.id).collect();
+    let after:Vec<_>=local.iter().map(|b|remap.get(&b.id).copied().unwrap_or(b.id)).collect();
+    if before!=after {
+        let order:HashMap<_,_>=after.iter().enumerate().map(|(i,id)|(*id,i)).collect();
+        let mut changed:Vec<_>=result.iter().filter(|b|order.contains_key(&b.id)).cloned().collect();
+        changed.sort_by_key(|b|order[&b.id]);let mut changed=changed.into_iter();
+        for item in &mut result {if order.contains_key(&item.id){*item=changed.next().unwrap();}}
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{sync::{Arc,Barrier},thread};
     use zsdesk_core::model::explorer::{ExplorerTab,ShellLocation};
+    #[test]
+    fn category_deletion_survives_stale_edits_and_concurrent_ids_remain_distinct(){
+        let base=vec![Bookmark::folder(10,"分类".into(),None),Bookmark::link(11,"保留".into(),ShellLocation::ThisPc,None)];
+        let mut stale=base.clone();stale[0].collapsed=true;stale[1].display_name="已改名".into();
+        let merged=merge_bookmarks(&base,&stale,&base[1..],12);
+        assert_eq!(merged.len(),1);assert_eq!(merged[0].id,11);assert_eq!(merged[0].display_name,"已改名");
+        let mut left=base.clone();left.push(Bookmark::folder(12,"左".into(),None));left.push(Bookmark::link(13,"子项".into(),ShellLocation::ThisPc,Some(12)));
+        let mut right=base.clone();right.push(Bookmark::folder(12,"右".into(),None));
+        let merged=merge_bookmarks(&base,&left,&right,14);
+        let left_id=merged.iter().find(|b|b.display_name=="左").unwrap().id;
+        assert_ne!(left_id,12);assert_eq!(merged.iter().find(|b|b.display_name=="子项").unwrap().parent_id,Some(left_id));
+        assert_eq!(merged.iter().map(|b|b.id).collect::<std::collections::HashSet<_>>().len(),merged.len());
+    }
+    #[test]
+    fn startup_location_is_preserved_by_stale_window_saves(){
+        use zsdesk_core::model::explorer::StartupLocation;
+        let root=std::env::temp_dir().join(format!("zsdesk-startup-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
+        fs::create_dir(&root).unwrap();let path=root.join("session.json");let original=default_session();save(&path,&original).unwrap();
+        let chosen=StartupLocation::Folder(root.clone());save_startup_location(&path,&chosen).unwrap();
+        save_window_with_shared_preferences(&path,&original,false,&original.ui.search_preferences(),&original.bookmarks).unwrap();
+        assert_eq!(load(&path).unwrap().ui.startup_location,chosen);
+        fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
+    }
     #[test]
     fn stale_window_navigation_preserves_bookmark_groups_order_and_id_allocator(){
         let root=std::env::temp_dir().join(format!("zsdesk-bookmark-save-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));

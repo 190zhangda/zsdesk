@@ -61,20 +61,25 @@ pub(super) fn close(owner:HWND){
 }
 pub(super) fn destroy(owner:HWND){close(owner);GENERATIONS.with(|generations|{generations.borrow_mut().remove(&(owner.0 as isize));});}
 pub(super) fn show(window:HWND,view:&IShellView,position:LPARAM)->windows::core::Result<()>{
-    let owner=root(window);close(owner);
-    let foreground=unsafe{GetForegroundWindow()};
-    let generation=generation(owner).unwrap();
+    let owner=root(window);
     let source=source(owner,window).ok_or_else(||failure("文件视图正在切换，请稍后重试"))?;
     let identity=super::pane_input::identity(owner,source).ok_or_else(||failure("文件视图已切换，请重新打开菜单"))?;
-    let pidls=snapshot(view)?;let folder=file_transfer::folder_path(view).ok();let point=point(window,position);
-    let background=if folder.is_none(){Some(background_pidl(view)?)}else{None};
+    start(owner,window,view,identity,point(window,position),false)
+}
+pub(super) fn show_new(owner:HWND,view:&IShellView,identity:super::pane_input::Identity,point:POINT)->windows::core::Result<()>{
+    start(owner,unsafe{view.GetWindow()?},view,identity,point,true)
+}
+fn start(owner:HWND,window:HWND,view:&IShellView,identity:super::pane_input::Identity,point:POINT,new:bool)->windows::core::Result<()>{
+    close(owner);let foreground=unsafe{GetForegroundWindow()};let generation=generation(owner).unwrap();
+    let pidls=if new{Vec::new()}else{snapshot(view)?};let folder=file_transfer::folder_path(view).ok();
+    let background=if pidls.is_empty(){Some(background_pidl(view)?)}else{None};
     let options=menu::context_menu_options();
     let mut mode=WorkerMode::More;
-    let targets=if pidls.is_empty()&&folder.is_none(){mode=WorkerMode::Background;background.clone().into_iter().collect()}else{pidls.clone()};
-    let layout=if mode==WorkerMode::Background{zsdesk_windows::shell::capture_view_layout(view)}else{None};
+    let targets=if pidls.is_empty(){mode=if new{WorkerMode::New}else{WorkerMode::Background};background.clone().into_iter().collect()}else{pidls.clone()};
+    let layout=if matches!(mode,WorkerMode::Background|WorkerMode::New){zsdesk_windows::shell::capture_view_layout(view)}else{None};
     let client=Client::spawn_with_layout(owner,point,targets,folder.clone(),options,MenuInterceptions{rename:true,open:true},mode,unsafe{GetKeyState(VK_SHIFT.0 as i32)}<0,layout)
         .map_err(|error|failure(&format!("无法启动系统菜单：{error:#}")))?;
-    if !current(owner,generation)||!live_source(owner,window,identity){return Ok(());}
+    if !current(owner,generation){return Ok(());}
     ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,Session{generation,identity,view_window:window,foreground,view:view.clone(),pidls,folder,background,client});});
     unsafe{SetTimer(Some(owner),TIMER,50,None)};Ok(())
 }
@@ -106,12 +111,15 @@ pub(super) fn poll(owner:HWND){
     // Full PIDL enumeration belongs to validation barriers, not every 50 ms
     // while the user reads a menu. Native callbacks can be costly for multi-select.
     let layout=session.client.take_layout();
-    let valid=if layout.is_some()||matches!(&result,Some(Ok(MenuOutcome::Rename|MenuOutcome::Open|MenuOutcome::Explore))){
+    let created=session.client.take_created();
+    let created_any=!created.is_empty();
+    let valid=if layout.is_some()||!created.is_empty()||matches!(&result,Some(Ok(MenuOutcome::Rename|MenuOutcome::Open|MenuOutcome::Explore))){
         same_selection(&session.view,&session.pidls,&session.folder,&session.background)
             &&current(owner,generation)&&live_source(owner,window,identity)
     }else{true};
     if valid&&matches!(&result,Some(Ok(MenuOutcome::ShellInvoked|MenuOutcome::NativeHandled))){
         if let Some(layout)=layout{zsdesk_windows::shell::restore_view_layout(&session.view,&layout);}
+        for item in created{super::pane_input::post(owner,identity,super::pane_input::Intent::CreatedItem(item));}
     }
     match result{
         None=>{ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,session);});},
@@ -124,7 +132,8 @@ pub(super) fn poll(owner:HWND){
                 }
             }
         },
-        Some(Ok(MenuOutcome::ShellInvoked))=>{super::pane_input::post(owner,identity,super::pane_input::Intent::Action(Command::Refresh.id()as usize));},
+        Some(Ok(MenuOutcome::ShellInvoked)) if !created_any=>{super::pane_input::post(owner,identity,super::pane_input::Intent::Action(Command::Refresh.id()as usize));},
+        Some(Ok(MenuOutcome::NativeHandled)) if !created_any&&session.pidls.is_empty()=>{super::pane_input::post(owner,identity,super::pane_input::Intent::Action(Command::Refresh.id()as usize));},
         Some(Err(error))=>{eprintln!("isolated Shell menu: {error:#}");menu::report_failure(owner,HRESULT(0x80004005u32 as i32));},
         _=>{},
     }

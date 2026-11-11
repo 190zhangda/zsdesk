@@ -310,7 +310,10 @@ static HRESULT SafeInitialize(Presenter* presenter,IUnknown* callback,HWND owner
     __except(EXCEPTION_EXECUTE_HANDLER){return E_UNEXPECTED;}
 }
 
-class Session final : public IServiceProvider, public IOleWindow, public NativeCallback, public IOleCommandTarget {
+using NewItemCallback=HRESULT (WINAPI*)(PCIDLIST_ABSOLUTE,int);
+thread_local NewItemCallback gNewItemCallback=nullptr;
+extern "C" void zs_menu_set_new_item_callback(NewItemCallback callback) noexcept {gNewItemCallback=callback;}
+class Session final : public IServiceProvider, public IOleWindow, public NativeCallback, public IOleCommandTarget, public INewMenuClient {
     LONG refs_=1;
     IShellView* shell_=nullptr;
     NativeCallback* callback_=nullptr;
@@ -485,6 +488,7 @@ public:
         if(iid==IID_IUnknown||iid==IID_IServiceProvider)*out=static_cast<IServiceProvider*>(this);
         else if(iid==kCallbackIID)*out=static_cast<NativeCallback*>(this);
         else if(iid==IID_IOleWindow)*out=static_cast<IOleWindow*>(this);
+        else if(iid==IID_INewMenuClient&&gNewItemCallback)*out=static_cast<INewMenuClient*>(this);
         else if(iid==IID_IOleCommandTarget&&commandTarget_&&!retiring_)*out=static_cast<IOleCommandTarget*>(this);
         else return E_NOINTERFACE;
         AddRef();return S_OK;
@@ -500,6 +504,7 @@ public:
     HRESULT STDMETHODCALLTYPE QueryService(REFGUID service,REFIID iid,void** out)override{
         if(!out)return E_POINTER;*out=nullptr;
         if(retiring_||!shell_)return E_NOINTERFACE;
+        if(service==SID_SNewMenuClient&&gNewItemCallback)return QueryInterface(iid,out);
         if(service==kPresenterSID)return E_NOINTERFACE; // No recursive presenter construction.
         if(service==SID_SFolderView)return shell_->QueryInterface(iid,out);
         if(service==IID_IOleCommandTarget||((service==SID_STopLevelBrowser||service==SID_SShellBrowser)&&iid==IID_IOleCommandTarget))return QueryInterface(iid,out);
@@ -510,6 +515,12 @@ public:
         AddRef();IOleCommandTarget* target=!retiring_?commandTarget_:nullptr;if(target)target->AddRef();
         HRESULT hr=target?target->QueryStatus(group,count,commands,text):OLECMDERR_E_NOTSUPPORTED;
         if(target)target->Release();Release();return hr;
+    }
+    HRESULT STDMETHODCALLTYPE IncludeItems(NMCII_FLAGS* flags)override{
+        if(!flags)return E_POINTER;*flags=NMCII_ITEMS|NMCII_FOLDERS;return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SelectAndEditItem(PCIDLIST_ABSOLUTE item,NMCSAEI_FLAGS flags)override{
+        return gNewItemCallback?gNewItemCallback(item,flags):E_NOINTERFACE;
     }
     HRESULT STDMETHODCALLTYPE Exec(const GUID* group,DWORD command,DWORD options,VARIANT* input,VARIANT* output)override{
         AddRef();IOleCommandTarget* target=!retiring_?commandTarget_:nullptr;if(target)target->AddRef();

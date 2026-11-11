@@ -11,6 +11,7 @@ fn chrono_like_now()->String{
 }
 
 impl WindowState {
+    pub(super) fn renamed_bookmark_index(&self)->Option<usize>{self.rename_id.and_then(|id|self.session.bookmarks.iter().position(|b|b.id==id))}
     pub(super) fn bookmark_index(&self,slot:usize)->Option<usize>{self.bookmark_order.get(slot).copied()}
     pub(super) fn bookmark_label(&self,index:usize)->String{
         let item=&self.session.bookmarks[index];let depth=self.session.bookmark_depth(index);
@@ -92,7 +93,7 @@ impl WindowState {
         let position=siblings.iter().position(|id|*id==bookmark.id).unwrap_or(0);
         let mut destinations=vec![entry("收藏栏根目录","move-root",bookmark.parent_id.is_some(),false)];
         destinations.extend(self.session.bookmarks.iter().filter(|b|b.is_folder&&b.id!=bookmark.id).map(|b|
-            entry(&b.display_name.replace('&',"&&"),&format!("move-{}",b.id),bookmark.parent_id!=Some(b.id),false)));
+            entry(&b.display_name.replace('&',"&&"),&format!("move-{}",b.id),bookmark.parent_id!=Some(b.id)&&self.session.can_move_bookmark_to(bookmark.id,Some(b.id)),false)));
         let spec = menu(vec![
             entry(if bookmark.is_folder{if bookmark.collapsed{"展开分类"}else{"折叠分类"}}else{"打开"}, "open", true, false),
             entry(if bookmark.is_folder{"打开分类中的全部文件夹\t双击"}else{"在新标签页中打开"}, "open-tab", true, false),
@@ -106,6 +107,7 @@ impl WindowState {
             submenu("移动到分类",destinations),
             MenuItemSpec::Separator,
             entry(if bookmark.is_folder{"移除分类并保留其中收藏"}else{"从收藏栏移除"}, "remove", true, false),
+            entry("删除分类及其中的收藏…", "remove-subtree", bookmark.is_folder, false),
         ]);
         match input::popup(self.hwnd, &spec, None).as_deref() {
             Some("open") => unsafe { self.open_bookmark_index(index, false) },
@@ -119,6 +121,12 @@ impl WindowState {
             Some("right") if position+1<siblings.len()=>self.move_bookmark_to(bookmark.id,bookmark.parent_id,siblings.get(position+2).copied()),
             Some("move-root")=>self.move_bookmark_to(bookmark.id,None,None),
             Some("remove") => { self.session.remove_bookmark(bookmark.id); self.save(); unsafe { self.rebuild_bookmarks(); } },
+            Some("remove-subtree") if bookmark.is_folder => {
+                let text=wide(&format!("删除分类“{}”及其中的收藏和子分类？\n\n实际文件和文件夹不会被删除。",bookmark.display_name));
+                if unsafe{MessageBoxW(Some(self.hwnd),PCWSTR(text.as_ptr()),windows::core::w!("删除收藏分类"),MB_OKCANCEL|MB_ICONQUESTION)}==IDOK {
+                    self.session.remove_bookmark_subtree(bookmark.id);self.save();unsafe{self.rebuild_bookmarks();}
+                }
+            },
             Some(action)=>if let Some(parent)=action.strip_prefix("move-").and_then(|id|id.parse().ok()){self.move_bookmark_to(bookmark.id,Some(parent),None);},
             _ => {}
         }
@@ -169,7 +177,7 @@ impl WindowState {
         let Some(bookmark) = self.session.bookmarks.get(index) else { return };
         let rect = self.bookmark_rect(index);
         self.rename_hwnd = unsafe { child(self.hwnd, "EDIT", &bookmark.display_name, ID_BOOKMARK_RENAME, ES_AUTOHSCROLL as u32, true) }.unwrap_or_default();
-        self.rename_index = Some(index);
+        self.rename_id = Some(bookmark.id);
         // Borderless EDIT inside the rounded text box painted by the chrome.
         let line = self.edit_line_height();
         let pad = self.s(8);
@@ -184,17 +192,17 @@ impl WindowState {
         self.invalidate_rect(self.layout.bookmarks_row);
     }
     pub(super) unsafe fn commit_bookmark_rename(&mut self) {
-        let Some(index) = self.rename_index.take() else { return };
+        let Some(id) = self.rename_id.take() else { return };
         let text = window_text(self.rename_hwnd);
         let _ = unsafe { DestroyWindow(self.rename_hwnd) };
         self.rename_hwnd = HWND::default();
         if !text.trim().is_empty() {
-            if let Some(b) = self.session.bookmarks.get_mut(index) { b.display_name = text.trim().into(); self.save(); }
+            if let Some(b) = self.session.bookmarks.iter_mut().find(|b|b.id==id) { b.display_name = text.trim().into(); self.save(); }
         }
         unsafe { self.rebuild_bookmarks(); }
     }
     pub(super) unsafe fn cancel_rename(&mut self) {
-        self.rename_index = None;
+        self.rename_id = None;
         if !self.rename_hwnd.0.is_null() { let _ = unsafe { DestroyWindow(self.rename_hwnd) }; self.rename_hwnd = HWND::default(); }
         self.invalidate_rect(self.layout.bookmarks_row);
     }

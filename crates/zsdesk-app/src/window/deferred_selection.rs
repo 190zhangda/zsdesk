@@ -14,11 +14,14 @@ impl WindowState {
         unsafe{SetTimer(Some(self.hwnd),TIMER,50,None);}
     }
     pub(super) fn select_created_folder(&mut self,path:PathBuf){
+        self.select_created_item(path,true);
+    }
+    pub(super) fn select_created_item(&mut self,path:PathBuf,rename:bool){
         let (Some(parent),Some(name))=(path.parent(),path.file_name())else{return;};
         let location=ShellLocation::Path(parent.into());
         // A completed operation must never rename an unrelated current folder.
         if shell_registration::same_location(self.current_location(),&location){
-            self.defer_selection(vec![name.to_os_string()],true);
+            self.defer_selection(vec![name.to_os_string()],rename);
         }else{self.select_created_in_other_pane(&location,name);}
     }
     pub(super) fn poll_deferred_selection(&mut self){

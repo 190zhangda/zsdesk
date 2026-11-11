@@ -327,6 +327,7 @@ pub(crate) fn run_arguments(args:Vec<OsString>,in_host:bool)->Result<()> {
     let mut session = loaded.unwrap_or_else(storage::default_session);
     session.normalize();
     if let Some(location) = requested { activate(&mut session, location, fresh); }
+    else {session.apply_startup_location();}
     window::run(session, config, selection, !opts.classic,opts.new_window,opts.focus_search.then_some(opts.search_settings))
 }
 

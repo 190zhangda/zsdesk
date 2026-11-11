@@ -425,6 +425,19 @@ impl ShellMenu {
     }
 
     pub fn hmenu(&self) -> HMENU { self.hmenu }
+    pub(super) fn context(&self)->&IContextMenu{&self.menu}
+
+    /// ShellNew owns its dynamic document templates and canonical command IDs.
+    pub fn track_new(&self,owner:HWND,point:POINT,before:&mut dyn FnMut()->Result<()>)->Result<MenuOutcome>{
+        let sub=self.submenu_with_verb("NewFolder").or_else(||{
+            (0..unsafe{GetMenuItemCount(Some(self.hmenu))}.max(0)).find_map(|index|{
+                let sub=unsafe{GetSubMenu(self.hmenu,index)};
+                if sub.is_invalid(){None}else{self.init_popup(sub,index);Some(sub)}
+            })
+        }).ok_or_else(||windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32),"当前文件夹没有可用的新建命令"))?;
+        let Some(command)=self.track_unfiltered(owner,sub,point)else{return Ok(MenuOutcome::Dismissed);};
+        before()?;self.invoke(owner,command,Some(point),false,false)?;Ok(MenuOutcome::ShellInvoked)
+    }
 
     /// Fills the popup menu. `extended` adds Shift-only verbs.
     pub fn populate(&self, rename: bool, extended: bool) -> Result<()> {

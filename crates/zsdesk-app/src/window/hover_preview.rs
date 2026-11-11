@@ -188,7 +188,7 @@ fn input_context(slot:&Slot,owner:HWND)->Option<Context> {
     {
         let slot=slot.try_borrow().ok()?;let state=slot.as_ref()?;
         if state.tab_drag.is_some() || state.splitter_drag.is_some()
-            || state.address_editing || state.rename_index.is_some() {return None;}
+            || state.address_editing || state.rename_id.is_some() {return None;}
     }
     let snapshot=ViewSnapshot::capture(slot)?;
     if snapshot.owner()!=owner{return None;}

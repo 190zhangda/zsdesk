@@ -385,14 +385,16 @@ impl WindowState {
 
     // ---- command bar ----------------------------------------------------
 
-    unsafe fn command(&mut self, id: CommandId) {
+    pub(super) unsafe fn command(&mut self, id: CommandId) {
         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
         let hwnd = self.hwnd;
         match id {
             CommandId::New => {
                 let rect = self.layout.command_rect(id).unwrap_or_default();
                 let point = self.screen_point(rect.x, rect.bottom());
-                let result = self.browser.as_ref().map(|b| b.show_new_menu(hwnd, point));
+                let result = self.browser.as_ref().zip(self.identity_for_source(self.browser_source)).map(|(b,identity)|{
+                    let view=unsafe{b.current_view()?};super::context_menu::show_new(hwnd,&view,identity,point)
+                });
                 self.shell_result(result);
             }
             CommandId::Cut => { let r = self.browser.as_ref().map(|b| b.invoke_selection(hwnd, "cut", false)); self.shell_result(r); }
@@ -623,6 +625,7 @@ impl WindowState {
 
     unsafe fn app_menu(&mut self) {
         self.sync_search_preferences();
+        if let Ok(saved)=storage::load(&self.config_path){self.session.ui.startup_location=saved.ui.startup_location;}
         let anchor = Some(self.layout.app_menu);
         let spec=self.app_menu_spec();let hwnd=self.hwnd;
         // Toggles are applied inside; only an action closes the menu and reaches the match.
@@ -632,6 +635,18 @@ impl WindowState {
             Some("new-window")=>self.new_window(),
             Some("diagnostics")=>if let Err(error)=diagnostics::show(self.hwnd){self.show_message(format!("无法打开诊断日志：{error}"));},
             Some("quick-search-settings") => unsafe { self.search_settings_menu(); },
+            Some(id @ ("startup-restore"|"startup-this-pc"|"startup-folder")) => {
+                use zsdesk_core::model::explorer::StartupLocation;
+                let location=match id {
+                    "startup-restore"=>StartupLocation::RestoreSession,
+                    "startup-this-pc"=>StartupLocation::ThisPc,
+                    _=>{let Some(path)=zsdesk_windows::desktop::pick_folder(self.hwnd,"选择默认打开的文件夹")else{return;};StartupLocation::Folder(path)},
+                };
+                match storage::save_startup_location(&self.config_path,&location){
+                    Ok(())=>{self.session.ui.startup_location=location;self.show_message("默认位置已保存，下次重新打开窗口时生效".into());},
+                    Err(error)=>self.show_message(format!("默认位置未保存：{error}")),
+                }
+            },
             Some("search-rebuild-index") => self.rebuild_search_index(),
             Some("dual-pane") => self.toggle_dual_pane(),
             Some(id) if self.search_engine_menu_action(id) => {},

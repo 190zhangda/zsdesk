@@ -8,7 +8,7 @@ static PENDING:OnceLock<Mutex<HashMap<usize,Envelope>>>=OnceLock::new();
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub(super) struct Identity {pub source:usize,pub tab:u64,pub epoch:u64}
-pub(super) enum Intent {Action(usize),Wheel(i32),OpenFolder(PathBuf),OpenFolders(Vec<PathBuf>),NavigateFolder(ShellLocation),SubmitAddress(String)}
+pub(super) enum Intent {Action(usize),Wheel(i32),OpenFolder(PathBuf),OpenFolders(Vec<PathBuf>),NavigateFolder(ShellLocation),SubmitAddress(String),CreatedItem(zsdesk_windows::shell::new_menu::CreatedItem)}
 struct Envelope {owner:isize,identity:Identity,intent:Intent}
 
 pub(super) fn post(owner:HWND,identity:Identity,intent:Intent)->bool {
@@ -85,6 +85,12 @@ impl WindowState {
             Intent::OpenFolder(path)=>self.pane_open_folder(envelope.identity.source,path),
             Intent::OpenFolders(paths)=>self.pane_open_folders(envelope.identity.source,paths),
             Intent::NavigateFolder(location)=>self.pane_navigate_folder(envelope.identity.source,location),
+            Intent::CreatedItem(item)=>{
+                if envelope.identity.source==self.browser_source{self.select_created_item(item.path,item.rename);}
+                else if let (Some(parent),Some(name))=(item.path.parent(),item.path.file_name()){
+                    self.select_created_in_other_pane(&ShellLocation::Path(parent.into()),name);
+                }
+            },
             Intent::SubmitAddress(text)=>if envelope.identity.source==self.browser_source {
                 address_input::delivered(self.address_edit);
                 diagnostics::record("navigation","address-submit-dispatched",None);

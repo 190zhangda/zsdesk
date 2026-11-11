@@ -367,7 +367,7 @@ struct WindowState {
     address_edit: HWND,
     search_edit: HWND,
     rename_hwnd: HWND,
-    rename_index: Option<usize>,
+    rename_id: Option<u64>,
     tooltip: HWND,
     tooltip_text: Vec<u16>,
     font: HFONT,
@@ -436,7 +436,7 @@ impl WindowState {
             hwnd: HWND::default(), dpi: 96, search_saved_preferences:session.ui.search_preferences(),bookmarks_saved:session.bookmarks.clone(),session_ending:false,session, config_path, modern, browser: None, tree: None,
             browser_source:0,folder_sizes:Default::default(),view_hwnd:HWND::default(),navigation_epoch:0,
             other_pane:Default::default(),active_pane_right:false,background_pane:false,routing_pane_message:false,pane_splitter_drag:None,
-            address_edit: HWND::default(), search_edit: HWND::default(), rename_hwnd: HWND::default(), rename_index: None,
+            address_edit: HWND::default(), search_edit: HWND::default(), rename_hwnd: HWND::default(), rename_id: None,
             tooltip: HWND::default(), tooltip_text: vec![0], font: HFONT::default(), gfx: None, surface: None,
             palette: Palette::light(), dark: false, mica: false, active: true, layout: ChromeLayout::default(),
             crumbs: Vec::new(), crumb_slots: Vec::new(), crumbs_for: None, address_editing: false, open_chevron: None,
@@ -604,7 +604,7 @@ impl WindowState {
         let address = self.layout.address;
         unsafe { move_control(self.address_edit, LayoutRect::new(address.x + pad, address.y + (address.height - line) / 2, (address.width - pad * 2).max(0), line)); }
         let _ = unsafe { ShowWindow(self.address_edit, if self.address_editing { SW_SHOWNOACTIVATE } else { SW_HIDE }) };
-        if let (Some(index), false) = (self.rename_index, self.rename_hwnd.0.is_null()) {
+        if let (Some(index), false) = (self.renamed_bookmark_index(), self.rename_hwnd.0.is_null()) {
             {
                 let r=self.bookmark_rect(index);
                 let pad = self.s(8);
@@ -737,10 +737,8 @@ impl WindowState {
                 self.session.ui.apply_search_preferences(&preferences);self.search_saved_preferences=preferences;
                 self.session.next_id=self.session.next_id.max(bookmarks.iter().map(|b|b.id).max().unwrap_or(0).saturating_add(1));
                 if self.session.bookmarks!=bookmarks{
-                    let renamed=self.rename_index.and_then(|index|self.session.bookmarks.get(index)).map(|b|b.id);
                     self.session.bookmarks=bookmarks.clone();
-                    self.rename_index=renamed.and_then(|id|self.session.bookmarks.iter().position(|b|b.id==id));
-                    if renamed.is_some()&&self.rename_index.is_none(){unsafe{self.cancel_rename();}}
+                    if self.rename_id.is_some()&&self.renamed_bookmark_index().is_none(){unsafe{self.cancel_rename();}}
                     self.measure_bookmarks();self.relayout();self.position_children();
                 }
                 self.bookmarks_saved=bookmarks;

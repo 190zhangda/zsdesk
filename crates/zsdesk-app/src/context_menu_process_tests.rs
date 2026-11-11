@@ -23,6 +23,18 @@ pub(crate) struct Environment{key:&'static str,previous:Option<std::ffi::OsStrin
 impl Environment{pub(crate) fn set(key:&'static str,value:impl AsRef<std::ffi::OsStr>)->Self{let previous=std::env::var_os(key);std::env::set_var(key,value);Self{key,previous}}}
 impl Drop for Environment{fn drop(&mut self){if let Some(previous)=&self.previous{std::env::set_var(self.key,previous);}else{std::env::remove_var(self.key);}}}
 pub(crate) struct Fixtures(pub(crate) Vec<PathBuf>);impl Drop for Fixtures{fn drop(&mut self){for path in &self.0{let _=fs::remove_file(path);}}}
+pub(super) fn new_item_command(menu:&ShellMenu,text:bool)->Result<u32>{
+    let popup=menu.submenu_with_verb("NewFolder").context("ShellNew folder command missing")?;
+    let count=unsafe{GetMenuItemCount(Some(popup))};let mut rows=Vec::new();
+    for index in 0..count {
+        let id=unsafe{GetMenuItemID(popup,index)};let verb=menu.verb(id).unwrap_or_default();
+        let mut label=[0u16;512];let length=unsafe{GetMenuStringW(popup,index as u32,Some(&mut label),MF_BYPOSITION)};
+        let label=String::from_utf16_lossy(&label[..length.max(0)as usize]);
+        if (!text&&verb.eq_ignore_ascii_case("NewFolder"))||(text&&verb.to_ascii_lowercase().contains(".txt")){return Ok(id);}
+        rows.push(serde_json::json!({"id":id,"verb":verb,"label":label}));
+    }
+    anyhow::bail!("ShellNew command missing (text={text}): {rows:?}")
+}
 pub(crate) fn sparse(root:&Path)->Result<(Fixtures,Vec<Vec<u8>>,Vec<serde_json::Value>)>{
     let mut fixtures=Fixtures(Vec::new());let mut pidls=Vec::new();let mut rows=Vec::new();
     for (name,gib) in [("ZSDesk-menu-大文件.bin",12u64),("ZSDesk-menu-归档.zip",6),("ZSDesk-menu-视频.mp4",6)]{

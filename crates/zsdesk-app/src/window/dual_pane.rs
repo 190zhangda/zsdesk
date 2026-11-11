@@ -571,9 +571,9 @@ pub(super) fn native_exercise(slot:&Slot,output:&std::path::Path,pump:fn(u64))->
             ensure!(std::time::Instant::now()<deadline,"direct pane source did not materialize");}
         {slot.borrow_mut().as_mut().unwrap().transfer_to_other_pane(moving);}
         let deadline=std::time::Instant::now()+std::time::Duration::from_secs(8);
-        loop{pump(25);if target.is_file()&&(!moving||!source.exists()){break;}
+        loop{pump(25);if zsdesk_windows::shell::file_transfer::pending_operations()==0&&target.is_file()&&(!moving||!source.exists()){break;}
             ensure!(std::time::Instant::now()<deadline,"direct pane {kind} did not complete");}
-        ensure!(std::fs::read(&target)?==b"native direct pane transfer","direct pane transfer changed contents");
+        ensure!(std::fs::read(&target).with_context(||format!("read completed pane transfer {}",target.display()))?==b"native direct pane transfer","direct pane transfer changed contents");
         ensure!(source.exists()!=moving,"copy/move source semantics differ");
     }
     let view={let mut slot=slot.borrow_mut();let state=slot.as_mut().unwrap();state.activate_pane(true);

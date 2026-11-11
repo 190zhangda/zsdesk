@@ -205,6 +205,13 @@ fn tab_settings(ui: &ExplorerUi) -> MenuItemSpec {
         entry("显示标签页数量", "show-tab-count", true, ui.show_tab_count),
         entry("双击关闭标签页", "double-click-close-tab", true, ui.double_click_close_tab),
         entry("关闭最后一个标签页时关闭窗口", "close-window-last-tab", true, ui.close_window_on_last_tab),
+        MenuItemSpec::Separator,
+        submenu("重新打开窗口时",vec![
+            entry("恢复上次的标签页","startup-restore",true,matches!(ui.startup_location,zsdesk_core::model::explorer::StartupLocation::RestoreSession)),
+            entry("打开此电脑","startup-this-pc",true,matches!(ui.startup_location,zsdesk_core::model::explorer::StartupLocation::ThisPc)),
+            entry(&match &ui.startup_location {zsdesk_core::model::explorer::StartupLocation::Folder(path)=>format!("默认文件夹：{}…",path.display().to_string().replace('&',"&&")),_=>"选择默认文件夹…".into()},
+                "startup-folder",true,matches!(ui.startup_location,zsdesk_core::model::explorer::StartupLocation::Folder(_))),
+        ]),
     ])
 }
 
@@ -251,11 +258,11 @@ fn search_settings(ui: &ExplorerUi) -> MenuItemSpec {
 }
 
 /// Applies a recognized settings choice; the host then saves and relayouts.
-pub fn interface_requires_dialog(choice:&str)->bool{matches!(choice,"search-everything-program")}
+pub fn interface_requires_dialog(choice:&str)->bool{matches!(choice,"search-everything-program"|"startup-folder")}
 
 /// Settings entries that run an action instead of toggling a preference.
 pub fn interface_action(choice:&str)->bool{
-    matches!(choice,"search-rebuild-index"|"search-index-settings"|"search-everything-service"|"dual-pane")||interface_requires_dialog(choice)
+    matches!(choice,"search-rebuild-index"|"search-index-settings"|"search-everything-service"|"dual-pane"|"startup-restore"|"startup-this-pc")||interface_requires_dialog(choice)
 }
 
 pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {

@@ -77,6 +77,49 @@ fn exercise(root:&Path,desktop_name:&str)->Result<serde_json::Value>{
                     "main_presenter_or_extension_created":false,"worker_rendering_exercised":false}));
             }
         }
+        // Real filesystem background menus must keep view commands. ShellNew
+        // completion must return to this visible view, including inline edit.
+        let mut cases=vec![("background-menu","menu-dismiss",false),("view-details","background-details",false),
+            ("new-menu","menu-dismiss",true),("new-folder","new-folder",true),("new-text","new-text",true),
+            ("background-new-folder","new-folder",false),("background-new-text","new-text",false)];
+        if modern{cases.push(("modern-background-new-folder","modern-owner-new-folder",false));}
+        for (case,probe,command_bar) in cases {
+            let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE",probe);
+            let before:std::collections::HashSet<_>=fs::read_dir(&folder)?.map(|entry|entry.unwrap().path()).collect();
+            {
+                let mut slot=runner.slot.borrow_mut();let state=slot.as_mut().unwrap();
+                state.browser.as_ref().unwrap().select_all(false);
+                if probe=="background-details"{state.browser.as_ref().unwrap().set_view_mode(1,48)?;}
+            }
+            pump(30);
+            if command_bar {
+                unsafe{runner.slot.borrow_mut().as_mut().unwrap().command(zsdesk_ui::chrome::CommandId::New);}
+            }else{
+                let view=runner.slot.borrow().as_ref().unwrap().browser.as_ref().unwrap().view_window().unwrap();
+                unsafe{SendMessageW(view,WM_CONTEXTMENU,Some(WPARAM(view.0 as usize)),Some(LPARAM(-1)));}
+            }
+            ensure!(super::context_menu::request_active(runner.hwnd),"filesystem/new menu did not reach the worker");
+            let deadline=Instant::now()+Duration::from_secs(15);
+            while super::context_menu::request_active(runner.hwnd){pump(10);ensure!(Instant::now()<deadline,"filesystem/new menu did not settle");}
+            let diagnostic=crate::context_menu_process::read_recent_diagnostics();let current=&diagnostic["current"];
+            ensure!(current["error"].is_null(),"filesystem/new menu failed ({probe}, modern={modern}): {current}");
+            if probe=="menu-dismiss"{ensure!(current["timing"]["menu_open_observation"].is_string(),"filesystem popup not presented");}
+            if probe=="background-details"{ensure!(runner.slot.borrow().as_ref().unwrap().browser.as_ref().unwrap().view_mode().is_some_and(|(mode,_)|mode==4),"filesystem view command lost");}
+            if probe.starts_with("new-")||probe=="modern-owner-new-folder"{
+                let added:Vec<_>=fs::read_dir(&folder)?.map(|entry|entry.unwrap().path()).filter(|path|!before.contains(path)).collect();
+                ensure!(added.len()==1,"expected one newly created item: {added:?}");
+                let deadline=Instant::now()+Duration::from_secs(10);
+                loop {pump(25);let slot=runner.slot.borrow();let state=slot.as_ref().unwrap();
+                    let selected=state.browser.as_ref().unwrap().selection_paths();
+                    if selected.iter().any(|path|PathBuf::from(path)==added[0])&&text_input_window(unsafe{GetFocus()}){break;}
+                    ensure!(Instant::now()<deadline,"created item was not selected for inline rename ({probe}): selected={selected:?}");
+                }
+                unsafe{SendMessageW(GetFocus(),WM_KEYDOWN,Some(WPARAM(VK_ESCAPE.0 as usize)),Some(LPARAM(0)));}pump(30);
+                if added[0].is_dir(){fs::remove_dir(&added[0])?;}else{fs::remove_file(&added[0])?;}
+                unsafe{runner.slot.borrow().as_ref().unwrap().browser.as_ref().unwrap().current_view()?.Refresh()?;}pump(120);
+            }
+            rows.push(serde_json::json!({"modern_preference":modern,"target":"filesystem/new","case":case,"probe":probe,"diagnostic":current}));
+        }
         // A virtual root has no filesystem path; render its actual background
         // menu repeatedly, including after a previous worker has been reused.
         unsafe{runner.slot.borrow_mut().as_mut().unwrap().navigate_to(ShellLocation::ThisPc);}
@@ -110,7 +153,7 @@ fn exercise(root:&Path,desktop_name:&str)->Result<serde_json::Value>{
     }
     drop(files);
     Ok(serde_json::json!({"selection_bytes":24u64*1024*1024*1024,"files":records,"routes":rows,
-        "main_delegate_installed":true,"fixtures_removed":true,"rendering_scope":"selection fault containment; actual classic/modern This PC background presentation and view command roundtrip"}))
+        "main_delegate_installed":true,"fixtures_removed":true,"rendering_scope":"classic/modern filesystem and This PC backgrounds; ShellNew popup and document/folder creation with visible inline rename; selection fault containment"}))
 }
 
 #[test]

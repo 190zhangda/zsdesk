@@ -305,7 +305,7 @@ impl WindowState {
         }
         for (i, rect) in l.bookmarks.iter().enumerate() {
             let Some(index)=self.bookmark_index(i)else{continue;};
-            if self.rename_index == Some(index) {
+            if self.rename_id == Some(self.session.bookmarks[index].id) {
                 let r = rf(LayoutRect::new(rect.x, rect.y, rect.width.max(self.s(140)), rect.height));
                 self.text_box(cv, r, true, false);
                 continue;
@@ -327,7 +327,7 @@ impl WindowState {
             self.button_fill(cv, l.bookmark_overflow, Hit::BookmarkOverflow, self.sf(4.0));
             cv.glyph("\u{E76C}", rf(l.bookmark_overflow), self.sf(10.0), c(p.text));
         }
-        if let Some(index)=self.rename_index{if !self.bookmark_order.iter().take(l.bookmarks.len()).any(|i|*i==index){self.text_box(cv,rf(self.bookmark_rect(index)),true,false);}}
+        if let Some(index)=self.renamed_bookmark_index(){if !self.bookmark_order.iter().take(l.bookmarks.len()).any(|i|*i==index){self.text_box(cv,rf(self.bookmark_rect(index)),true,false);}}
     }
 
     fn paint_content(&self, cv: &Canvas) {
