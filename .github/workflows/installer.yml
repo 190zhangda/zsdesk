@@ -12,7 +12,7 @@ on:
         required: false
 
 permissions:
-  contents: write   # 创建 Release 需要
+  contents: write
 
 jobs:
   installer:
@@ -41,9 +41,8 @@ jobs:
         id: meta
         shell: pwsh
         run: |
-          $raw = Get-Content -LiteralPath zsdesk/Cargo.toml -Raw
-          $m = [regex]::Match($raw, '(?m)^version\s*=\s*"([^"]+)"')
-          if (-not $m.Success) { throw "Cargo.toml 里没读到 version" }
+          $m = [regex]::Match((Get-Content -LiteralPath zsdesk/Cargo.toml -Raw), '(?m)^version\s*=\s*"([^"]+)"')
+          if (-not $m.Success) { throw "Cargo.toml 未找到 version" }
           "version=$($m.Groups[1].Value)" >> $env:GITHUB_OUTPUT
 
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -51,27 +50,37 @@ jobs:
       - name: Install Inno Setup 6
         run: choco install innosetup --yes --no-progress
 
-      # ---- Everything 运行时（保留，不要删）----
+      # ---- Everything 运行时（必须保留，不要删）----
       - name: Fetch pinned Everything runtime
+        id: everything
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path everything -Force | Out-Null
+          New-Item -ItemType Directory -Path everything_raw -Force | Out-Null
           Invoke-WebRequest -Uri 'https://www.voidtools.com/Everything-1.4.1.1032.x64.zip' -OutFile everything.zip -UseBasicParsing
-          Expand-Archive -Path everything.zip -DestinationPath everything -Force
-          # 找真正包含 Everything.exe 的子目录，把 manifest 放对位置
-          $exeDir = Get-ChildItem -Path everything -Recurse -Filter Everything.exe | Select-Object -First 1 | ForEach-Object { $_.DirectoryName }
-          if (-not $exeDir) { throw "解压后找不到 Everything.exe" }
-          Copy-Item zsdesk/packaging/engines/everything.json "$exeDir/manifest.json" -Force
-          "everything_dir=$exeDir" >> $env:GITHUB_OUTPUT
-        id: everything
+          Expand-Archive -Path everything.zip -DestinationPath everything_raw -Force
 
-      # ---- 打包 + 编译安装包 ----
+          # 自动定位 Everything.exe 真实目录
+          $exe = Get-ChildItem -Path everything_raw -Recurse -Filter Everything.exe | Select-Object -First 1
+          if (-not $exe) { throw "解压后找不到 Everything.exe" }
+          $realDir = $exe.DirectoryName
+
+          # 平铺到 everything/ 目录
+          New-Item -ItemType Directory -Path everything -Force | Out-Null
+          Copy-Item -Path "$realDir\*" -Destination everything\ -Recurse -Force
+
+          # 拷贝校验清单（必须与 everything.json 哈希一致）
+          Copy-Item zsdesk/packaging/engines/everything.json everything/manifest.json -Force
+
+          Remove-Item everything.zip, everything_raw -Recurse -Force
+          "dir=$PWD/everything" >> $env:GITHUB_OUTPUT
+
+      # ---- 编译 + 打包 + 出安装包 ----
       - name: Package and compile installer
         shell: pwsh
         run: >
           ./zsdesk/scripts/package.ps1
           -Editions ($env:EDITIONS -split ',')
-          -EverythingDir "${{ steps.everything.outputs.everything_dir }}"
+          -EverythingDir "${{ steps.everything.outputs.dir }}"
           -InnoCompiler 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
           -OutputDir "$PWD/out"
 
