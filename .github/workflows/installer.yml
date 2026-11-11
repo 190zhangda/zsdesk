@@ -1,12 +1,9 @@
 name: Windows installer
 
-# 产出 Inno Setup 安装包（写入注册表的标准安装程序），而非便携版 exe。
-# 触发方式：
-#   - push 标签 v*（如 v0.3.11）→ 打包并自动创建 GitHub Release
-#   - workflow_dispatch       → 手动打包，仅上传 Artifact
 on:
   push:
-    tags: ['v*']
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       editions:
@@ -15,7 +12,7 @@ on:
         required: false
 
 permissions:
-  contents: write   # 创建 Release 需要；仅打 Artifact 时可降为 read
+  contents: write   # 创建 Release 需要
 
 jobs:
   installer:
@@ -29,50 +26,68 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: zsdesk
-      - name: Read the ZSUI revision
+
+      - name: Read ZSUI revision
         id: zsui
         shell: pwsh
         run: '"revision=$((Get-Content -LiteralPath zsdesk/packaging/zsui-revision.txt -Raw).Trim())" >> $env:GITHUB_OUTPUT'
-      # package.ps1 要求 zsui 与 zsdesk 是兄弟目录（构建会 remap 它的路径）
       - uses: actions/checkout@v7
         with:
           repository: qiu7824/zsui
           ref: ${{ steps.zsui.outputs.revision }}
           path: zsui
-      - name: Read the workspace version
+
+      - name: Read version from Cargo.toml
         id: meta
         shell: pwsh
         run: |
-          $v=[regex]::Match((Get-Content -LiteralPath zsdesk/Cargo.toml -Raw),'(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
-          "version=$v" >> $env:GITHUB_OUTPUT
+          $raw = Get-Content -LiteralPath zsdesk/Cargo.toml -Raw
+          $m = [regex]::Match($raw, '(?m)^version\s*=\s*"([^"]+)"')
+          if (-not $m.Success) { throw "Cargo.toml 里没读到 version" }
+          "version=$($m.Groups[1].Value)" >> $env:GITHUB_OUTPUT
+
       - uses: dtolnay/rust-toolchain@1.99.0
+
       - name: Install Inno Setup 6
         run: choco install innosetup --yes --no-progress
+
+      # ---- Everything 运行时（保留，不要删）----
       - name: Fetch pinned Everything runtime
-        # package.ps1 会校验 Everything.exe/lng/License 与 packaging/engines/everything.json
-        # 的 sha256，并要求 manifest.json 与 everything.json 内容一致（即哈希相同）。
-        # 注意：完成“移除 Everything、改用 Listary”的改造后，整个 step 删除即可。
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path everything | Out-Null
-          Invoke-WebRequest -Uri 'https://www.voidtools.com/Everything-1.4.1.1032.x64.zip' -OutFile everything.zip
-          Expand-Archive -Path everything.zip -DestinationPath everything
-          Copy-Item zsdesk/packaging/engines/everything.json everything/manifest.json
-      - name: Package payloads and compile installers
+          New-Item -ItemType Directory -Path everything -Force | Out-Null
+          Invoke-WebRequest -Uri 'https://www.voidtools.com/Everything-1.4.1.1032.x64.zip' -OutFile everything.zip -UseBasicParsing
+          Expand-Archive -Path everything.zip -DestinationPath everything -Force
+          # 找真正包含 Everything.exe 的子目录，把 manifest 放对位置
+          $exeDir = Get-ChildItem -Path everything -Recurse -Filter Everything.exe | Select-Object -First 1 | ForEach-Object { $_.DirectoryName }
+          if (-not $exeDir) { throw "解压后找不到 Everything.exe" }
+          Copy-Item zsdesk/packaging/engines/everything.json "$exeDir/manifest.json" -Force
+          "everything_dir=$exeDir" >> $env:GITHUB_OUTPUT
+        id: everything
+
+      # ---- 打包 + 编译安装包 ----
+      - name: Package and compile installer
         shell: pwsh
         run: >
           ./zsdesk/scripts/package.ps1
           -Editions ($env:EDITIONS -split ',')
-          -EverythingDir "$PWD/everything"
+          -EverythingDir "${{ steps.everything.outputs.everything_dir }}"
           -InnoCompiler 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
           -OutputDir "$PWD/out"
+
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
           name: ZSDesk-${{ steps.meta.outputs.version }}-setup
           path: out/**/*-setup.exe
-      - name: Create GitHub Release
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: out/**/*-setup.exe
+          generate_release_notes: true
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
